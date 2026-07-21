@@ -1,0 +1,40 @@
+// expect: 42
+//
+// tests/49_block_scoping.c0 - block scoping: sibling blocks reuse names, inner blocks shadow
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int result;
+    int x;
+
+    // sibling if/else blocks reusing the same name -- must not be a redeclaration error
+    if (1) {
+        int going = 10;
+        result = going;
+    } else {
+        int going = 20;
+        result = going;
+    }
+    if (result != 10) { return 1; }
+
+    // two sequential (non-overlapping) blocks reusing the same name
+    if (1) {
+        int tmp = 100;
+        result = tmp;
+    }
+    if (1) {
+        int tmp = 200;
+        result = result + tmp;
+    }
+    if (result != 300) { return 2; }
+
+    // shadowing: inner block's x shadows outer x, outer resumes after the block
+    x = 1;
+    if (1) {
+        int x;
+        x = 2;
+        if (x != 2) { return 3; }
+    }
+    if (x != 1) { return 4; }
+
+    return 42;
+}

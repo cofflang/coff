@@ -1,0 +1,30 @@
+// expect: 42
+//
+// tests/64_large_hex_literal.c0 - a hex literal with the high bit set keeps its exact bit pattern
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// Regression test: a hex literal with the high bit set must keep its
+// exact bit pattern, not get clamped to LONG_MAX. coff0.c's lexer used
+// strtol, which clamps any digit sequence that does not fit a signed
+// long to 0x7FFFFFFFFFFFFFFF with ERANGE instead of preserving the
+// bits. I hit this with a real value, a packed 8x8 font glyph bitmap
+// (0xF88484F88484F800) that silently came back wrong. Fixed with
+// strtoul, which parses the same digits as an unsigned magnitude; the
+// cast back to long just reinterprets the bits. Same fix on the decimal
+// path, for the same reason. The c0-written lexers never had this bug:
+// their `v = v*16 + digit` accumulation wraps naturally in the
+// register. They still get run over this file, since it is part of
+// the same differential corpus as every other test.
+//
+// Checked with real arithmetic, not just "did it compile": the hex
+// literal must equal an independently expressed value built from
+// decimal plus unary minus, at a magnitude safely under the boundary
+// either parsing function would hit, so the comparison does not depend
+// on the same code path being right on both sides.
+int main() {
+    int hex_lit = 0xF88484F88484F800;
+    int expected = 0 - 539159852467554304;
+    if (hex_lit == expected) {
+        return 42;
+    }
+    return 0;
+}

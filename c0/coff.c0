@@ -1,0 +1,1816 @@
+// coff.c0 - the self-hosted c0 compiler, written in c0
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0.
+//
+// coff is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your
+// option) any later version. coff is distributed in the hope that it
+// will be useful, but WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+// the GNU General Public License for more details. You should have
+// received a copy of the license along with coff; if not, see
+// <https://www.gnu.org/licenses/>.
+
+// Purpose: this file IS the compiler. Lexer, parser, resolver and code
+// generator in one file; the binary built from it is called coff1.
+// Called as `coff1 input.c0 output.s` it reads and writes real files;
+// with no arguments it reads stdin and writes stdout (the form the
+// differential test harness uses).
+//
+// The output is byte-for-byte identical to what coff0 produces for the
+// same input. On any lex, parse or resolve error it prints an error
+// sentinel and exits 1, same rule as coff0: nothing is emitted until
+// the whole program is known to be valid.
+//
+// Verified as a real bootstrap fixpoint: coff0 compiling coff.c0
+// (stage 1) and coff.c0 compiling itself (stage 2) produce identical
+// assembly, and stage 2 compiling coff.c0 again (stage 3) matches
+// stage 2. See the fixpoint checks in run_tests.sh.
+//
+// Token record: 32 bytes — 0 kind, 8 ival, 16 name ptr, 24 len. Same as
+// parse.c0.
+// Token kinds: 1 NUM, 2 IDENT, 3 STR, 4 PLUS, 5 MINUS, 6 STAR, 7 SLASH,
+//   8 ASSIGN, 9 EQ, 10 NE, 11 LT, 12 LE, 13 GT, 14 GE, 15 LPAREN,
+//   16 RPAREN, 17 LBRACE, 18 RBRACE, 19 SEMI, 20 COMMA, 21 INT, 22 IF,
+//   23 ELSE, 24 WHILE, 25 RETURN, 26 EOF, 27 AND, 28 OR, 29 BREAK, 30 CONTINUE,
+//   31 LBRACKET, 32 RBRACKET, 33 VOID.
+//
+// AST node: 72 bytes (parse.c0's 64-byte record plus one more slot) —
+//   0 kind, 8 ival, 16 name/str ptr, 24 str len,
+//   32 child1 (lhs/cond/args/body), 40 child2 (rhs/then), 48 child3 (else),
+//   56 next sibling, 64 extra (VAR/ASSIGN: is_global flag; STR: string
+//   table index, assigned at parse time so numbering matches coff0's).
+// Node kinds: same numbering as parse.c0 (1 NUM .. 22 BLOCK), plus
+//   23 AND, 24 OR (both short-circuiting; precedence between equality and
+//   the statement grammar, || loosest of the two), 25 BREAK, 26 CONTINUE
+//   (both only valid inside a while loop — resolve() enforces this),
+//   27 INDEX (child1=base, child2=index; buf[i] sugar over load8(buf+i)),
+//   28 INDEXASSIGN (child1=base, child2=index, child3=value),
+//   29 FUNCREF (a VAR node (kind 3) whose name turned out to be a declared
+//   function rather than a variable/global -- resolve() rewrites its kind
+//   in place; evaluates to the function's address via `lea`). The extra
+//   field (offset 64) is also reused for CALL nodes (kind 6): 1 means this
+//   call's `name` is a variable holding a function-reference value rather
+//   than a declared function, so gen_call must call *through* its value
+//   instead of calling `name` directly (indirect call).
+//
+// Function record: 104 bytes (parse.c0's 96-byte record plus stack_size) —
+//   0 name, 8 nparams, 16+8i param names for the first 6 (register-passed),
+//   64 body, 72 next, 80 stack_size (filled in by resolve_function),
+//   88 is_void (1 if declared "void" instead of "int" -- may not return a
+//   value), 96 extra_params (head of a linked list for the 7th param
+//   onward, stack-passed; max 16 total params). Extra-param node: 16
+//   bytes — 0 name, 8 next.
+// Global record: 24 bytes — 0 name, 8 init, 16 next. Same as parse.c0.
+
+int toks = 0;
+int tpos = 0;
+
+int fhead = 0;
+int ghead = 0;
+
+int sym_names = 0;
+int sym_offsets = 0;
+int sym_count = 0;
+int stack_size = 0;
+int loop_depth = 0;
+int current_fn_is_void = 0;
+
+int scope_marks = 0;
+int scope_depth = 0;
+
+int string_ptrs = 0;
+int string_lens = 0;
+int string_count = 0;
+
+int label_count = 0;
+int current_ret_label = 0;
+
+int loop_labels = 0;
+int gen_loop_depth = 0;
+
+int outfd = 1;
+
+// Include-expansion state. The real logic is in the "includes" section
+// below; these are just the globals it shares across recursive calls.
+int INCLUDE_MAX_DEPTH = 32;
+int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
+int include_depth = 0;
+int EXPAND_CAP = 4194304; // 4MB
+int expand_buf = 0;
+int expand_len = 0;
+
+// --- shared helpers (same as parse.c0) -------------------------------------
+
+int strlen_(int s) {
+    int i = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+// All generated assembly goes through emit() rather than the print()
+// builtin, because print() always targets stdout. emit() targets outfd,
+// which main() points at the output file when one is given, or leaves
+// at stdout otherwise.
+void emit(int s) {
+    write(outfd, s, strlen_(s));
+    return;
+}
+
+int is_digit(int c) {
+    if (c >= '0' && c <= '9') { return 1; }
+    return 0;
+}
+
+int is_hex_digit(int c) {
+    if (is_digit(c) == 1) { return 1; }
+    if (c >= 'a' && c <= 'f') { return 1; }
+    if (c >= 'A' && c <= 'F') { return 1; }
+    return 0;
+}
+
+int hex_value(int c) {
+    if (is_digit(c) == 1) { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return c - 'A' + 10;
+}
+
+int is_ident_start(int c) {
+    if (c >= 'a' && c <= 'z') { return 1; }
+    if (c >= 'A' && c <= 'Z') { return 1; }
+    if (c == '_') { return 1; }
+    return 0;
+}
+
+int is_ident_char(int c) {
+    if (is_digit(c) == 1) { return 1; }
+    return is_ident_start(c);
+}
+
+void print_int(int v) {
+    int tmp = alloc(32);
+    int neg = 0;
+    int i = 31;
+    if (v == 0) { emit("0"); return; }
+    if (v < 0) { neg = 1; v = 0 - v; }
+    while (v > 0) {
+        i = i - 1;
+        tmp[i] = '0' + (v - (v / 10) * 10);
+        v = v / 10;
+    }
+    if (neg == 1) { i = i - 1; tmp[i] = '-'; }
+    emit(tmp + i);
+    return;
+}
+
+int word_is(int buf, int start, int len, int kw) {
+    int i = 0;
+    int k = 0;
+    while (i < len) {
+        k = kw[i];
+        if (k == 0) { return 0; }
+        if (buf[start + i] != k) { return 0; }
+        i = i + 1;
+    }
+    if (kw[len] != 0) { return 0; }
+    return 1;
+}
+
+int copy_bytes(int buf, int start, int len) {
+    int p = alloc(len + 1);
+    int i = 0;
+    while (i < len) {
+        p[i] = buf[start + i];
+        i = i + 1;
+    }
+    return p;
+}
+
+// Both sides are null-terminated byte pointers (identifiers and string
+// literals are always alloc'd fresh, hence zero-terminated).
+int streq(int a, int b) {
+    int i = 0;
+    int going = 1;
+    int result = 0;
+    int ca = 0;
+    int cb = 0;
+    while (going == 1) {
+        ca = a[i];
+        cb = b[i];
+        if (ca != cb) { going = 0; }
+        else if (ca == 0) { going = 0; result = 1; }
+        else { i = i + 1; }
+    }
+    return result;
+}
+
+// -------------------------------------------------------------- includes
+//
+// `include "path.c0";` is pure textual substitution, resolved before
+// real lexing starts. Mirrors coff0.c's resolve_includes exactly (and
+// the identical copies in lex.c0/parse.c0), differentially verified
+// against all of them; see coff0.c for the design. This is the
+// load-bearing copy -- coff1, built from this file, is the compiler
+// real programs are built with.
+
+// Directory part of `path` (a null-terminated string), trailing slash
+// included so callers can concatenate directly. A fresh empty string
+// when the path has no slash at all.
+int dirname_with_slash(int path) {
+    int len = strlen_(path);
+    int i = len - 1;
+    while (i >= 0) {
+        if (load8(path + i) == '/') {
+            return copy_bytes(path, 0, i + 1);
+        }
+        i = i - 1;
+    }
+    int empty = alloc(1);
+    store8(empty, 0);
+    return empty;
+}
+
+int join_path(int dir, int rel) {
+    int dl = strlen_(dir);
+    int rl = strlen_(rel);
+    int out = alloc(dl + rl + 1);
+    int i = 0;
+    while (i < dl) {
+        store8(out + i, load8(dir + i));
+        i = i + 1;
+    }
+    int j = 0;
+    while (j < rl) {
+        store8(out + dl + j, load8(rel + j));
+        j = j + 1;
+    }
+    store8(out + dl + rl, 0);
+    return out;
+}
+
+void expand_putc(int c) {
+    if (expand_len >= EXPAND_CAP) {
+        print("PARSEERROR\n");
+        exit(1);
+    }
+    store8(expand_buf + expand_len, c);
+    expand_len = expand_len + 1;
+    return;
+}
+
+// Reads `path` and scans its raw text for `include "X";` directives,
+// copying everything else through unchanged (string literals, char
+// literals and // comments verbatim, so none of them can trigger a
+// false match). Each include is expanded recursively in place, appended
+// into the shared expand_buf/expand_len globals. include_stack and
+// include_depth guard against a file including itself, directly or
+// transitively. Char literals get the same verbatim-copy treatment as
+// strings on purpose: without it, a literal like '"' makes the scanner
+// enter string-skip mode at that bare quote and swallow everything up
+// to the next `"` in the file. A real bug, found when lex.c0's
+// identical copy of this function failed to lex its own source (which
+// contains `!= '"'`).
+void expand_file(int path) {
+    int i = 0;
+    while (i < include_depth) {
+        if (streq(load64(include_stack + i * 8), path) == 1) {
+            print("PARSEERROR\n");
+            exit(1);
+        }
+        i = i + 1;
+    }
+    if (include_depth >= INCLUDE_MAX_DEPTH) {
+        print("PARSEERROR\n");
+        exit(1);
+    }
+    store64(include_stack + include_depth * 8, path);
+    include_depth = include_depth + 1;
+
+    int fd = open_read(path);
+    if (fd < 0) {
+        print("PARSEERROR\n");
+        exit(1);
+    }
+    int src = alloc(1048576);
+    int n = 0;
+    int got = read(fd, src, 1048576);
+    while (got > 0) {
+        n = n + got;
+        got = read(fd, src + n, 1048576 - n);
+    }
+    close(fd);
+
+    int dir = dirname_with_slash(path);
+    int p = 0;
+    while (p < n) {
+        int c = load8(src + p);
+        if (c == '"') {
+            expand_putc(c);
+            p = p + 1;
+            int scanning = 1;
+            while (scanning == 1) {
+                if (p >= n || load8(src + p) == '"') { scanning = 0; }
+                else {
+                    int sc = load8(src + p);
+                    if (sc == '\\' && p + 1 < n) {
+                        expand_putc(sc);
+                        p = p + 1;
+                        expand_putc(load8(src + p));
+                        p = p + 1;
+                    } else {
+                        expand_putc(sc);
+                        p = p + 1;
+                    }
+                }
+            }
+            if (p < n) { expand_putc('"'); p = p + 1; }
+        } else if (c == '\'') {
+            expand_putc(c);
+            p = p + 1;
+            if (p < n && load8(src + p) == '\\' && p + 1 < n) {
+                expand_putc(load8(src + p));
+                p = p + 1;
+                expand_putc(load8(src + p));
+                p = p + 1;
+            } else if (p < n) {
+                expand_putc(load8(src + p));
+                p = p + 1;
+            }
+            if (p < n && load8(src + p) == '\'') {
+                expand_putc('\'');
+                p = p + 1;
+            }
+        } else if (c == '/' && p + 1 < n && load8(src + p + 1) == '/') {
+            while (p < n && load8(src + p) != '\n') {
+                expand_putc(load8(src + p));
+                p = p + 1;
+            }
+        } else if (is_ident_start(c) == 1) {
+            int start = p;
+            while (p < n && is_ident_char(load8(src + p)) == 1) {
+                p = p + 1;
+            }
+            int wlen = p - start;
+            if (wlen == 7 && word_is(src, start, 7, "include") == 1) {
+                int q = p;
+                while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
+                    q = q + 1;
+                }
+                if (q >= n || load8(src + q) != '"') { print("PARSEERROR\n"); exit(1); }
+                q = q + 1;
+                int pstart = q;
+                while (q < n && load8(src + q) != '"') { q = q + 1; }
+                if (q >= n) { print("PARSEERROR\n"); exit(1); }
+                int rel = copy_bytes(src, pstart, q - pstart);
+                q = q + 1;
+                while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
+                    q = q + 1;
+                }
+                if (q >= n || load8(src + q) != ';') { print("PARSEERROR\n"); exit(1); }
+                q = q + 1;
+                expand_file(join_path(dir, rel));
+                p = q;
+            } else {
+                int k = start;
+                while (k < p) {
+                    expand_putc(load8(src + k));
+                    k = k + 1;
+                }
+            }
+        } else {
+            expand_putc(c);
+            p = p + 1;
+        }
+    }
+
+    include_depth = include_depth - 1;
+    return;
+}
+
+void perr() {
+    print("PARSEERROR\n");
+    exit(1);
+    return;
+}
+
+void cerr() {
+    print("CODEGENERROR\n");
+    exit(1);
+    return;
+}
+
+void tok_put(int i, int kind, int ival, int name, int len) {
+    int p = toks + i * 32;
+    store64(p, kind);
+    store64(p + 8, ival);
+    store64(p + 16, name);
+    store64(p + 24, len);
+    return;
+}
+
+int tok_kind(int i) { return load64(toks + i * 32); }
+int tok_ival(int i) { return load64(toks + i * 32 + 8); }
+int tok_name(int i) { return load64(toks + i * 32 + 16); }
+int tok_len(int i)  { return load64(toks + i * 32 + 24); }
+
+// Lex all of buf[0..n) into the global token array; appends an EOF token.
+void lex_all(int buf, int n) {
+    int pos = 0;
+    int t = 0;
+    int c = 0;
+    int nxt = 0;
+    int going = 0;
+    int v = 0;
+    int d = 0;
+    int start = 0;
+    int len = 0;
+    int s = 0;
+    int e = 0;
+    int q = 0;
+    int name = 0;
+    int sbuf = 0;
+    int slen = 0;
+    int base = 0;
+    int is_hex = 0;
+
+    toks = alloc((n + 2) * 32);
+
+    while (pos < n) {
+        c = load8(buf + pos);
+
+        if (c == ' ') { pos = pos + 1; }
+        else if (c == '\n') { pos = pos + 1; }
+        else if (c == '\t') { pos = pos + 1; }
+        else if (c == 13) { pos = pos + 1; }
+
+        else if (c == '/') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '/') {
+                going = 1;
+                while (going == 1) {
+                    if (pos < n) {
+                        if (load8(buf + pos) != '\n') { pos = pos + 1; }
+                        else { going = 0; }
+                    } else { going = 0; }
+                }
+            } else {
+                tok_put(t, 7, 0, 0, 0);
+                t = t + 1;
+                pos = pos + 1;
+            }
+        }
+
+        else if (is_digit(c) == 1) {
+            v = 0;
+            base = 10;
+            is_hex = 0;
+            if (c == '0' && pos + 2 < n) {
+                nxt = load8(buf + pos + 1);
+                if ((nxt == 'x' || nxt == 'X') && is_hex_digit(load8(buf + pos + 2)) == 1) {
+                    is_hex = 1;
+                }
+            }
+            if (is_hex == 1) { pos = pos + 2; base = 16; }
+            going = 1;
+            while (going == 1) {
+                if (pos < n) {
+                    d = load8(buf + pos);
+                    if (base == 16) {
+                        if (is_hex_digit(d) == 1) {
+                            v = v * 16 + hex_value(d);
+                            pos = pos + 1;
+                        } else { going = 0; }
+                    } else if (is_digit(d) == 1) {
+                        v = v * 10 + (d - '0');
+                        pos = pos + 1;
+                    } else { going = 0; }
+                } else { going = 0; }
+            }
+            tok_put(t, 1, v, 0, 0);
+            t = t + 1;
+        }
+
+        else if (is_ident_start(c) == 1) {
+            start = pos;
+            going = 1;
+            while (going == 1) {
+                if (pos < n) {
+                    if (is_ident_char(load8(buf + pos)) == 1) { pos = pos + 1; }
+                    else { going = 0; }
+                } else { going = 0; }
+            }
+            len = pos - start;
+            if (word_is(buf, start, len, "int") == 1) { tok_put(t, 21, 0, 0, 0); }
+            else if (word_is(buf, start, len, "if") == 1) { tok_put(t, 22, 0, 0, 0); }
+            else if (word_is(buf, start, len, "else") == 1) { tok_put(t, 23, 0, 0, 0); }
+            else if (word_is(buf, start, len, "while") == 1) { tok_put(t, 24, 0, 0, 0); }
+            else if (word_is(buf, start, len, "return") == 1) { tok_put(t, 25, 0, 0, 0); }
+            else if (word_is(buf, start, len, "break") == 1) { tok_put(t, 29, 0, 0, 0); }
+            else if (word_is(buf, start, len, "continue") == 1) { tok_put(t, 30, 0, 0, 0); }
+            else if (word_is(buf, start, len, "void") == 1) { tok_put(t, 33, 0, 0, 0); }
+            else {
+                name = copy_bytes(buf, start, len);
+                tok_put(t, 2, 0, name, len);
+            }
+            t = t + 1;
+        }
+
+        else if (c == '"') {
+            pos = pos + 1;
+            sbuf = alloc(n + 1);
+            slen = 0;
+            going = 1;
+            while (going == 1) {
+                if (pos >= n) { perr(); }
+                s = load8(buf + pos);
+                if (s == '"') {
+                    going = 0;
+                    pos = pos + 1;
+                } else if (s == '\\') {
+                    pos = pos + 1;
+                    if (pos >= n) { perr(); }
+                    e = load8(buf + pos);
+                    v = 0 - 1;
+                    if (e == 'n') { v = '\n'; }
+                    if (e == 't') { v = '\t'; }
+                    if (e == '\\') { v = '\\'; }
+                    if (e == '"') { v = '"'; }
+                    if (v < 0) { perr(); }
+                    store8(sbuf + slen, v);
+                    slen = slen + 1;
+                    pos = pos + 1;
+                } else {
+                    store8(sbuf + slen, s);
+                    slen = slen + 1;
+                    pos = pos + 1;
+                }
+            }
+            tok_put(t, 3, 0, sbuf, slen);
+            t = t + 1;
+        }
+
+        else if (c == '\'') {
+            pos = pos + 1;
+            if (pos >= n) { perr(); }
+            v = 0 - 1;
+            e = load8(buf + pos);
+            if (e == '\\') {
+                pos = pos + 1;
+                if (pos >= n) { perr(); }
+                q = load8(buf + pos);
+                if (q == 'n') { v = '\n'; }
+                if (q == 't') { v = '\t'; }
+                if (q == '\\') { v = '\\'; }
+                if (q == '\'') { v = '\''; }
+                if (q == '0') { v = 0; }
+                if (v < 0) {
+                    if (q != '0') { perr(); }
+                }
+                pos = pos + 1;
+            } else {
+                if (e == '\'') { perr(); }
+                v = e;
+                pos = pos + 1;
+            }
+            if (pos >= n) { perr(); }
+            if (load8(buf + pos) != '\'') { perr(); }
+            pos = pos + 1;
+            tok_put(t, 1, v, 0, 0);
+            t = t + 1;
+        }
+
+        else if (c == '=') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 9, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 8, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
+        }
+        else if (c == '!') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 10, 0, 0, 0); pos = pos + 2; t = t + 1; }
+            else { perr(); }
+        }
+        else if (c == '<') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 11, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
+        }
+        else if (c == '>') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 13, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
+        }
+        else if (c == '+') { tok_put(t, 4, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '-') { tok_put(t, 5, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '*') { tok_put(t, 6, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '(') { tok_put(t, 15, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == ')') { tok_put(t, 16, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '{') { tok_put(t, 17, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '}') { tok_put(t, 18, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == ';') { tok_put(t, 19, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == ',') { tok_put(t, 20, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '&') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; t = t + 1; }
+            else { perr(); }
+        }
+        else if (c == '|') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; t = t + 1; }
+            else { perr(); }
+        }
+        else if (c == '[') { tok_put(t, 31, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == ']') { tok_put(t, 32, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else { perr(); }
+    }
+
+    tok_put(t, 26, 0, 0, 0);
+    return;
+}
+
+// Name of the i'th declared parameter, wherever it lives (inline
+// register slot or the extra_params list).
+int param_name_at(int f, int i) {
+    int p = 0;
+    int k = 0;
+    if (i < 6) { return load64(f + 16 + i * 8); }
+    p = load64(f + 96);
+    k = i - 6;
+    while (k > 0) {
+        p = load64(p + 8);
+        k = k - 1;
+    }
+    return load64(p);
+}
+
+// --- parser (builds 72-byte nodes; registers string literals as it goes) --
+
+int new_node(int kind) {
+    int p = alloc(72);
+    store64(p, kind);
+    return p;
+}
+
+void expect(int k) {
+    if (tok_kind(tpos) != k) { perr(); }
+    tpos = tpos + 1;
+    return;
+}
+
+int p_primary() {
+    int nd = 0;
+    int name = 0;
+    int k = 0;
+    int head = 0;
+    int tail = 0;
+    int a = 0;
+    k = tok_kind(tpos);
+    if (k == 15) {
+        tpos = tpos + 1;
+        nd = p_expr();
+        expect(16);
+        return nd;
+    }
+    if (k == 1) {
+        nd = new_node(1);
+        store64(nd + 8, tok_ival(tpos));
+        tpos = tpos + 1;
+        return nd;
+    }
+    if (k == 3) {
+        nd = new_node(2);
+        store64(nd + 16, tok_name(tpos));
+        store64(nd + 24, tok_len(tpos));
+        if (string_count >= 512) { cerr(); }
+        store64(string_ptrs + string_count * 8, tok_name(tpos));
+        store64(string_lens + string_count * 8, tok_len(tpos));
+        store64(nd + 64, string_count);
+        string_count = string_count + 1;
+        tpos = tpos + 1;
+        return nd;
+    }
+    if (k == 2) {
+        name = tok_name(tpos);
+        tpos = tpos + 1;
+        if (tok_kind(tpos) == 15) {
+            tpos = tpos + 1;
+            nd = new_node(6);
+            store64(nd + 16, name);
+            head = 0;
+            tail = 0;
+            if (tok_kind(tpos) != 16) {
+                a = p_expr();
+                head = a;
+                tail = a;
+                while (tok_kind(tpos) == 20) {
+                    tpos = tpos + 1;
+                    a = p_expr();
+                    store64(tail + 56, a);
+                    tail = a;
+                }
+            }
+            expect(16);
+            store64(nd + 32, head);
+            return nd;
+        }
+        nd = new_node(3);
+        store64(nd + 16, name);
+        return nd;
+    }
+    perr();
+    return 0;
+}
+
+int p_postfix() {
+    int nd = 0;
+    int idx = 0;
+    nd = p_primary();
+    while (tok_kind(tpos) == 31) {
+        tpos = tpos + 1;
+        idx = new_node(27);
+        store64(idx + 32, nd);
+        store64(idx + 40, p_expr());
+        expect(32);
+        nd = idx;
+    }
+    return nd;
+}
+
+int p_unary() {
+    int nd = 0;
+    if (tok_kind(tpos) == 5) {
+        tpos = tpos + 1;
+        nd = new_node(17);
+        store64(nd + 32, p_unary());
+        return nd;
+    }
+    return p_postfix();
+}
+
+int p_term() {
+    int left = 0;
+    int nd = 0;
+    int op = 0;
+    left = p_unary();
+    while (1) {
+        op = tok_kind(tpos);
+        if (op == 6) {
+            tpos = tpos + 1;
+            nd = new_node(9);
+            store64(nd + 32, left);
+            store64(nd + 40, p_unary());
+            left = nd;
+        } else if (op == 7) {
+            tpos = tpos + 1;
+            nd = new_node(10);
+            store64(nd + 32, left);
+            store64(nd + 40, p_unary());
+            left = nd;
+        } else { break; }
+    }
+    return left;
+}
+
+int p_add() {
+    int left = 0;
+    int nd = 0;
+    int op = 0;
+    left = p_term();
+    while (1) {
+        op = tok_kind(tpos);
+        if (op == 4) {
+            tpos = tpos + 1;
+            nd = new_node(7);
+            store64(nd + 32, left);
+            store64(nd + 40, p_term());
+            left = nd;
+        } else if (op == 5) {
+            tpos = tpos + 1;
+            nd = new_node(8);
+            store64(nd + 32, left);
+            store64(nd + 40, p_term());
+            left = nd;
+        } else { break; }
+    }
+    return left;
+}
+
+int p_rel() {
+    int left = 0;
+    int nd = 0;
+    int op = 0;
+    int kind = 0;
+    left = p_add();
+    while (1) {
+        op = tok_kind(tpos);
+        kind = 0;
+        if (op == 11) { kind = 13; }
+        if (op == 12) { kind = 14; }
+        if (op == 13) { kind = 15; }
+        if (op == 14) { kind = 16; }
+        if (kind > 0) {
+            tpos = tpos + 1;
+            nd = new_node(kind);
+            store64(nd + 32, left);
+            store64(nd + 40, p_add());
+            left = nd;
+        } else { break; }
+    }
+    return left;
+}
+
+int p_equality() {
+    int left = 0;
+    int nd = 0;
+    int op = 0;
+    int kind = 0;
+    left = p_rel();
+    while (1) {
+        op = tok_kind(tpos);
+        kind = 0;
+        if (op == 9) { kind = 11; }
+        if (op == 10) { kind = 12; }
+        if (kind > 0) {
+            tpos = tpos + 1;
+            nd = new_node(kind);
+            store64(nd + 32, left);
+            store64(nd + 40, p_rel());
+            left = nd;
+        } else { break; }
+    }
+    return left;
+}
+
+int p_logic_and() {
+    int left = 0;
+    int nd = 0;
+    left = p_equality();
+    while (tok_kind(tpos) == 27) {
+        tpos = tpos + 1;
+        nd = new_node(23);
+        store64(nd + 32, left);
+        store64(nd + 40, p_equality());
+        left = nd;
+    }
+    return left;
+}
+
+int p_logic_or() {
+    int left = 0;
+    int nd = 0;
+    left = p_logic_and();
+    while (tok_kind(tpos) == 28) {
+        tpos = tpos + 1;
+        nd = new_node(24);
+        store64(nd + 32, left);
+        store64(nd + 40, p_logic_and());
+        left = nd;
+    }
+    return left;
+}
+
+int p_expr() {
+    return p_logic_or();
+}
+
+int p_stmt() {
+    int nd = 0;
+    int name = 0;
+    int k = 0;
+    int e = 0;
+    int out = 0;
+    k = tok_kind(tpos);
+    if (k == 17) { return p_block(); }
+    if (k == 21) {
+        tpos = tpos + 1;
+        if (tok_kind(tpos) != 2) { perr(); }
+        name = tok_name(tpos);
+        tpos = tpos + 1;
+        nd = new_node(5);
+        store64(nd + 16, name);
+        if (tok_kind(tpos) == 8) {
+            tpos = tpos + 1;
+            store64(nd + 40, p_expr());
+        }
+        expect(19);
+        return nd;
+    }
+    if (k == 22) {
+        tpos = tpos + 1;
+        expect(15);
+        nd = new_node(18);
+        store64(nd + 32, p_expr());
+        expect(16);
+        store64(nd + 40, p_stmt());
+        if (tok_kind(tpos) == 23) {
+            tpos = tpos + 1;
+            store64(nd + 48, p_stmt());
+        }
+        return nd;
+    }
+    if (k == 24) {
+        tpos = tpos + 1;
+        expect(15);
+        nd = new_node(19);
+        store64(nd + 32, p_expr());
+        expect(16);
+        store64(nd + 40, p_stmt());
+        return nd;
+    }
+    if (k == 25) {
+        tpos = tpos + 1;
+        nd = new_node(20);
+        if (tok_kind(tpos) != 19) { store64(nd + 32, p_expr()); }
+        expect(19);
+        return nd;
+    }
+    if (k == 29) {
+        tpos = tpos + 1;
+        expect(19);
+        return new_node(25);
+    }
+    if (k == 30) {
+        tpos = tpos + 1;
+        expect(19);
+        return new_node(26);
+    }
+    // Parse a full expression first, then decide what the statement is:
+    // a plain assignment (VAR '=' expr), an indexed assignment (buf[i]
+    // '=' expr), or, with no '=' following, an expression statement.
+    // The left side of buf[i] = v can be any length, so this cannot
+    // dispatch on a fixed token peek like the statement forms above.
+    e = p_expr();
+    if (tok_kind(tpos) == 8) {
+        tpos = tpos + 1;
+        if (load64(e) == 3) {
+            name = load64(e + 16);
+            out = new_node(4);
+            store64(out + 16, name);
+            store64(out + 40, p_expr());
+            expect(19);
+            return out;
+        }
+        if (load64(e) == 27) {
+            out = new_node(28);
+            store64(out + 32, load64(e + 32));
+            store64(out + 40, load64(e + 40));
+            store64(out + 48, p_expr());
+            expect(19);
+            return out;
+        }
+        perr();
+    }
+    out = new_node(21);
+    store64(out + 32, e);
+    expect(19);
+    return out;
+}
+
+int p_block() {
+    int nd = 0;
+    int head = 0;
+    int tail = 0;
+    int s = 0;
+    expect(17);
+    nd = new_node(22);
+    while (tok_kind(tpos) != 18) {
+        s = p_stmt();
+        if (head == 0) { head = s; tail = s; }
+        else { store64(tail + 56, s); tail = s; }
+    }
+    expect(18);
+    store64(nd + 32, head);
+    return nd;
+}
+
+// --- builtins table ---------------------------------------------------------
+
+int builtin_arity(int name) {
+    if (streq(name, "print") == 1) { return 1; }
+    if (streq(name, "write") == 1) { return 3; }
+    if (streq(name, "read") == 1) { return 3; }
+    if (streq(name, "open_read") == 1) { return 1; }
+    if (streq(name, "open_write") == 1) { return 1; }
+    if (streq(name, "close") == 1) { return 1; }
+    if (streq(name, "alloc") == 1) { return 1; }
+    if (streq(name, "load8") == 1) { return 1; }
+    if (streq(name, "store8") == 1) { return 2; }
+    if (streq(name, "load64") == 1) { return 1; }
+    if (streq(name, "store64") == 1) { return 2; }
+    if (streq(name, "exit") == 1) { return 1; }
+    if (streq(name, "argc") == 1) { return 0; }
+    if (streq(name, "argv") == 1) { return 1; }
+    if (streq(name, "outb") == 1) { return 2; }
+    if (streq(name, "inb") == 1) { return 1; }
+    return 0 - 1;
+}
+
+int is_builtin(int name) {
+    if (builtin_arity(name) >= 0) { return 1; }
+    return 0;
+}
+
+int arg_reg(int i) {
+    if (i == 0) { return "rdi"; }
+    if (i == 1) { return "rsi"; }
+    if (i == 2) { return "rdx"; }
+    if (i == 3) { return "rcx"; }
+    if (i == 4) { return "r8"; }
+    return "r9";
+}
+
+// --- resolve: assign stack offsets to locals, mark global VAR/ASSIGN uses -
+
+int func_nparams_of(int name) {
+    int f = fhead;
+    while (f != 0) {
+        if (streq(load64(f), name) == 1) { return load64(f + 8); }
+        f = load64(f + 72);
+    }
+    cerr();
+    return 0;
+}
+
+int func_exists(int name) {
+    int f = fhead;
+    while (f != 0) {
+        if (streq(load64(f), name) == 1) { return 1; }
+        f = load64(f + 72);
+    }
+    return 0;
+}
+
+int glob_exists(int name) {
+    int g = ghead;
+    while (g != 0) {
+        if (streq(load64(g), name) == 1) { return 1; }
+        g = load64(g + 16);
+    }
+    return 0;
+}
+
+// Scans the most recently declared names first (highest index first) so
+// an inner scope's variable shadows an outer one with the same name.
+int sym_try_lookup(int name) {
+    int i = sym_count - 1;
+    while (i >= 0) {
+        if (streq(load64(sym_names + i * 8), name) == 1) { return load64(sym_offsets + i * 8); }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+int sym_declared_in_scope(int name) {
+    int scope_start = 0;
+    int i = 0;
+    if (scope_depth > 0) { scope_start = load64(scope_marks + (scope_depth - 1) * 8); }
+    i = scope_start;
+    while (i < sym_count) {
+        if (streq(load64(sym_names + i * 8), name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+int sym_declare(int name) {
+    int off = 0;
+    if (sym_declared_in_scope(name) == 1) { cerr(); }
+    if (sym_count >= 256) { cerr(); }
+    off = (sym_count + 1) * 8;
+    store64(sym_names + sym_count * 8, name);
+    store64(sym_offsets + sym_count * 8, off);
+    sym_count = sym_count + 1;
+    if (off > stack_size) { stack_size = off; }
+    return off;
+}
+
+void resolve(int nd) {
+    int k = 0;
+    int name = 0;
+    int off = 0;
+    int args = 0;
+    int a = 0;
+    int nargs = 0;
+    int bar = 0;
+    if (nd == 0) { return; }
+    k = load64(nd);
+    if (k == 1) { return; }
+    if (k == 2) { return; }
+    if (k == 3) {
+        name = load64(nd + 16);
+        off = sym_try_lookup(name);
+        if (off >= 0) { store64(nd + 8, off); return; }
+        if (glob_exists(name) == 1) { store64(nd + 64, 1); return; }
+        if (func_exists(name) == 1) { store64(nd, 29); return; }
+        cerr();
+        return;
+    }
+    if (k == 29) { return; } // FUNCREF only exists post-resolve, made by the k==3 case above
+    if (k == 4) {
+        resolve(load64(nd + 40));
+        name = load64(nd + 16);
+        off = sym_try_lookup(name);
+        if (off >= 0) { store64(nd + 8, off); return; }
+        if (glob_exists(name) == 1) { store64(nd + 64, 1); return; }
+        cerr();
+        return;
+    }
+    if (k == 5) {
+        if (load64(nd + 40) != 0) { resolve(load64(nd + 40)); }
+        store64(nd + 8, sym_declare(load64(nd + 16)));
+        return;
+    }
+    if (k == 6) {
+        name = load64(nd + 16);
+        args = load64(nd + 32);
+        nargs = 0;
+        a = args;
+        while (a != 0) { nargs = nargs + 1; a = load64(a + 56); }
+        bar = builtin_arity(name);
+        if (bar >= 0) {
+            if (nargs != bar) { cerr(); }
+        } else if (func_exists(name) == 1) {
+            if (func_nparams_of(name) != nargs) { cerr(); }
+        } else {
+            // Not a builtin and not a declared function. If the name is
+            // a variable, this is an indirect call through its value.
+            // No arity check is possible (see coff0.c for why). Offset
+            // 64, unused by CALL otherwise, encodes 0 = direct call,
+            // 1 = indirect via a global, 2 = indirect via a local or
+            // param (whose stack offset then lives in offset 8, the
+            // same slot VAR uses for the same purpose).
+            off = sym_try_lookup(name);
+            if (off >= 0) { store64(nd + 8, off); store64(nd + 64, 2); }
+            else if (glob_exists(name) == 1) { store64(nd + 64, 1); }
+            else { cerr(); }
+        }
+        a = args;
+        while (a != 0) { resolve(a); a = load64(a + 56); }
+        return;
+    }
+    if (k >= 7 && k <= 16) { resolve(load64(nd + 32)); resolve(load64(nd + 40)); return; }
+    if (k == 23) { resolve(load64(nd + 32)); resolve(load64(nd + 40)); return; }
+    if (k == 24) { resolve(load64(nd + 32)); resolve(load64(nd + 40)); return; }
+    if (k == 17) { resolve(load64(nd + 32)); return; }
+    if (k == 18) {
+        resolve(load64(nd + 32));
+        resolve(load64(nd + 40));
+        if (load64(nd + 48) != 0) { resolve(load64(nd + 48)); }
+        return;
+    }
+    if (k == 19) {
+        resolve(load64(nd + 32));
+        loop_depth = loop_depth + 1;
+        resolve(load64(nd + 40));
+        loop_depth = loop_depth - 1;
+        return;
+    }
+    if (k == 20) {
+        if (current_fn_is_void == 1) { if (load64(nd + 32) != 0) { cerr(); } }
+        resolve(load64(nd + 32));
+        return;
+    }
+    if (k == 21) { resolve(load64(nd + 32)); return; }
+    if (k == 22) {
+        if (scope_depth >= 64) { cerr(); }
+        store64(scope_marks + scope_depth * 8, sym_count);
+        scope_depth = scope_depth + 1;
+        a = load64(nd + 32);
+        while (a != 0) { resolve(a); a = load64(a + 56); }
+        scope_depth = scope_depth - 1;
+        sym_count = load64(scope_marks + scope_depth * 8);
+        return;
+    }
+    if (k == 25) { if (loop_depth <= 0) { cerr(); } return; }
+    if (k == 26) { if (loop_depth <= 0) { cerr(); } return; }
+    if (k == 27) { resolve(load64(nd + 32)); resolve(load64(nd + 40)); return; }
+    if (k == 28) {
+        resolve(load64(nd + 32));
+        resolve(load64(nd + 40));
+        resolve(load64(nd + 48));
+        return;
+    }
+    return;
+}
+
+// --- codegen: emit assembly byte-identical to coff0's own gen_expr/gen_stmt
+
+void gen_block(int nd) {
+    int s = load64(nd + 32);
+    while (s != 0) {
+        gen_stmt(s);
+        s = load64(s + 56);
+    }
+    return;
+}
+
+void gen_binop(int nd, int k) {
+    gen_expr(load64(nd + 32));
+    emit("    push rax\n");
+    gen_expr(load64(nd + 40));
+    emit("    mov rcx, rax\n");
+    emit("    pop rax\n");
+    if (k == 7) { emit("    add rax, rcx\n"); return; }
+    if (k == 8) { emit("    sub rax, rcx\n"); return; }
+    if (k == 9) { emit("    imul rax, rcx\n"); return; }
+    if (k == 10) { emit("    cqo\n    idiv rcx\n"); return; }
+    if (k == 11) { emit("    cmp rax, rcx\n    sete al\n    movzx rax, al\n"); return; }
+    if (k == 12) { emit("    cmp rax, rcx\n    setne al\n    movzx rax, al\n"); return; }
+    if (k == 13) { emit("    cmp rax, rcx\n    setl al\n    movzx rax, al\n"); return; }
+    if (k == 14) { emit("    cmp rax, rcx\n    setle al\n    movzx rax, al\n"); return; }
+    if (k == 15) { emit("    cmp rax, rcx\n    setg al\n    movzx rax, al\n"); return; }
+    if (k == 16) { emit("    cmp rax, rcx\n    setge al\n    movzx rax, al\n"); return; }
+    return;
+}
+
+void gen_call(int nd) {
+    int name = load64(nd + 16);
+    int args = load64(nd + 32);
+    int l = 0;
+    int i = 0;
+    int nargs = 0;
+    int a = 0;
+
+    if (streq(name, "print") == 1) {
+        l = label_count; label_count = label_count + 1;
+        gen_expr(args);
+        emit("    mov rbx, rax\n");
+        emit("    xor rcx, rcx\n");
+        emit(".Lstrlen"); print_int(l); emit(":\n");
+        emit("    cmp byte ptr [rbx + rcx], 0\n");
+        emit("    je .Lstrlend"); print_int(l); emit("\n");
+        emit("    inc rcx\n");
+        emit("    jmp .Lstrlen"); print_int(l); emit("\n");
+        emit(".Lstrlend"); print_int(l); emit(":\n");
+        emit("    mov rdx, rcx\n");
+        emit("    mov rsi, rbx\n");
+        emit("    mov rdi, 1\n");
+        emit("    mov rax, 1\n");
+        emit("    syscall\n");
+        return;
+    }
+    if (streq(name, "alloc") == 1) {
+        l = label_count; label_count = label_count + 1;
+        gen_expr(args);
+        emit("    push rax\n");
+        emit("    mov rax, [.Lcurbrk]\n");
+        emit("    test rax, rax\n");
+        emit("    jnz .Lbrkok"); print_int(l); emit("\n");
+        emit("    mov rdi, 0\n");
+        emit("    mov rax, 12\n");
+        emit("    syscall\n");
+        emit(".Lbrkok"); print_int(l); emit(":\n");
+        emit("    pop rdi\n");
+        emit("    push rax\n");
+        emit("    add rdi, rax\n");
+        emit("    mov rax, 12\n");
+        emit("    syscall\n");
+        emit("    mov [.Lcurbrk], rax\n");
+        emit("    pop rax\n");
+        return;
+    }
+    if (streq(name, "load8") == 1) {
+        gen_expr(args);
+        emit("    movzx rax, byte ptr [rax]\n");
+        return;
+    }
+    if (streq(name, "store8") == 1) {
+        gen_expr(args);
+        emit("    push rax\n");
+        gen_expr(load64(args + 56));
+        emit("    pop rdi\n");
+        emit("    mov byte ptr [rdi], al\n");
+        return;
+    }
+    if (streq(name, "exit") == 1) {
+        gen_expr(args);
+        emit("    mov rdi, rax\n");
+        emit("    mov rax, 60\n");
+        emit("    syscall\n");
+        return;
+    }
+    if (streq(name, "load64") == 1) {
+        gen_expr(args);
+        emit("    mov rax, [rax]\n");
+        return;
+    }
+    if (streq(name, "store64") == 1) {
+        gen_expr(args);
+        emit("    push rax\n");
+        gen_expr(load64(args + 56));
+        emit("    pop rdi\n");
+        emit("    mov [rdi], rax\n");
+        return;
+    }
+    if (streq(name, "argc") == 1) {
+        emit("    mov rax, [.Largv0]\n");
+        emit("    mov rax, [rax]\n");
+        return;
+    }
+    if (streq(name, "argv") == 1) {
+        gen_expr(args);
+        emit("    mov rcx, rax\n");
+        emit("    mov rax, [.Largv0]\n");
+        emit("    mov rax, [rax + rcx*8 + 8]\n");
+        return;
+    }
+    if (streq(name, "outb") == 1) {
+        gen_expr(args);
+        emit("    push rax\n");
+        gen_expr(load64(args + 56));
+        emit("    pop rdx\n");
+        emit("    out dx, al\n");
+        return;
+    }
+    if (streq(name, "inb") == 1) {
+        gen_expr(args);
+        emit("    mov rdx, rax\n");
+        emit("    in al, dx\n");
+        emit("    movzx rax, al\n");
+        return;
+    }
+
+    a = args;
+    while (a != 0) {
+        gen_expr(a);
+        emit("    push rax\n");
+        a = load64(a + 56);
+        nargs = nargs + 1;
+    }
+    if (nargs <= 6) {
+        i = nargs - 1;
+        while (i >= 0) {
+            emit("    pop "); emit(arg_reg(i)); emit("\n");
+            i = i - 1;
+        }
+    } else {
+        i = 0;
+        while (i < 6) {
+            emit("    mov "); emit(arg_reg(i)); emit(", [rsp + ");
+            print_int((nargs - 1 - i) * 8); emit("]\n");
+            i = i + 1;
+        }
+    }
+
+    if (streq(name, "write") == 1) { emit("    mov rax, 1\n    syscall\n"); return; }
+    if (streq(name, "read") == 1) { emit("    mov rax, 0\n    syscall\n"); return; }
+    if (streq(name, "close") == 1) { emit("    mov rax, 3\n    syscall\n"); return; }
+    if (streq(name, "open_read") == 1) {
+        emit("    mov rsi, 0\n");
+        emit("    mov rax, 2\n    syscall\n");
+        return;
+    }
+    if (streq(name, "open_write") == 1) {
+        emit("    mov rsi, 577\n");
+        emit("    mov rdx, 420\n");
+        emit("    mov rax, 2\n    syscall\n");
+        return;
+    }
+    if (load64(nd + 64) == 1) {
+        // Indirect call through a global holding a function address.
+        // r10 is free here (caller-saved, and not one of the six arg
+        // registers), loaded once the real args are already in place.
+        emit("    mov r10, [.G"); emit(name); emit("]\n");
+        emit("    call r10\n");
+    } else if (load64(nd + 64) == 2) {
+        emit("    mov r10, [rbp - "); print_int(load64(nd + 8)); emit("]\n");
+        emit("    call r10\n");
+    } else {
+        emit("    call "); emit(name); emit("\n");
+    }
+    if (nargs > 6) { emit("    add rsp, "); print_int(nargs * 8); emit("\n"); }
+    return;
+}
+
+void gen_expr(int nd) {
+    int k = load64(nd);
+    int l = 0;
+    if (k == 1) { emit("    mov rax, "); print_int(load64(nd + 8)); emit("\n"); return; }
+    if (k == 2) { emit("    lea rax, [.Lstr"); print_int(load64(nd + 64)); emit("]\n"); return; }
+    if (k == 3) {
+        if (load64(nd + 64) == 1) {
+            emit("    mov rax, [.G"); emit(load64(nd + 16)); emit("]\n");
+        } else {
+            emit("    mov rax, [rbp - "); print_int(load64(nd + 8)); emit("]\n");
+        }
+        return;
+    }
+    if (k == 29) {
+        emit("    lea rax, ["); emit(load64(nd + 16)); emit("]\n");
+        return;
+    }
+    if (k == 17) { gen_expr(load64(nd + 32)); emit("    neg rax\n"); return; }
+    if (k == 27) {
+        gen_expr(load64(nd + 32));
+        emit("    push rax\n");
+        gen_expr(load64(nd + 40));
+        emit("    mov rcx, rax\n");
+        emit("    pop rax\n");
+        emit("    add rax, rcx\n");
+        emit("    movzx rax, byte ptr [rax]\n");
+        return;
+    }
+    if (k == 6) { gen_call(nd); return; }
+    if (k >= 7 && k <= 16) { gen_binop(nd, k); return; }
+    if (k == 23) {
+        l = label_count; label_count = label_count + 1;
+        gen_expr(load64(nd + 32));
+        emit("    cmp rax, 0\n");
+        emit("    je .Lfalse"); print_int(l); emit("\n");
+        gen_expr(load64(nd + 40));
+        emit("    cmp rax, 0\n");
+        emit("    je .Lfalse"); print_int(l); emit("\n");
+        emit("    mov rax, 1\n");
+        emit("    jmp .Landend"); print_int(l); emit("\n");
+        emit(".Lfalse"); print_int(l); emit(":\n");
+        emit("    mov rax, 0\n");
+        emit(".Landend"); print_int(l); emit(":\n");
+        return;
+    }
+    if (k == 24) {
+        l = label_count; label_count = label_count + 1;
+        gen_expr(load64(nd + 32));
+        emit("    cmp rax, 0\n");
+        emit("    jne .Ltrue"); print_int(l); emit("\n");
+        gen_expr(load64(nd + 40));
+        emit("    cmp rax, 0\n");
+        emit("    jne .Ltrue"); print_int(l); emit("\n");
+        emit("    mov rax, 0\n");
+        emit("    jmp .Lorend"); print_int(l); emit("\n");
+        emit(".Ltrue"); print_int(l); emit(":\n");
+        emit("    mov rax, 1\n");
+        emit(".Lorend"); print_int(l); emit(":\n");
+        return;
+    }
+    cerr();
+    return;
+}
+
+void gen_stmt(int nd) {
+    int k = load64(nd);
+    int l = 0;
+    if (k == 5) {
+        if (load64(nd + 40) != 0) { gen_expr(load64(nd + 40)); }
+        else { emit("    mov rax, 0\n"); }
+        emit("    mov [rbp - "); print_int(load64(nd + 8)); emit("], rax\n");
+        return;
+    }
+    if (k == 4) {
+        gen_expr(load64(nd + 40));
+        if (load64(nd + 64) == 1) {
+            emit("    mov [.G"); emit(load64(nd + 16)); emit("], rax\n");
+        } else {
+            emit("    mov [rbp - "); print_int(load64(nd + 8)); emit("], rax\n");
+        }
+        return;
+    }
+    if (k == 28) {
+        gen_expr(load64(nd + 32));
+        emit("    push rax\n");
+        gen_expr(load64(nd + 40));
+        emit("    pop rcx\n");
+        emit("    add rcx, rax\n");
+        emit("    push rcx\n");
+        gen_expr(load64(nd + 48));
+        emit("    pop rdi\n");
+        emit("    mov byte ptr [rdi], al\n");
+        return;
+    }
+    if (k == 21) { gen_expr(load64(nd + 32)); return; }
+    if (k == 18) {
+        l = label_count; label_count = label_count + 1;
+        gen_expr(load64(nd + 32));
+        emit("    cmp rax, 0\n");
+        emit("    je .Lelse"); print_int(l); emit("\n");
+        gen_stmt(load64(nd + 40));
+        emit("    jmp .Lend"); print_int(l); emit("\n");
+        emit(".Lelse"); print_int(l); emit(":\n");
+        if (load64(nd + 48) != 0) { gen_stmt(load64(nd + 48)); }
+        emit(".Lend"); print_int(l); emit(":\n");
+        return;
+    }
+    if (k == 19) {
+        l = label_count; label_count = label_count + 1;
+        emit(".Lstart"); print_int(l); emit(":\n");
+        gen_expr(load64(nd + 32));
+        emit("    cmp rax, 0\n");
+        emit("    je .Lend"); print_int(l); emit("\n");
+        if (gen_loop_depth >= 64) { cerr(); }
+        store64(loop_labels + gen_loop_depth * 8, l);
+        gen_loop_depth = gen_loop_depth + 1;
+        gen_stmt(load64(nd + 40));
+        gen_loop_depth = gen_loop_depth - 1;
+        emit("    jmp .Lstart"); print_int(l); emit("\n");
+        emit(".Lend"); print_int(l); emit(":\n");
+        return;
+    }
+    if (k == 20) {
+        if (load64(nd + 32) != 0) { gen_expr(load64(nd + 32)); }
+        emit("    jmp .Lret"); print_int(current_ret_label); emit("\n");
+        return;
+    }
+    if (k == 25) {
+        emit("    jmp .Lend"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
+        return;
+    }
+    if (k == 26) {
+        emit("    jmp .Lstart"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
+        return;
+    }
+    if (k == 22) { gen_block(nd); return; }
+    cerr();
+    return;
+}
+
+void gen_function(int f) {
+    int frame = load64(f + 80);
+    int nparams = load64(f + 8);
+    int i = 0;
+    int rem = frame - (frame / 16) * 16;
+    if (rem != 0) { frame = frame + (16 - rem); }
+
+    current_ret_label = label_count;
+    label_count = label_count + 1;
+
+    emit(load64(f)); emit(":\n");
+    emit("    push rbp\n");
+    emit("    mov rbp, rsp\n");
+    if (frame > 0) { emit("    sub rsp, "); print_int(frame); emit("\n"); }
+
+    while (i < nparams) {
+        if (i < 6) {
+            emit("    mov [rbp - "); print_int((i + 1) * 8); emit("], "); emit(arg_reg(i)); emit("\n");
+        } else {
+            emit("    mov rax, [rbp + "); print_int(16 + (nparams - 1 - i) * 8); emit("]\n");
+            emit("    mov [rbp - "); print_int((i + 1) * 8); emit("], rax\n");
+        }
+        i = i + 1;
+    }
+
+    gen_block(load64(f + 64));
+
+    emit(".Lret"); print_int(current_ret_label); emit(":\n");
+    emit("    mov rsp, rbp\n");
+    emit("    pop rbp\n");
+    emit("    ret\n");
+    return;
+}
+
+// --- main: read stdin, lex, parse, resolve, emit assembly ------------------
+
+int main() {
+    int buf = 0;
+    int n = 0;
+    int got = 0;
+    int name = 0;
+    int gtail = 0;
+    int ftail = 0;
+    int g = 0;
+    int g2 = 0;
+    int f = 0;
+    int f2 = 0;
+    int np = 0;
+    int sign = 0;
+    int i = 0;
+    int j = 0;
+    int found_main = 0;
+    int p = 0;
+    int len = 0;
+    int infd = 0;
+    int is_void = 0;
+    int extra_head = 0;
+    int extra_tail = 0;
+    int pnode = 0;
+
+    sym_names = alloc(256 * 8);
+    sym_offsets = alloc(256 * 8);
+    string_ptrs = alloc(512 * 8);
+    string_lens = alloc(512 * 8);
+    loop_labels = alloc(64 * 8);
+    scope_marks = alloc(64 * 8);
+
+    // `coff input.c0 output.s` reads and writes real files; with no
+    // arguments, stdin/stdout still works (the differential test
+    // harness uses that form).
+    if (argc() == 3) {
+        infd = open_read(argv(1));
+        if (infd < 0) { cerr(); }
+        outfd = open_write(argv(2));
+        if (outfd < 0) { cerr(); }
+    } else if (argc() != 1) {
+        cerr();
+    }
+
+    // With a real path known (the normal CLI form), expand include
+    // directives, resolving relative paths against argv(1)'s own
+    // directory. Reading stdin instead skips expansion entirely: piped
+    // bytes have no path to resolve a relative include against, so
+    // there is nothing meaningful expand_file could do with them.
+    if (argc() == 3) {
+        expand_buf = alloc(EXPAND_CAP);
+        expand_len = 0;
+        include_stack = alloc(INCLUDE_MAX_DEPTH * 8);
+        expand_file(argv(1));
+        buf = expand_buf;
+        n = expand_len;
+    } else {
+        // 1MB, not 65536. The old 65536-byte cap silently truncated the
+        // first real c0 file that outgrew it (my OS kernel's main
+        // source, found when I switched its build from coff0 to this
+        // compiler) and the only symptom was a bare PARSEERROR with no
+        // hint that the actual problem was a full buffer. coff0.c has
+        // no equivalent limit (plain C, realloc'd buffer), which is
+        // exactly why nothing in the test corpus ever caught it. 1MB is
+        // generous headroom past any c0 file I expect to write.
+        buf = alloc(1048576);
+        got = read(infd, buf, 1048576);
+        while (got > 0) {
+            n = n + got;
+            got = read(infd, buf + n, 1048576 - n);
+        }
+    }
+
+    lex_all(buf, n);
+    tpos = 0;
+
+    while (tok_kind(tpos) != 26) {
+        is_void = 0;
+        if (tok_kind(tpos) == 33) { is_void = 1; tpos = tpos + 1; }
+        else { expect(21); }
+        if (tok_kind(tpos) != 2) { perr(); }
+        name = tok_name(tpos);
+        tpos = tpos + 1;
+        if (tok_kind(tpos) == 15) {
+            f = alloc(104);
+            store64(f, name);
+            store64(f + 88, is_void);
+            tpos = tpos + 1;
+            np = 0;
+            extra_head = 0;
+            extra_tail = 0;
+            if (tok_kind(tpos) != 16) {
+                while (1) {
+                    expect(21);
+                    if (tok_kind(tpos) != 2) { perr(); }
+                    if (np >= 16) { cerr(); }
+                    if (np < 6) {
+                        store64(f + 16 + np * 8, tok_name(tpos));
+                    } else {
+                        pnode = alloc(16);
+                        store64(pnode, tok_name(tpos));
+                        if (extra_head == 0) { extra_head = pnode; extra_tail = pnode; }
+                        else { store64(extra_tail + 8, pnode); extra_tail = pnode; }
+                    }
+                    np = np + 1;
+                    tpos = tpos + 1;
+                    if (tok_kind(tpos) == 20) { tpos = tpos + 1; }
+                    else { break; }
+                }
+            }
+            expect(16);
+            store64(f + 8, np);
+            store64(f + 96, extra_head);
+            store64(f + 64, p_block());
+            if (fhead == 0) { fhead = f; ftail = f; }
+            else { store64(ftail + 72, f); ftail = f; }
+        } else {
+            if (is_void == 1) { cerr(); }
+            g = alloc(24);
+            store64(g, name);
+            if (tok_kind(tpos) == 8) {
+                tpos = tpos + 1;
+                sign = 1;
+                if (tok_kind(tpos) == 5) { tpos = tpos + 1; sign = 0 - 1; }
+                if (tok_kind(tpos) != 1) { perr(); }
+                store64(g + 8, sign * tok_ival(tpos));
+                tpos = tpos + 1;
+            }
+            expect(19);
+            if (ghead == 0) { ghead = g; gtail = g; }
+            else { store64(gtail + 16, g); gtail = g; }
+        }
+    }
+
+    // Pass A: function signatures — no builtin-name clash, exactly one main
+    // taking no parameters, no duplicate function names.
+    f = fhead;
+    while (f != 0) {
+        if (is_builtin(load64(f)) == 1) { cerr(); }
+        if (streq(load64(f), "main") == 1) {
+            if (load64(f + 8) != 0) { cerr(); }
+            if (load64(f + 88) == 1) { cerr(); }
+            found_main = 1;
+        }
+        f = load64(f + 72);
+    }
+    if (found_main == 0) { cerr(); }
+    f = fhead;
+    while (f != 0) {
+        f2 = load64(f + 72);
+        while (f2 != 0) {
+            if (streq(load64(f), load64(f2)) == 1) { cerr(); }
+            f2 = load64(f2 + 72);
+        }
+        f = load64(f + 72);
+    }
+
+    // Pass B: globals — no builtin-name clash, no function-name clash, no
+    // duplicate global names.
+    g = ghead;
+    while (g != 0) {
+        if (is_builtin(load64(g)) == 1) { cerr(); }
+        f = fhead;
+        while (f != 0) {
+            if (streq(load64(f), load64(g)) == 1) { cerr(); }
+            f = load64(f + 72);
+        }
+        g = load64(g + 16);
+    }
+    g = ghead;
+    while (g != 0) {
+        g2 = load64(g + 16);
+        while (g2 != 0) {
+            if (streq(load64(g), load64(g2)) == 1) { cerr(); }
+            g2 = load64(g2 + 16);
+        }
+        g = load64(g + 16);
+    }
+
+    // Pass C: resolve every function body, assigning stack offsets.
+    f = fhead;
+    while (f != 0) {
+        sym_count = 0;
+        stack_size = 0;
+        scope_depth = 0;
+        current_fn_is_void = load64(f + 88);
+        np = load64(f + 8);
+        i = 0;
+        while (i < np) {
+            sym_declare(param_name_at(f, i));
+            i = i + 1;
+        }
+        resolve(load64(f + 64));
+        store64(f + 80, stack_size);
+        f = load64(f + 72);
+    }
+
+    // Pass D: emit assembly.
+    emit(".intel_syntax noprefix\n");
+    emit(".global _start\n");
+    emit("_start:\n");
+    emit("    mov [.Largv0], rsp\n");
+    emit("    call main\n");
+    emit("    mov rdi, rax\n");
+    emit("    mov rax, 60\n");
+    emit("    syscall\n");
+
+    f = fhead;
+    while (f != 0) {
+        gen_function(f);
+        f = load64(f + 72);
+    }
+
+    if (string_count > 0) {
+        emit("\n.section .rodata\n");
+        i = 0;
+        while (i < string_count) {
+            emit(".Lstr"); print_int(i); emit(":\n");
+            emit("    .byte");
+            p = load64(string_ptrs + i * 8);
+            len = load64(string_lens + i * 8);
+            j = 0;
+            while (j < len) {
+                emit(" "); print_int(p[j]); emit(",");
+                j = j + 1;
+            }
+            emit(" 0\n");
+            i = i + 1;
+        }
+    }
+
+    emit("\n.section .data\n");
+    emit(".Lcurbrk:\n    .quad 0\n");
+    emit(".Largv0:\n    .quad 0\n");
+    g = ghead;
+    while (g != 0) {
+        emit(".G"); emit(load64(g)); emit(":\n    .quad ");
+        print_int(load64(g + 8));
+        emit("\n");
+        g = load64(g + 16);
+    }
+
+    if (outfd != 1) { close(outfd); }
+    return 0;
+}

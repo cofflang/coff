@@ -1,0 +1,16 @@
+// expect: no-exec
+//
+// tests/59_port_io.c0 - outb/inb compile; never executed, codegen checked by the diff loops
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// outb/inb compile to `out dx, al` / `in al, dx`, privileged
+// instructions that fault in normal Linux userspace (no ring 0, no
+// IOPL), so this program is only compiled, never executed -- see the
+// no-exec handling in run_tests.sh. Codegen correctness is checked by
+// the codegendiff loop instead, which diffs coff0's assembly against
+// coff.c0's without running either.
+int main() {
+    // 1016 == 0x3f8 (COM1) -- c0 has no hex literal syntax, decimal only.
+    outb(1016, 65);
+    int v = inb(1016);
+    return v;
+}

@@ -1,0 +1,9 @@
+// expect: compile-error
+//
+// tests/34_read_wrong_argcount.c0 - read() with the wrong argument count is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int buf = alloc(8);
+    read(0, buf);
+    return 0;
+}

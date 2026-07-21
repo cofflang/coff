@@ -1,0 +1,6 @@
+# build artifacts -- everything in the repo is source; the compilers are
+# rebuilt from it (see README)
+coff0
+coff1
+*.o
+*.s

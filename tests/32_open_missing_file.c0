@@ -1,0 +1,12 @@
+// expect: 1
+//
+// tests/32_open_missing_file.c0 - open_read on a missing file returns a negative value
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int fd = open_read("/tmp/c0_definitely_missing_file_xyz");
+    if (fd < 0) {
+        return 1;
+    }
+    close(fd);
+    return 0;
+}

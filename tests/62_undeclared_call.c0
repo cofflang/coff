@@ -1,0 +1,12 @@
+// expect: compile-error
+//
+// tests/62_undeclared_call.c0 - calling a completely unknown name is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// Calling a name that is neither a builtin, a declared function, nor a
+// declared variable must still be a compile error. Regression test for
+// the indirect-call resolve path added with function references, which
+// routes an unknown call name through a variable lookup before finally
+// erroring.
+int main() {
+    return totally_undeclared(1, 2);
+}

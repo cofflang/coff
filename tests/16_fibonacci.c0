@@ -1,0 +1,14 @@
+// expect: 55
+//
+// tests/16_fibonacci.c0 - fibonacci
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int fib(int n) {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+int main() {
+    return fib(10);
+}

@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/56_void_global.c0 - a void global is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+void x;
+int main() { return 0; }

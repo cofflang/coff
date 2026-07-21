@@ -1,0 +1,8 @@
+// expect: compile-error
+//
+// tests/48_continue_outside_loop.c0 - continue outside a loop is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    if (1) { continue; }
+    return 0;
+}

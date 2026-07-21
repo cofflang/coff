@@ -1,0 +1,11 @@
+// expect: 21
+//
+// tests/13_six_params.c0 - all six register-passed parameters at once
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int sum6(int a, int b, int c, int d, int e, int f) {
+    return a + b + c + d + e + f;
+}
+
+int main() {
+    return sum6(1, 2, 3, 4, 5, 6);
+}

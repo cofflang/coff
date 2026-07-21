@@ -1,0 +1,14 @@
+// expect: 120
+//
+// tests/14_recursive_factorial.c0 - recursive factorial
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int fact(int n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+int main() {
+    return fact(5);
+}

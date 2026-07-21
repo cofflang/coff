@@ -1,0 +1,10 @@
+// expect: compile-error
+//
+// tests/38_global_redefinition.c0 - redefining a global is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int x = 1;
+int x = 2;
+
+int main() {
+    return x;
+}

@@ -1,0 +1,9 @@
+// expect: compile-error
+//
+// tests/52_invalid_assign_target.c0 - assigning to something that is not a variable or an index is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int f(int a) { return a; }
+int main() {
+    f(1) = 2;
+    return 0;
+}

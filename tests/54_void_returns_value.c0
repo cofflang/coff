@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/54_void_returns_value.c0 - a void function returning a value is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+void f() { return 5; }
+int main() { f(); return 0; }

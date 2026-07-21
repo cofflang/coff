@@ -1,0 +1,12 @@
+// expect: compile-error
+//
+// tests/67_include_circular.c0 - a circular include is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// include_fixtures/cyc_a.c0 includes cyc_b.c0, which includes cyc_a.c0
+// right back. That must be a compile error with a clear diagnostic, not
+// an infinite recursion or a stack overflow.
+include "include_fixtures/cyc_a.c0";
+
+int main() {
+    return a_val();
+}

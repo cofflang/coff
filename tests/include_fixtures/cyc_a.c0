@@ -1,0 +1,11 @@
+// tests/include_fixtures/cyc_a.c0 - fixture for 67_include_circular: includes cyc_b.c0
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+//
+// Includes cyc_b.c0 on purpose, which includes this file right back,
+// so the include-cycle error path gets hit instead of an infinite
+// recursion or stack overflow.
+include "cyc_b.c0";
+
+int a_val() {
+    return 1;
+}

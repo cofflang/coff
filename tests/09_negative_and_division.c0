@@ -1,0 +1,11 @@
+// expect: 7
+//
+// tests/09_negative_and_division.c0 - unary minus and integer division
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int x = 10;
+    int y = -3;
+    int a = 20;
+    int b = 4;
+    return x + y + (a / b) - 5;
+}

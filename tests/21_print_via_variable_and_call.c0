@@ -1,0 +1,14 @@
+// expect: 0
+//
+// tests/21_print_via_variable_and_call.c0 - print() on a string passed through a variable and a function call
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int greet(int name) {
+    print(name);
+    return 0;
+}
+
+int main() {
+    int s = "printed indirectly through a variable and a function call\n";
+    greet(s);
+    return 0;
+}

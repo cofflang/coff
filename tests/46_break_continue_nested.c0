@@ -1,0 +1,49 @@
+// expect: 42
+//
+// tests/46_break_continue_nested.c0 - break and continue, including nested loops
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int i;
+    int sum;
+    int outer;
+    int inner_sum;
+
+    // basic break: loop would run to 10, but breaks at 5
+    i = 0;
+    sum = 0;
+    while (i < 10) {
+        if (i == 5) { break; }
+        sum = sum + 1;
+        i = i + 1;
+    }
+    if (sum != 5) { return 10; }
+
+    // basic continue: skip even numbers, sum odd 1..9
+    i = 0;
+    sum = 0;
+    while (i < 10) {
+        i = i + 1;
+        if (i - (i / 2) * 2 == 0) { continue; }
+        sum = sum + i;
+    }
+    if (sum != 25) { return 11; }
+
+    // nested loops: break/continue only affect the innermost loop
+    outer = 0;
+    sum = 0;
+    while (outer < 3) {
+        i = 0;
+        inner_sum = 0;
+        while (i < 10) {
+            i = i + 1;
+            if (i == 4) { break; }
+            inner_sum = inner_sum + 1;
+        }
+        if (inner_sum != 3) { return 12; }
+        sum = sum + inner_sum;
+        outer = outer + 1;
+    }
+    if (sum != 9) { return 13; }
+
+    return 42;
+}

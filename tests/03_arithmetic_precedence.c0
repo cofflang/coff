@@ -1,0 +1,9 @@
+// expect: 14
+//
+// tests/03_arithmetic_precedence.c0 - arithmetic precedence (* over +) and parentheses
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int x = 2;
+    int y = 3;
+    return x + y * 4;
+}

@@ -1,0 +1,43 @@
+// expect: 42
+//
+// tests/51_array_syntax.c0 - buf[i] syntax, cross-checked against load8/store8
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int buf;
+    int i;
+    int sum;
+
+    buf = alloc(16);
+
+    // write via buf[i] = v, matching store8(buf+i, v)
+    i = 0;
+    while (i < 16) {
+        buf[i] = i * 2;
+        i = i + 1;
+    }
+
+    // read via buf[i], matching load8(buf+i)
+    sum = 0;
+    i = 0;
+    while (i < 16) {
+        sum = sum + buf[i];
+        i = i + 1;
+    }
+    // sum of 0,2,4,...,30 = 240
+    if (sum != 240) { return 1; }
+
+    // cross-check: buf[i] must equal load8(buf+i) exactly
+    i = 0;
+    while (i < 16) {
+        if (buf[i] != load8(buf + i)) { return 2; }
+        i = i + 1;
+    }
+
+    // store8 and buf[i]=v must be interchangeable
+    store8(buf + 5, 99);
+    if (buf[5] != 99) { return 3; }
+    buf[5] = 7;
+    if (load8(buf + 5) != 7) { return 4; }
+
+    return 42;
+}

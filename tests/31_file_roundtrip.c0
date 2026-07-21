@@ -1,0 +1,20 @@
+// expect: 11
+//
+// tests/31_file_roundtrip.c0 - full file write, read back, verify roundtrip on disk
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int fd = open_write("/tmp/c0_test_31_roundtrip.txt");
+    if (fd < 0) { return 101; }
+    write(fd, "roundtrip!\n", 11);
+    close(fd);
+
+    int rfd = open_read("/tmp/c0_test_31_roundtrip.txt");
+    if (rfd < 0) { return 102; }
+    int buf = alloc(64);
+    int n = read(rfd, buf, 64);
+    close(rfd);
+
+    print(buf);
+    if (load8(buf) != 114) { return 103; }  // 'r'
+    return n;
+}

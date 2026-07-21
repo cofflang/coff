@@ -1,0 +1,13 @@
+// expect: 120
+//
+// tests/10_factorial.c0 - factorial with a while loop
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int n = 5;
+    int result = 1;
+    while (n > 1) {
+        result = result * n;
+        n = n - 1;
+    }
+    return result;
+}

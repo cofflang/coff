@@ -1,0 +1,13 @@
+// expect: 42
+//
+// tests/45_logical_precedence.c0 - && binds tighter than ||
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    if ((1 || 0 && 0) != 1) { return 60; }
+    if ((1 == 1 && 2 == 2) != 1) { return 61; }
+    if ((1 == 2 || 3 == 3) != 1) { return 62; }
+    if ((0 || 0 || 1) != 1) { return 63; }
+    if ((1 && 1 && 1) != 1) { return 64; }
+    if ((1 && 0 || 1) != 1) { return 65; }
+    return 42;
+}

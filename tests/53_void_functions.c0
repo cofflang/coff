@@ -1,0 +1,29 @@
+// expect: 42
+//
+// tests/53_void_functions.c0 - void functions used for their side effects
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int counter = 0;
+
+void mark() {
+    counter = counter + 1;
+}
+
+void mark_upto(int n) {
+    if (counter >= n) {
+        return;
+    }
+    counter = counter + 1;
+    mark_upto(n);
+}
+
+int main() {
+    mark();
+    mark();
+    if (counter != 2) { return 1; }
+
+    counter = 0;
+    mark_upto(5);
+    if (counter != 5) { return 2; }
+
+    return 42;
+}

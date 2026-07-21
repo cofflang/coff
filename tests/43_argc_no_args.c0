@@ -1,0 +1,7 @@
+// expect: 1
+//
+// tests/43_argc_no_args.c0 - argc() with no extra arguments
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    return argc();
+}

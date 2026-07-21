@@ -1,0 +1,12 @@
+// expect: 1
+//
+// tests/05_if_else_true.c0 - if/else, true branch taken
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int x = 5;
+    if (x > 3) {
+        return 1;
+    } else {
+        return 0;
+    }
+}

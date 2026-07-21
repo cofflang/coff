@@ -1,0 +1,10 @@
+// tests/include_fixtures/adder.c0 - fixture for 65_include_basic: defines add(), only ever included
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+//
+// Only ever referenced via `include`, never compiled standalone. It
+// lives under include_fixtures/ so that the `tests/*.c0` glob in
+// run_tests.sh (and the identical glob the diff loops use) does not
+// pick it up directly -- it has no main() and would fail on its own.
+int add(int a, int b) {
+    return a + b;
+}
