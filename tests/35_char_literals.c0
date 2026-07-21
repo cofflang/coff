@@ -1,0 +1,17 @@
+// expect: 32
+//
+// tests/35_char_literals.c0 - char literals lex to plain numbers
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int newline = '\n';
+    int tab = '\t';
+    int backslash = '\\';
+    int quote = '\'';
+    int zero = '\0';
+    if (newline != 10) { return 1; }
+    if (tab != 9) { return 2; }
+    if (backslash != 92) { return 3; }
+    if (quote != 39) { return 4; }
+    if (zero != 0) { return 5; }
+    return 'a' - 'A';
+}

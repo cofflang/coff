@@ -1,0 +1,5 @@
+// expect: compile-error
+//
+// tests/55_void_main.c0 - void main is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+void main() { return; }

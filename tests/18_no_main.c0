@@ -1,0 +1,7 @@
+// expect: compile-error
+//
+// tests/18_no_main.c0 - a program without main is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int add(int a, int b) {
+    return a + b;
+}

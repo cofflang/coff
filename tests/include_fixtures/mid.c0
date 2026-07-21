@@ -1,0 +1,13 @@
+// tests/include_fixtures/mid.c0 - fixture for 66_include_nested: includes deep.c0 relative to its own directory
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+//
+// Includes deep.c0 by a path relative to its own directory ("deep.c0",
+// not "include_fixtures/deep.c0"). That is the actual thing the test
+// checks: include paths resolve relative to the file containing the
+// directive, not the top-level entry file, so this works no matter what
+// path 66_include_nested.c0 used to reach this file.
+include "deep.c0";
+
+int mid_val() {
+    return deep_val() + 1;
+}

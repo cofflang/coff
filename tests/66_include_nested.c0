@@ -1,0 +1,14 @@
+// expect: 101
+//
+// tests/66_include_nested.c0 - nested include, paths relative to the including file
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// Transitive include: this file includes include_fixtures/mid.c0,
+// which itself includes include_fixtures/deep.c0. Proves both that
+// includes nest, and that a file's include paths resolve relative to
+// its own directory: mid.c0 says `include "deep.c0";`, not
+// `include "include_fixtures/deep.c0";`, and still finds it from here.
+include "include_fixtures/mid.c0";
+
+int main() {
+    return mid_val();
+}

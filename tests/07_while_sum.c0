@@ -1,0 +1,13 @@
+// expect: 10
+//
+// tests/07_while_sum.c0 - while loop summing upward
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 5) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}

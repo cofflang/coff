@@ -1,0 +1,13 @@
+// expect: compile-error
+//
+// tests/39_global_vs_function_name.c0 - a name that is both a global and a function is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int foo = 1;
+
+int foo() {
+    return 0;
+}
+
+int main() {
+    return 0;
+}

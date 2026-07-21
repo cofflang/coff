@@ -1,0 +1,19 @@
+// expect: 0
+//
+// tests/30_alloc_bump_and_zeroing.c0 - bump allocator: contiguous allocations, page-boundary writes, zeroed fresh memory
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int a = alloc(4096);
+    int b = alloc(4096);
+    int c = alloc(10000);
+    if (b - a != 4096) { return 1; }
+    if (c - b != 4096) { return 2; }
+    store8(a, 11);
+    store8(b, 22);
+    store8(c + 9999, 33);
+    if (load8(a) != 11) { return 3; }
+    if (load8(b) != 22) { return 4; }
+    if (load8(c + 9999) != 33) { return 5; }
+    if (load8(c) != 0) { return 6; }
+    return 0;
+}

@@ -1,0 +1,17 @@
+// expect: 7
+//
+// tests/65_include_basic.c0 - basic include: calling a function defined in an included file
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// `include "path.c0";` is pure textual substitution, resolved before
+// the real lexer runs (see resolve_includes in coff0.c). add() is
+// defined in include_fixtures/adder.c0 and called here as if it had
+// been declared in this file directly. Also covers the two false
+// positive guards the include scanner needs: the word include inside a
+// comment (right here) or inside a string literal below must not be
+// mistaken for a real directive.
+include "include_fixtures/adder.c0";
+
+int main() {
+    print("please do not include this text as a directive\n");
+    return add(3, 4);
+}

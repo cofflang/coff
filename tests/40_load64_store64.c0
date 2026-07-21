@@ -1,0 +1,15 @@
+// expect: 0
+//
+// tests/40_load64_store64.c0 - load64/store64 roundtrip, including a pointer stored in memory
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int buf = alloc(32);
+    store64(buf, 123456789012345);
+    store64(buf + 8, -42);
+    store64(buf + 16, buf);              // a pointer stored in memory
+    if (load64(buf) != 123456789012345) { return 1; }
+    if (load64(buf + 8) != -42) { return 2; }
+    if (load64(load64(buf + 16)) != 123456789012345) { return 3; }  // follow the pointer
+    if (load8(buf + 8) != 214) { return 4; }  // low byte of -42 (two's complement)
+    return 0;
+}

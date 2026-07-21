@@ -1,0 +1,11 @@
+// expect: compile-error
+//
+// tests/33_redefine_new_builtin.c0 - redefining alloc is a compile error, like any builtin
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int alloc(int n) {
+    return n;
+}
+
+int main() {
+    return 0;
+}

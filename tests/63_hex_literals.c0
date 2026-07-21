@@ -1,0 +1,17 @@
+// expect: 56
+//
+// tests/63_hex_literals.c0 - hex literal syntax (0x/0X)
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// Hex literal syntax (0x/0X prefix) is pure lexer sugar, like char
+// literals: 0x1F and 31 lex to the identical NUM token, so nothing
+// downstream of the lexer needed to change. Covers lowercase x with
+// lowercase digits, uppercase X, hex literals in ordinary arithmetic,
+// and an explicit equality check against the known decimal value --
+// proving it is the right number, not just some number.
+int main() {
+    int a = 0x1F;         // 31
+    int b = 0XA;          // 10, uppercase X
+    int c = 0xff - 0xF0;  // 255 - 240 = 15, both digit cases
+    if (0x2A != 42) { return 99; }
+    return a + b + c;     // 31 + 10 + 15 = 56
+}

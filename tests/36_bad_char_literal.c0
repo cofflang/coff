@@ -1,0 +1,7 @@
+// expect: compile-error
+//
+// tests/36_bad_char_literal.c0 - a malformed char literal is a lex error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    return 'ab';
+}

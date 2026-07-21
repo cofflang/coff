@@ -1,0 +1,11 @@
+// expect: 7
+//
+// tests/12_function_call.c0 - calling another function
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int add(int a, int b) {
+    return a + b;
+}
+
+int main() {
+    return add(3, 4);
+}

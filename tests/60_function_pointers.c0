@@ -1,0 +1,30 @@
+// expect: 125
+//
+// tests/60_function_pointers.c0 - function references in locals, reassigned and passed as arguments
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A bare function name evaluates to its address, the same way a string
+// literal is just an int pointing at bytes. Assigning it to a variable
+// and calling through that variable is an indirect call. The test
+// reassigns the same local to different function references, and
+// passes a function reference as an ordinary argument (apply's `fn`
+// parameter).
+int add(int a, int b) {
+    return a + b;
+}
+
+int sub(int a, int b) {
+    return a - b;
+}
+
+int apply(int fn, int a, int b) {
+    return fn(a, b);
+}
+
+int main() {
+    int op = add;
+    int r1 = op(10, 3);
+    op = sub;
+    int r2 = op(10, 3);
+    int r3 = apply(add, 100, 5);
+    return r1 + r2 + r3;
+}

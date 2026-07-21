@@ -1,0 +1,29 @@
+// expect: 80
+//
+// tests/61_function_pointer_global.c0 - a function reference in a global, dispatch-table style
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A global holding a function reference -- a real dispatch-table
+// pattern: a function looks up its behavior through a global that gets
+// reassigned between calls, instead of always calling the same name
+// directly.
+int square(int x) {
+    return x * x;
+}
+
+int cube(int x) {
+    return x * x * x;
+}
+
+int handler = 0;
+
+int dispatch(int x) {
+    return handler(x);
+}
+
+int main() {
+    handler = square;
+    int r1 = dispatch(4);
+    handler = cube;
+    int r2 = dispatch(4);
+    return r1 + r2;
+}

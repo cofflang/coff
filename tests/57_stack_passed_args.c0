@@ -1,0 +1,37 @@
+// expect: 42
+//
+// tests/57_stack_passed_args.c0 - stack-passed arguments past the sixth, nested and recursive
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int add8(int a, int b, int c, int d, int e, int f, int g, int h) {
+    return a * 10000000 + b * 1000000 + c * 100000 + d * 10000 + e * 1000 + f * 100 + g * 10 + h;
+}
+
+int seven(int a, int b, int c, int d, int e, int f, int g) {
+    return a * 1000000 + b * 100000 + c * 10000 + d * 1000 + e * 100 + f * 10 + g;
+}
+
+int nine(int a, int b, int c, int d, int e, int f, int g, int h, int i) {
+    if (i == 0) { return 0; }
+    return add8(a, b, c, d, e, f, g, h) + nine(a, b, c, d, e, f, g, h, i - 1);
+}
+
+int main() {
+    int r;
+
+    r = seven(1, 2, 3, 4, 5, 6, 7);
+    if (r != 1234567) { return 1; }
+
+    r = add8(1, 2, 3, 4, 5, 6, 7, 8);
+    if (r != 12345678) { return 2; }
+
+    // nested call as an argument, to stress evaluation order
+    r = add8(1, 2, 3, 4, 5, 6, 7, seven(0, 0, 0, 0, 0, 0, 9) - 1);
+    if (r != 12345678) { return 3; }
+
+    // recursion through a >6-arg function: repeated push/cleanup
+    // cycles must not corrupt anything
+    r = nine(1, 0, 0, 0, 0, 0, 0, 0, 3);
+    if (r != 30000000) { return 4; }
+
+    return 42;
+}

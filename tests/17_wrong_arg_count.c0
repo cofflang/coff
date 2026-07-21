@@ -1,0 +1,11 @@
+// expect: compile-error
+//
+// tests/17_wrong_arg_count.c0 - calling a function with the wrong argument count is a compile error
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int add(int a, int b) {
+    return a + b;
+}
+
+int main() {
+    return add(1, 2, 3);
+}

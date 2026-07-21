@@ -1,0 +1,576 @@
+// lex.c0 - a lexer for c0, written in c0
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0.
+//
+// coff is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your
+// option) any later version. coff is distributed in the hope that it
+// will be useful, but WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+// the GNU General Public License for more details. You should have
+// received a copy of the license along with coff; if not, see
+// <https://www.gnu.org/licenses/>.
+
+// Purpose: the first piece of the self-hosted compiler, kept as a
+// standalone differential test stage. Reads c0 source from stdin (or an
+// optional file argument, see main) and prints one token per line in
+// exactly the format of `coff0 -t` -- that format is the contract the
+// lexdiff loop in run_tests.sh checks, byte for byte. On a lex error it
+// prints LEXERROR and exits 1; coff0 -t aborts with no stdout at all in
+// that case, so error files are excluded from the diff.
+//
+// Some of the style in here is historical: this file predates c0 having
+// break/continue (hence the loop flags) and predates globals, so most
+// state is threaded through locals. Both features exist now; I have left
+// the old shapes alone where rewriting them buys nothing.
+
+// The chain of currently-open includes, for cycle detection -- see
+// expand_file.
+int INCLUDE_MAX_DEPTH = 32;
+int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
+int include_depth = 0;
+// Output buffer for expand_file's textual substitution. This mirrors
+// coff0.c's resolve_includes (see the comment there for the design) and
+// is differentially verified against it. Fixed generous size instead of
+// real dynamic growth, which is the usual buffer style in this codebase.
+int EXPAND_CAP = 4194304; // 4MB
+int expand_buf = 0;
+int expand_len = 0;
+
+int is_digit(int c) {
+    if (c >= '0' && c <= '9') { return 1; }
+    return 0;
+}
+
+int is_hex_digit(int c) {
+    if (is_digit(c) == 1) { return 1; }
+    if (c >= 'a' && c <= 'f') { return 1; }
+    if (c >= 'A' && c <= 'F') { return 1; }
+    return 0;
+}
+
+int hex_value(int c) {
+    if (is_digit(c) == 1) { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return c - 'A' + 10;
+}
+
+int is_ident_start(int c) {
+    if (c >= 'a' && c <= 'z') { return 1; }
+    if (c >= 'A' && c <= 'Z') { return 1; }
+    if (c == '_') { return 1; }
+    return 0;
+}
+
+int is_ident_char(int c) {
+    if (is_digit(c) == 1) { return 1; }
+    return is_ident_start(c);
+}
+
+void print_char(int c) {
+    int tmp = alloc(2);
+    store8(tmp, c);
+    print(tmp);
+    return;
+}
+
+void print_int(int v) {
+    int tmp = alloc(32);
+    if (v == 0) { print("0"); return; }
+    int neg = 0;
+    if (v < 0) { neg = 1; v = 0 - v; }
+    int i = 31;
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        v = v / 10;
+    }
+    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    print(tmp + i);
+    return;
+}
+
+// Does the word at buf[start..start+len) equal the null-terminated
+// keyword at kw?
+int word_is(int buf, int start, int len, int kw) {
+    int i = 0;
+    while (i < len) {
+        int k = load8(kw + i);
+        if (k == 0) { return 0; }
+        if (load8(buf + start + i) != k) { return 0; }
+        i = i + 1;
+    }
+    if (load8(kw + len) != 0) { return 0; }
+    return 1;
+}
+
+// -------------------------------------------------------------- includes
+//
+// `include "path.c0";` is pure textual substitution, resolved before
+// real lexing starts. This mirrors coff0.c's resolve_includes exactly
+// and is differentially verified against it; see the comment there for
+// the design. One difference worth noting: this tool was stdin-only for
+// most of its life, so main() below takes an optional file argument --
+// a relative include path needs a real file path to resolve against,
+// and piped stdin bytes do not have one.
+
+int slen(int s) {
+    int i = 0;
+    while (load8(s + i) != 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+int streq_(int a, int b) {
+    int i = 0;
+    int going = 1;
+    int result = 0;
+    while (going == 1) {
+        int ca = load8(a + i);
+        int cb = load8(b + i);
+        if (ca != cb) { going = 0; }
+        else if (ca == 0) { going = 0; result = 1; }
+        else { i = i + 1; }
+    }
+    return result;
+}
+
+// Directory part of `path` (a null-terminated string), trailing slash
+// included so callers can concatenate directly. A fresh empty string
+// when the path has no slash at all.
+int dirname_with_slash(int path) {
+    int len = slen(path);
+    int i = len - 1;
+    while (i >= 0) {
+        if (load8(path + i) == '/') {
+            int out = alloc(i + 2);
+            int k = 0;
+            while (k <= i) {
+                store8(out + k, load8(path + k));
+                k = k + 1;
+            }
+            store8(out + i + 1, 0);
+            return out;
+        }
+        i = i - 1;
+    }
+    int empty = alloc(1);
+    store8(empty, 0);
+    return empty;
+}
+
+int join_path(int dir, int rel) {
+    int dl = slen(dir);
+    int rl = slen(rel);
+    int out = alloc(dl + rl + 1);
+    int i = 0;
+    while (i < dl) {
+        store8(out + i, load8(dir + i));
+        i = i + 1;
+    }
+    int j = 0;
+    while (j < rl) {
+        store8(out + dl + j, load8(rel + j));
+        j = j + 1;
+    }
+    store8(out + dl + rl, 0);
+    return out;
+}
+
+void expand_putc(int c) {
+    if (expand_len >= EXPAND_CAP) {
+        print("LEXERROR\n");
+        exit(1);
+    }
+    store8(expand_buf + expand_len, c);
+    expand_len = expand_len + 1;
+    return;
+}
+
+// Reads `path` and scans its raw text for `include "X";` directives,
+// copying everything else through unchanged (string literals, char
+// literals and // comments verbatim, so none of them can trigger a
+// false match). Each include is expanded recursively in place, appended
+// into the shared expand_buf/expand_len globals. include_stack and
+// include_depth guard against a file including itself, directly or
+// transitively.
+void expand_file(int path) {
+    int i = 0;
+    while (i < include_depth) {
+        if (streq_(load64(include_stack + i * 8), path) == 1) {
+            print("LEXERROR\n");
+            exit(1);
+        }
+        i = i + 1;
+    }
+    if (include_depth >= INCLUDE_MAX_DEPTH) {
+        print("LEXERROR\n");
+        exit(1);
+    }
+    store64(include_stack + include_depth * 8, path);
+    include_depth = include_depth + 1;
+
+    int fd = open_read(path);
+    if (fd < 0) {
+        print("LEXERROR\n");
+        exit(1);
+    }
+    int src = alloc(1048576);
+    int n = 0;
+    int got = read(fd, src, 1048576);
+    while (got > 0) {
+        n = n + got;
+        got = read(fd, src + n, 1048576 - n);
+    }
+    close(fd);
+
+    int dir = dirname_with_slash(path);
+    int p = 0;
+    while (p < n) {
+        int c = load8(src + p);
+        if (c == '"') {
+            expand_putc(c);
+            p = p + 1;
+            int scanning = 1;
+            while (scanning == 1) {
+                if (p >= n || load8(src + p) == '"') { scanning = 0; }
+                else {
+                    int sc = load8(src + p);
+                    if (sc == '\\' && p + 1 < n) {
+                        expand_putc(sc);
+                        p = p + 1;
+                        expand_putc(load8(src + p));
+                        p = p + 1;
+                    } else {
+                        expand_putc(sc);
+                        p = p + 1;
+                    }
+                }
+            }
+            if (p < n) { expand_putc('"'); p = p + 1; }
+        } else if (c == '\'') {
+            // Char literals need the same verbatim-copy treatment as
+            // strings. Without this case the scanner has no notion of
+            // being inside a char literal, so a literal like '"' made it
+            // enter string-skip mode at that bare quote and swallow
+            // everything up to the next `"` in the file. Found the hard
+            // way: this very function's own source contains `!= '"'`,
+            // which broke lexing this file before the fix.
+            expand_putc(c);
+            p = p + 1;
+            if (p < n && load8(src + p) == '\\' && p + 1 < n) {
+                expand_putc(load8(src + p));
+                p = p + 1;
+                expand_putc(load8(src + p));
+                p = p + 1;
+            } else if (p < n) {
+                expand_putc(load8(src + p));
+                p = p + 1;
+            }
+            if (p < n && load8(src + p) == '\'') {
+                expand_putc('\'');
+                p = p + 1;
+            }
+        } else if (c == '/' && p + 1 < n && load8(src + p + 1) == '/') {
+            while (p < n && load8(src + p) != '\n') {
+                expand_putc(load8(src + p));
+                p = p + 1;
+            }
+        } else if (is_ident_start(c) == 1) {
+            int start = p;
+            while (p < n && is_ident_char(load8(src + p)) == 1) {
+                p = p + 1;
+            }
+            int wlen = p - start;
+            if (wlen == 7 && word_is(src, start, 7, "include") == 1) {
+                int q = p;
+                while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
+                    q = q + 1;
+                }
+                if (q >= n || load8(src + q) != '"') { print("LEXERROR\n"); exit(1); }
+                q = q + 1;
+                int pstart = q;
+                while (q < n && load8(src + q) != '"') { q = q + 1; }
+                if (q >= n) { print("LEXERROR\n"); exit(1); }
+                int rel = alloc(q - pstart + 1);
+                int ri = 0;
+                while (ri < q - pstart) {
+                    store8(rel + ri, load8(src + pstart + ri));
+                    ri = ri + 1;
+                }
+                store8(rel + (q - pstart), 0);
+                q = q + 1;
+                while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
+                    q = q + 1;
+                }
+                if (q >= n || load8(src + q) != ';') { print("LEXERROR\n"); exit(1); }
+                q = q + 1;
+                expand_file(join_path(dir, rel));
+                p = q;
+            } else {
+                int k = start;
+                while (k < p) {
+                    expand_putc(load8(src + k));
+                    k = k + 1;
+                }
+            }
+        } else {
+            expand_putc(c);
+            p = p + 1;
+        }
+    }
+
+    include_depth = include_depth - 1;
+    return;
+}
+
+int main() {
+    int buf = 0;
+    int n = 0;
+
+    // The optional file argument is what makes include resolution
+    // possible at all -- a relative include path needs a real file to
+    // resolve relative to, and piped stdin content cannot provide one.
+    // With no argument (the original stdin-only interface) expansion is
+    // skipped entirely, same behavior as before includes existed.
+    if (argc() == 2) {
+        expand_buf = alloc(EXPAND_CAP);
+        expand_len = 0;
+        include_stack = alloc(INCLUDE_MAX_DEPTH * 8);
+        expand_file(argv(1));
+        buf = expand_buf;
+        n = expand_len;
+    } else {
+        // 1MB, not 65536. The old 65536-byte cap silently truncated the
+        // first real c0 file that outgrew it (my OS kernel's main
+        // source) and the only symptom was a confusing parse error far
+        // downstream, with no hint that the actual problem was a full
+        // buffer. 1MB is generous headroom past any c0 file I expect to
+        // write.
+        buf = alloc(1048576);
+        int got = read(0, buf, 1048576);
+        while (got > 0) {
+            n = n + got;
+            got = read(0, buf + n, 1048576 - n);
+        }
+    }
+
+    int pos = 0;
+    int c = 0;
+    int nxt = 0;
+    int going = 0;
+    int v = 0;
+    int d = 0;
+    int start = 0;
+    int len = 0;
+    int i = 0;
+    int s = 0;
+    int e = 0;
+    int q = 0;
+    int base = 0;
+    int is_hex = 0;
+    while (pos < n) {
+        c = load8(buf + pos);
+
+        if (c == ' ') { pos = pos + 1; }
+        else if (c == '\n') { pos = pos + 1; }
+        else if (c == '\t') { pos = pos + 1; }
+        else if (c == 13) { pos = pos + 1; }
+
+        else if (c == '/') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '/') {
+                going = 1;
+                while (going == 1) {
+                    if (pos < n) {
+                        if (load8(buf + pos) != '\n') { pos = pos + 1; }
+                        else { going = 0; }
+                    } else { going = 0; }
+                }
+            } else {
+                print("SLASH\n");
+                pos = pos + 1;
+            }
+        }
+
+        else if (is_digit(c) == 1) {
+            v = 0;
+            base = 10;
+            is_hex = 0;
+            if (c == '0' && pos + 2 < n) {
+                nxt = load8(buf + pos + 1);
+                if ((nxt == 'x' || nxt == 'X') && is_hex_digit(load8(buf + pos + 2)) == 1) {
+                    is_hex = 1;
+                }
+            }
+            if (is_hex == 1) { pos = pos + 2; base = 16; }
+            going = 1;
+            while (going == 1) {
+                if (pos < n) {
+                    d = load8(buf + pos);
+                    if (base == 16) {
+                        if (is_hex_digit(d) == 1) {
+                            v = v * 16 + hex_value(d);
+                            pos = pos + 1;
+                        } else { going = 0; }
+                    } else if (is_digit(d) == 1) {
+                        v = v * 10 + (d - '0');
+                        pos = pos + 1;
+                    } else { going = 0; }
+                } else { going = 0; }
+            }
+            print("NUM ");
+            print_int(v);
+            print("\n");
+        }
+
+        else if (is_ident_start(c) == 1) {
+            start = pos;
+            going = 1;
+            while (going == 1) {
+                if (pos < n) {
+                    if (is_ident_char(load8(buf + pos)) == 1) { pos = pos + 1; }
+                    else { going = 0; }
+                } else { going = 0; }
+            }
+            len = pos - start;
+            if (word_is(buf, start, len, "int") == 1) { print("INT\n"); }
+            else if (word_is(buf, start, len, "if") == 1) { print("IF\n"); }
+            else if (word_is(buf, start, len, "else") == 1) { print("ELSE\n"); }
+            else if (word_is(buf, start, len, "while") == 1) { print("WHILE\n"); }
+            else if (word_is(buf, start, len, "return") == 1) { print("RETURN\n"); }
+            else if (word_is(buf, start, len, "break") == 1) { print("BREAK\n"); }
+            else if (word_is(buf, start, len, "continue") == 1) { print("CONTINUE\n"); }
+            else if (word_is(buf, start, len, "void") == 1) { print("VOID\n"); }
+            else {
+                print("IDENT ");
+                i = start;
+                while (i < pos) {
+                    print_char(load8(buf + i));
+                    i = i + 1;
+                }
+                print("\n");
+            }
+        }
+
+        else if (c == '"') {
+            pos = pos + 1;
+            print("STR");
+            going = 1;
+            while (going == 1) {
+                if (pos >= n) { print("\nLEXERROR\n"); return 1; }
+                s = load8(buf + pos);
+                if (s == '"') {
+                    going = 0;
+                    pos = pos + 1;
+                } else if (s == '\\') {
+                    pos = pos + 1;
+                    if (pos >= n) { print("\nLEXERROR\n"); return 1; }
+                    e = load8(buf + pos);
+                    v = 0 - 1;
+                    if (e == 'n') { v = '\n'; }
+                    if (e == 't') { v = '\t'; }
+                    if (e == '\\') { v = '\\'; }
+                    if (e == '"') { v = '"'; }
+                    if (v < 0) { print("\nLEXERROR\n"); return 1; }
+                    print(" ");
+                    print_int(v);
+                    pos = pos + 1;
+                } else {
+                    print(" ");
+                    print_int(s);
+                    pos = pos + 1;
+                }
+            }
+            print("\n");
+        }
+
+        else if (c == '\'') {
+            pos = pos + 1;
+            if (pos >= n) { print("LEXERROR\n"); return 1; }
+            v = 0 - 1;
+            e = load8(buf + pos);
+            if (e == '\\') {
+                pos = pos + 1;
+                if (pos >= n) { print("LEXERROR\n"); return 1; }
+                q = load8(buf + pos);
+                if (q == 'n') { v = '\n'; }
+                if (q == 't') { v = '\t'; }
+                if (q == '\\') { v = '\\'; }
+                if (q == '\'') { v = '\''; }
+                if (q == '0') { v = 0; }
+                if (v < 0) {
+                    if (q != '0') { print("LEXERROR\n"); return 1; }
+                }
+                pos = pos + 1;
+            } else {
+                if (e == '\'') { print("LEXERROR\n"); return 1; }
+                v = e;
+                pos = pos + 1;
+            }
+            if (pos >= n) { print("LEXERROR\n"); return 1; }
+            if (load8(buf + pos) != '\'') { print("LEXERROR\n"); return 1; }
+            pos = pos + 1;
+            print("NUM ");
+            print_int(v);
+            print("\n");
+        }
+
+        else if (c == '=') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("EQ\n"); pos = pos + 2; }
+            else { print("ASSIGN\n"); pos = pos + 1; }
+        }
+        else if (c == '!') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("NE\n"); pos = pos + 2; }
+            else { print("LEXERROR\n"); return 1; }
+        }
+        else if (c == '<') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("LE\n"); pos = pos + 2; }
+            else { print("LT\n"); pos = pos + 1; }
+        }
+        else if (c == '>') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("GE\n"); pos = pos + 2; }
+            else { print("GT\n"); pos = pos + 1; }
+        }
+        else if (c == '&') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '&') { print("AND\n"); pos = pos + 2; }
+            else { print("LEXERROR\n"); return 1; }
+        }
+        else if (c == '|') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '|') { print("OR\n"); pos = pos + 2; }
+            else { print("LEXERROR\n"); return 1; }
+        }
+        else if (c == '+') { print("PLUS\n"); pos = pos + 1; }
+        else if (c == '-') { print("MINUS\n"); pos = pos + 1; }
+        else if (c == '*') { print("STAR\n"); pos = pos + 1; }
+        else if (c == '(') { print("LPAREN\n"); pos = pos + 1; }
+        else if (c == ')') { print("RPAREN\n"); pos = pos + 1; }
+        else if (c == '{') { print("LBRACE\n"); pos = pos + 1; }
+        else if (c == '}') { print("RBRACE\n"); pos = pos + 1; }
+        else if (c == ';') { print("SEMI\n"); pos = pos + 1; }
+        else if (c == ',') { print("COMMA\n"); pos = pos + 1; }
+        else if (c == '[') { print("LBRACKET\n"); pos = pos + 1; }
+        else if (c == ']') { print("RBRACKET\n"); pos = pos + 1; }
+        else { print("LEXERROR\n"); return 1; }
+    }
+
+    print("EOF\n");
+    return 0;
+}

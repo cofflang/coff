@@ -1,0 +1,10 @@
+// expect: 42
+//
+// tests/29_alloc_store_load.c0 - alloc/store8/load8 roundtrip
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int buf = alloc(8);
+    store8(buf, 40);
+    store8(buf + 1, 2);
+    return load8(buf) + load8(buf + 1);
+}

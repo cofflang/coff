@@ -1,0 +1,9 @@
+// tests/include_fixtures/cyc_b.c0 - fixture for 67_include_circular: includes cyc_a.c0 right back
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+//
+// See cyc_a.c0.
+include "cyc_a.c0";
+
+int b_val() {
+    return 2;
+}
