@@ -29,8 +29,21 @@
  *
  * The c0 grammar, as accepted here:
  *
- *   program    := (function | global)*
+ *   program    := (function | global | extern | layout)*
  *   global     := "int" IDENT ("=" "-"? NUM)? ";"     (constant initializer only)
+ *   extern     := "extern" "int" IDENT ";"            (declares a global that
+ *                                                        some other object file
+ *                                                        defines; c0 emits no
+ *                                                        storage for it)
+ *   layout     := "layout" IDENT "{" ("int" IDENT ";")* "}"
+ *                                                     (named offsets into a
+ *                                                        block of memory. Every
+ *                                                        field is "int" because
+ *                                                        that is the only type
+ *                                                        c0 has; the layout only
+ *                                                        gives each name an
+ *                                                        offset, it allocates
+ *                                                        nothing)
  *   function   := ("int" | "void") IDENT "(" params? ")" block
  *   params     := "int" IDENT ("," "int" IDENT)*        (max 16 total; first 6
  *                                                          register-passed, rest
@@ -40,8 +53,10 @@
  *   stmt       := decl_stmt | assign_stmt | if_stmt | while_stmt
  *               | return_stmt | break_stmt | continue_stmt | expr_stmt | block
  *   decl_stmt  := "int" IDENT ("=" expr)? ";"
- *   assign_stmt:= (IDENT | postfix) "=" expr ";"      (postfix must be an
- *                                                        indexing expr, e.g. buf[i] = v)
+ *   assign_stmt:= (IDENT | postfix) "=" expr ";"      (a postfix target must end
+ *                                                        in an index or a field,
+ *                                                        e.g. buf[i] = v or
+ *                                                        e.hp = 10)
  *   if_stmt    := "if" "(" expr ")" stmt ("else" stmt)?
  *   while_stmt := "while" "(" expr ")" stmt
  *   return_stmt:= "return" expr? ";"                    ("return;" bare is required
@@ -61,9 +76,22 @@
  *   additive   := term (("+" | "-") term)*
  *   term       := unary (("*" | "/") unary)*
  *   unary      := "-" unary | postfix
- *   postfix    := primary ("[" expr "]")*             (buf[i] is sugar over
- *                                                        load8(buf+i) / store8)
+ *   postfix    := primary (("[" expr "]") | ("." IDENT))*
+ *                                                     (buf[i] is sugar over
+ *                                                        load8(buf+i) / store8;
+ *                                                        e.field is sugar over
+ *                                                        load64(e + offset) /
+ *                                                        store64, where the
+ *                                                        offset comes from
+ *                                                        whichever layout
+ *                                                        declared that field
+ *                                                        name)
  *   primary    := NUM | STRING | IDENT ("(" args? ")")? | "(" expr ")"
+ *               | "sizeof" "(" IDENT ")"              (IDENT must name a
+ *                                                        declared layout.
+ *                                                        Resolves at compile
+ *                                                        time to its field
+ *                                                        count times 8)
  *   args       := expr ("," expr)*
  *
  * A `main` function is required, takes no parameters, and must return
@@ -144,6 +172,9 @@ typedef enum {
   TK_KW_BREAK, TK_KW_CONTINUE,
   TK_LBRACKET, TK_RBRACKET,
   TK_KW_VOID,
+  TK_KW_EXTERN,
+  TK_DOT,
+  TK_KW_LAYOUT, TK_KW_SIZEOF,
 } TokenKind;
 
 typedef struct {
@@ -159,7 +190,7 @@ static int is_ident_start(int c) { return isalpha(c) || c == '_'; }
 static int is_ident_char(int c) { return isalnum(c) || c == '_'; }
 
 static Token *tokenize(char *src) {
-  int cap = 256;
+  int cap = 512;
   Token *out = malloc(sizeof(Token) * cap);
   int n = 0;
   char *p = src;
@@ -180,25 +211,29 @@ static Token *tokenize(char *src) {
         p += 2;
         while (isxdigit((unsigned char)*p)) p++;
         t->kind = TK_NUM;
-        /* strtoul, not strtol -- same bug as on the decimal path below.
-         * Found here first, with a real value: a packed 8x8 font glyph
-         * bitmap (0xF88484F88484F800) came back as 0x7FFFFFFFFFFFFFFF
-         * instead of itself. */
+        /* strtoul, not strtol -- see the comment on the decimal path below,
+         * same bug, found here first with a real high-bit-set value (an
+         * 8x8 font glyph's packed bitmap, 0xF88484F88484F800) silently
+         * coming back as 0x7FFFFFFFFFFFFFFF instead of itself. */
         t->ival = (long)strtoul(start, NULL, 16);
         n++;
         continue;
       }
       while (isdigit((unsigned char)*p)) p++;
       t->kind = TK_NUM;
-      /* strtoul, not strtol. A c0 ival is a raw 64-bit bit pattern; a
-       * literal at or past 2^63 is simply what its bits are, read as
-       * negative. strtol clamps anything that does not fit a signed long
-       * to LONG_MAX with ERANGE, silently corrupting the top half of the
-       * range. strtoul parses the same digits as an unsigned magnitude,
-       * and the cast back to long just reinterprets the bits. The
-       * c0-written lexers never had this bug -- their `v = v*10 + digit`
-       * accumulation wraps naturally in the register, with no library in
-       * between to "help". */
+      /* strtoul, not strtol: c0's ival is a raw 64-bit bit pattern (c0 has
+       * no unsigned type -- a literal at or past 2^63 is just what its bits
+       * are, reinterpreted as negative, same as every other c0 int). strtol
+       * clamps any digit sequence that does not fit as a *signed* long to
+       * LONG_MAX with ERANGE, silently corrupting the top half of the
+       * range instead of wrapping -- the c0-written lexers (lex.c0/
+       * parse.c0/coff.c0) never had this bug, since their digit
+       * accumulation (`v = v*10 + digit`) is pure arithmetic on the CPU's
+       * own registers, which wraps naturally with no library-level
+       * clamping. strtoul parses the same digits as an unsigned magnitude
+       * with no clamping, and converting that back to `long` just
+       * reinterprets the bits (well-defined in practice on every platform
+       * this targets). */
       t->ival = (long)strtoul(start, NULL, 10);
       n++;
       continue;
@@ -275,6 +310,9 @@ static Token *tokenize(char *src) {
       else if (strcmp(word, "break") == 0) t->kind = TK_KW_BREAK;
       else if (strcmp(word, "continue") == 0) t->kind = TK_KW_CONTINUE;
       else if (strcmp(word, "void") == 0) t->kind = TK_KW_VOID;
+      else if (strcmp(word, "extern") == 0) t->kind = TK_KW_EXTERN;
+      else if (strcmp(word, "layout") == 0) t->kind = TK_KW_LAYOUT;
+      else if (strcmp(word, "sizeof") == 0) t->kind = TK_KW_SIZEOF;
       else { t->kind = TK_IDENT; t->name = word; }
       n++;
       continue;
@@ -293,6 +331,7 @@ static Token *tokenize(char *src) {
       case ',': t->kind = TK_COMMA; p++; break;
       case '[': t->kind = TK_LBRACKET; p++; break;
       case ']': t->kind = TK_RBRACKET; p++; break;
+      case '.': t->kind = TK_DOT; p++; break;
       case '=':
         if (p[1] == '=') { t->kind = TK_EQ; p += 2; } else { t->kind = TK_ASSIGN; p++; }
         break;
@@ -340,24 +379,25 @@ typedef enum {
   ND_BREAK, ND_CONTINUE,
   ND_INDEX, ND_INDEX_ASSIGN,
   ND_FUNCREF,
+  ND_FIELD, ND_FIELD_ASSIGN, ND_SIZEOF,
 } NodeKind;
 
 typedef struct Node Node;
 struct Node {
   NodeKind kind;
-  Node *lhs, *rhs;    /* binary ops; ASSIGN/DECL: rhs = value (NULL allowed for DECL);
-                         INDEX/INDEX_ASSIGN: lhs = base address, rhs = index */
-  long ival;          /* NUM literal; stack offset for VAR/ASSIGN/DECL/indirect CALL */
-  int is_global;      /* VAR/ASSIGN/indirect CALL: name is a global, not a stack slot */
-  int is_indirect;    /* CALL: `name` is a variable holding a function address,
-                         not a declared function -- call through its value */
+  Node *lhs, *rhs;    /* binary ops; ASSIGN/DECL: rhs = value expr (may be NULL for DECL);
+                         INDEX/INDEX_ASSIGN: lhs = base pointer expr, rhs = index expr */
+  long ival;          /* NUM literal; resolved stack offset for VAR/ASSIGN/DECL/(indirect) CALL */
+  int is_global;      /* VAR/ASSIGN/(indirect) CALL: name resolved to a global, not a stack slot */
+  int is_indirect;    /* CALL: `name` is a function-pointer-valued variable, not a
+                         declared function -- call through its value (see resolve()) */
   int str_id;         /* STR: index into the string-literal table */
   char *name;         /* VAR / ASSIGN / DECL / CALL / FUNCREF */
-  Node *cond, *then, *els; /* IF; INDEX_ASSIGN reuses cond for the stored value */
+  Node *cond, *then, *els; /* IF; INDEX_ASSIGN: cond = value expr (`buf[i] = value`) */
   Node *body;         /* WHILE body; BLOCK: head of statement list */
-  Node *args;         /* CALL: head of argument list (chained via next) */
+  Node *args;         /* CALL: head of argument-expression list (chained via next) */
   int nargs;          /* CALL: argument count */
-  Node *next;         /* next statement in a BLOCK, or next arg of a CALL */
+  Node *next;         /* next statement in a BLOCK, or next arg in a CALL's args list */
 };
 
 #define MAX_PARAMS 6          /* register-passed params (rdi/rsi/rdx/rcx/r8/r9) */
@@ -373,17 +413,17 @@ typedef struct Function Function;
 struct Function {
   char *name;
   char *params[MAX_PARAMS]; /* first MAX_PARAMS params (register-passed) */
-  Param *extra_params;      /* the rest (stack-passed), in declaration order */
+  Param *extra_params;      /* params beyond MAX_PARAMS (stack-passed), in order */
   int nparams;
-  int is_void;      /* declared "void" instead of "int"; may not return a value */
+  int is_void;      /* declared "void" instead of "int" -- may not return a value */
   Node *body;
-  long stack_size;  /* filled in by resolve_function() */
+  long stack_size; /* filled in by resolve_function() */
   int ret_label;    /* filled in just before codegen */
   Function *next;
 };
 
-/* Name of the i'th declared parameter, wherever it lives (inline register
- * slot or the extra_params list). */
+/* Name of the i'th declared parameter (0-indexed), regardless of whether it
+ * lives in the inline register-param slots or the extra_params list. */
 static char *param_name(Function *f, int i) {
   if (i < MAX_PARAMS) return f->params[i];
   Param *p = f->extra_params;
@@ -398,13 +438,27 @@ struct Global {
   Global *next;
 };
 
+typedef struct LayoutField LayoutField;
+struct LayoutField {
+  char *name;
+  LayoutField *next;
+};
+
+typedef struct Layout Layout;
+struct Layout {
+  char *name;
+  LayoutField *fields;
+  int nfields;
+  Layout *next;
+};
+
 static Node *new_node(NodeKind kind) {
   Node *n = calloc(1, sizeof(Node));
   n->kind = kind;
   return n;
 }
 
-#define MAX_STRINGS 512
+#define MAX_STRINGS 4096
 static char *string_data[MAX_STRINGS];
 static int string_len[MAX_STRINGS];
 static int string_count;
@@ -472,23 +526,45 @@ static Node *parse_primary(void) {
     n->name = name;
     return n;
   }
+  if (check(TK_KW_SIZEOF)) {
+    advance();
+    expect(TK_LPAREN, "'('");
+    Node *n = new_node(ND_SIZEOF);
+    n->name = expect(TK_IDENT, "a layout name")->name;
+    expect(TK_RPAREN, "')'");
+    return n;
+  }
   error("expected an expression");
   return NULL;
 }
 
-/* postfix := primary ("[" expr "]")*
- * buf[i] is sugar over load8(buf+i). Chains like buf[i][j] fall out of the
- * grammar for free -- an index expression is just an int that happens to be
- * an address, like everything else in c0. */
+/* postfix := primary (("[" expr "]") | ("." IDENT))*   -- buf[i] is sugar
+ * over load8(buf+i); e.field is sugar over load64(e + field's offset), the
+ * offset coming from whichever `layout` declared that field name (see the
+ * global field-offset table built in main()). Chains (buf[i][j], e.f.g) are
+ * allowed for free by the grammar, same "an int that happens to be a valid
+ * address" spirit as everything else in c0. */
 static Node *parse_postfix(void) {
   Node *n = parse_primary();
-  while (check(TK_LBRACKET)) {
-    advance();
-    Node *idx = new_node(ND_INDEX);
-    idx->lhs = n;
-    idx->rhs = parse_expr();
-    expect(TK_RBRACKET, "']'");
-    n = idx;
+  for (;;) {
+    if (check(TK_LBRACKET)) {
+      advance();
+      Node *idx = new_node(ND_INDEX);
+      idx->lhs = n;
+      idx->rhs = parse_expr();
+      expect(TK_RBRACKET, "']'");
+      n = idx;
+      continue;
+    }
+    if (check(TK_DOT)) {
+      advance();
+      Node *f = new_node(ND_FIELD);
+      f->lhs = n;
+      f->name = expect(TK_IDENT, "a field name")->name;
+      n = f;
+      continue;
+    }
+    break;
   }
   return n;
 }
@@ -641,12 +717,11 @@ static Node *parse_stmt(void) {
     return new_node(ND_CONTINUE);
   }
 
-  /* Parse a full expression first, then decide what the statement is: a
-   * plain assignment (VAR '=' expr), an indexed assignment (buf[i] '='
-   * expr), or, with no '=' following, an expression statement like
-   * `f(1);`. The left side of `buf[i] = v` can be any length, so this
-   * cannot be dispatched on a fixed token peek like the other statement
-   * forms. */
+  /* Parse a full expression first, then decide: a plain assignment
+   * (VAR '=' expr), an indexed assignment (buf[i] '=' expr), or -- if not
+   * followed by '=' at all -- an expression statement (e.g. `f(1);`). This
+   * needs arbitrary lookahead (buf[i] can be any length), so unlike the
+   * other statement forms it cannot be dispatched on a fixed token peek. */
   Node *e = parse_expr();
   if (check(TK_ASSIGN)) {
     advance();
@@ -662,6 +737,14 @@ static Node *parse_stmt(void) {
       n->lhs = e->lhs;
       n->rhs = e->rhs;
       n->cond = parse_expr();
+      expect(TK_SEMI, "';'");
+      return n;
+    }
+    if (e->kind == ND_FIELD) {
+      Node *n = new_node(ND_FIELD_ASSIGN);
+      n->lhs = e->lhs;
+      n->name = e->name;
+      n->rhs = parse_expr();
       expect(TK_SEMI, "';'");
       return n;
     }
@@ -731,13 +814,65 @@ static Global *parse_global(char *name) {
 
 static Function *prog_functions;
 static Global *prog_globals;
+static Global *prog_externs;
+static Layout *prog_layouts;
+
+static Global *parse_extern(char *name) {
+  Global *e = calloc(1, sizeof(Global));
+  e->name = name;
+  e->init = 0;
+  return e;
+}
+
+/* layout := "layout" IDENT "{" ("int" IDENT ";")* "}"   -- every field is
+ * "int" (c0 has only one type), spelled out the same way a local/global
+ * declaration is, so the grammar does not grow a second way to say "a field
+ * named x" beyond what parse_stmt's decl_stmt already knows. */
+static Layout *parse_layout(void) {
+  Layout *l = calloc(1, sizeof(Layout));
+  l->name = expect(TK_IDENT, "a layout name")->name;
+  expect(TK_LBRACE, "'{'");
+  LayoutField head = {0};
+  LayoutField *tail = &head;
+  while (!check(TK_RBRACE)) {
+    expect(TK_KW_INT, "'int' (every layout field is an int)");
+    LayoutField *f = calloc(1, sizeof(LayoutField));
+    f->name = expect(TK_IDENT, "a field name")->name;
+    expect(TK_SEMI, "';'");
+    tail->next = f;
+    tail = f;
+    l->nfields++;
+  }
+  expect(TK_RBRACE, "'}'");
+  l->fields = head.next;
+  return l;
+}
 
 static void parse_program(void) {
   Function fhead = {0};
   Function *ftail = &fhead;
   Global ghead = {0};
   Global *gtail = &ghead;
+  Global ehead = {0};
+  Global *etail = &ehead;
+  Layout lhead = {0};
+  Layout *ltail = &lhead;
   while (!check(TK_EOF)) {
+    if (check(TK_KW_EXTERN)) {
+      advance();
+      expect(TK_KW_INT, "'int' after 'extern'");
+      char *name = expect(TK_IDENT, "a name")->name;
+      expect(TK_SEMI, "';'");
+      etail->next = parse_extern(name);
+      etail = etail->next;
+      continue;
+    }
+    if (check(TK_KW_LAYOUT)) {
+      advance();
+      ltail->next = parse_layout();
+      ltail = ltail->next;
+      continue;
+    }
     int is_void = 0;
     if (check(TK_KW_VOID)) { is_void = 1; advance(); }
     else expect(TK_KW_INT, "'int' or 'void'");
@@ -754,18 +889,21 @@ static void parse_program(void) {
   }
   prog_functions = fhead.next;
   prog_globals = ghead.next;
+  prog_externs = ehead.next;
+  prog_layouts = lhead.next;
 }
 
 /* ------------------------------------------------------------- resolve */
-/* Two jobs. First, a pass over every function collects name+arity into a
- * signature table, so calls can reference functions in any source order
- * (mutual recursion included). Second, a per-function pass assigns every
- * declared variable (parameters included) a stack slot, and checks that
- * every reference, assignment and call refers to something declared, with
- * the right arity. */
+/* Two jobs: (1) a first pass over every function collects name+arity into a
+ * signature table so calls can reference functions regardless of source
+ * order (including mutual recursion); (2) a per-function pass assigns every
+ * declared variable (including parameters) a stack slot and checks that
+ * every reference/assignment/call refers to something already declared with
+ * the right arity. c0 still has a single flat per-function scope regardless
+ * of block nesting -- a deliberate simplification, not an oversight. */
 
-#define MAX_VARS 256
-#define MAX_FUNCS 256
+#define MAX_VARS 4096
+#define MAX_FUNCS 4096
 
 typedef struct { const char *name; int nargs; } Builtin;
 static const Builtin BUILTINS[] = {
@@ -775,6 +913,7 @@ static const Builtin BUILTINS[] = {
   { "load64", 1 }, { "store64", 2 }, { "exit", 1 },
   { "argc", 0 }, { "argv", 1 },
   { "outb", 2 }, { "inb", 1 },
+  { "outw", 2 }, { "inw", 1 },
 };
 #define NBUILTINS ((int)(sizeof(BUILTINS) / sizeof(BUILTINS[0])))
 
@@ -832,6 +971,101 @@ static int glob_exists(char *name) {
   return 0;
 }
 
+static char *extern_names[256];
+static int extern_count;
+
+static int extern_exists(char *name) {
+  for (int i = 0; i < extern_count; i++) {
+    if (strcmp(extern_names[i], name) == 0) return 1;
+  }
+  return 0;
+}
+
+static void extern_declare(char *name) {
+  for (int i = 0; i < extern_count; i++) {
+    if (strcmp(extern_names[i], name) == 0) error("redefinition of extern '%s'", name);
+  }
+  if (extern_count >= 256) error("too many externs (max 256)");
+  extern_names[extern_count++] = name;
+}
+
+/* Field names live in a single flat namespace shared across every `layout`
+ * declaration, not one scoped per layout -- c0 has no type system, so
+ * `e.x` cannot be checked against "the layout e was allocated as", and
+ * does not try to be. Instead, the first layout to declare a field name
+ * fixes that name's byte offset for good; every other layout that reuses
+ * the name must agree on the same offset (i.e. the same position within
+ * its own field list), or it is a compile error. This is a real,
+ * deliberate restriction (two layouts cannot independently give "x" two
+ * different meanings) -- the same "trust the programmer, one flat
+ * namespace" spirit as c0's single function/global namespace. */
+#define MAX_FIELDS 4096
+static char *field_names[MAX_FIELDS];
+static long field_offsets[MAX_FIELDS];
+static int field_count;
+
+static long field_lookup(const char *name) {
+  for (int i = 0; i < field_count; i++) {
+    if (strcmp(field_names[i], name) == 0) return field_offsets[i];
+  }
+  error("unknown field '%s' (not declared in any layout)", name);
+  return -1;
+}
+
+static void field_declare_or_check(const char *name, long offset) {
+  for (int i = 0; i < field_count; i++) {
+    if (strcmp(field_names[i], name) == 0) {
+      if (field_offsets[i] != offset) {
+        error("field '%s' at offset %ld conflicts with its earlier use at offset %ld "
+              "(every layout that shares a field name must declare it at the same position)",
+              name, offset, field_offsets[i]);
+      }
+      return;
+    }
+  }
+  if (field_count >= MAX_FIELDS) error("too many distinct field names (max %d)", MAX_FIELDS);
+  field_names[field_count] = (char *)name;
+  field_offsets[field_count] = offset;
+  field_count++;
+}
+
+#define MAX_LAYOUTS 256
+static char *layout_names[MAX_LAYOUTS];
+static long layout_sizes[MAX_LAYOUTS];
+static int layout_count;
+
+static long layout_lookup_size(const char *name) {
+  for (int i = 0; i < layout_count; i++) {
+    if (strcmp(layout_names[i], name) == 0) return layout_sizes[i];
+  }
+  error("unknown layout '%s' in sizeof(...)", name);
+  return -1;
+}
+
+/* Validates every `layout` declaration (called once, up front, same spot
+ * globals/externs are declared): checks for duplicate field names within
+ * one layout, registers each field's offset in the shared field table
+ * (erroring on a cross-layout conflict), and records the layout's own
+ * size (nfields * 8) for sizeof(...). */
+static void layout_declare(Layout *l) {
+  for (int i = 0; i < layout_count; i++) {
+    if (strcmp(layout_names[i], l->name) == 0) error("redefinition of layout '%s'", l->name);
+  }
+  if (layout_count >= MAX_LAYOUTS) error("too many layouts (max %d)", MAX_LAYOUTS);
+
+  long offset = 0;
+  for (LayoutField *f = l->fields; f; f = f->next) {
+    for (LayoutField *g = l->fields; g != f; g = g->next) {
+      if (strcmp(g->name, f->name) == 0) error("duplicate field '%s' in layout '%s'", f->name, l->name);
+    }
+    field_declare_or_check(f->name, offset);
+    offset += 8;
+  }
+  layout_names[layout_count] = l->name;
+  layout_sizes[layout_count] = (long)l->nfields * 8;
+  layout_count++;
+}
+
 static char *sym_names[MAX_VARS];
 static long sym_offsets[MAX_VARS];
 static int sym_count;
@@ -839,20 +1073,20 @@ static long stack_size;
 static int loop_depth; /* nesting depth of while loops during resolve(); break/continue require loop_depth > 0 */
 static int current_fn_is_void; /* whether the function currently being resolved is void */
 
-/* Block scoping: each '{' marks the sym_count at entry, and sym_declare's
+/* Block scoping: each '{' block marks the sym_count at entry; sym_declare's
  * redeclaration check only looks back to that mark, so sibling blocks can
  * reuse a name without colliding. Leaving a block truncates sym_count back
- * to the mark. A nice side effect is that sibling blocks' locals share
- * stack offsets (their lifetimes never overlap, so this is safe) -- a
- * frame-size win I got for free rather than engineered. */
+ * to the mark, which also means sibling blocks' locals get the same stack
+ * offsets (safe: their lifetimes never overlap) -- a size win that falls
+ * out of the scheme for free, not something specially engineered. */
 #define MAX_SCOPE_DEPTH 64
 static int scope_marks[MAX_SCOPE_DEPTH];
 static int scope_depth;
 
-/* Returns the stack offset, or -1 when `name` is not a local of the
- * current function (the caller then tries the globals table). Scans the
- * most recently declared names first, so an inner scope's variable
- * shadows an outer one with the same name. */
+/* Returns the stack offset, or -1 if `name` is not a local in the current
+ * function (the caller then falls back to the globals table). Scans
+ * innermost-declared-first so an inner scope's variable correctly shadows
+ * an outer one of the same name. */
 static long sym_try_lookup(char *name) {
   for (int i = sym_count - 1; i >= 0; i--) {
     if (strcmp(sym_names[i], name) == 0) return sym_offsets[i];
@@ -880,14 +1114,15 @@ static void resolve(Node *n) {
     case ND_NUM: return;
     case ND_STR: return;
     case ND_VAR: {
-      long off = sym_try_lookup(n->name); /* locals shadow globals, globals shadow functions */
+      long off = sym_try_lookup(n->name); /* locals shadow globals shadow functions */
       if (off >= 0) { n->ival = off; return; }
       if (glob_exists(n->name)) { n->is_global = 1; return; }
+      if (extern_exists(n->name)) { n->kind = ND_FUNCREF; return; }
       if (func_exists(n->name)) { n->kind = ND_FUNCREF; return; }
       error("undeclared variable '%s'", n->name);
       return;
     }
-    case ND_FUNCREF: return; /* only exists post-resolve, made by the VAR case above */
+    case ND_FUNCREF: return; /* only ever reached already-resolved, via the VAR case above */
     case ND_NEG: resolve(n->lhs); return;
     case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV:
     case ND_EQ: case ND_NE: case ND_LT: case ND_LE: case ND_GT: case ND_GE:
@@ -917,8 +1152,8 @@ static void resolve(Node *n) {
           error("'%s' takes %d argument(s), got %d", n->name, expected, n->nargs);
         }
       } else {
-        /* Not a builtin and not a declared function. If the name is a
-         * variable, this is an indirect call through its value. */
+        /* Not a builtin, not a declared function -- an indirect call through
+         * a function-pointer-valued variable, if `name` names one. */
         long off = sym_try_lookup(n->name);
         if (off >= 0) { n->ival = off; n->is_indirect = 1; }
         else if (glob_exists(n->name)) { n->is_global = 1; n->is_indirect = 1; }
@@ -958,6 +1193,18 @@ static void resolve(Node *n) {
       resolve(n->lhs); resolve(n->rhs); return;
     case ND_INDEX_ASSIGN:
       resolve(n->lhs); resolve(n->rhs); resolve(n->cond); return;
+    case ND_FIELD:
+      resolve(n->lhs);
+      n->ival = field_lookup(n->name);
+      return;
+    case ND_FIELD_ASSIGN:
+      resolve(n->lhs); resolve(n->rhs);
+      n->ival = field_lookup(n->name);
+      return;
+    case ND_SIZEOF:
+      n->ival = layout_lookup_size(n->name);
+      n->kind = ND_NUM; /* same in-place rewrite-to-constant trick as FUNCREF */
+      return;
   }
 }
 
@@ -980,7 +1227,7 @@ static int label_count;
 static int current_ret_label;
 
 #define MAX_LOOP_DEPTH 64
-static int loop_labels[MAX_LOOP_DEPTH]; /* one label id per active while loop, so break/continue can find the innermost .Lend/.Lstart */
+static int loop_labels[MAX_LOOP_DEPTH]; /* one label id per active while loop; .Lstart%d/.Lend%d are break/continue's targets */
 static int gen_loop_depth;
 
 static void gen_expr(Node *n) {
@@ -1011,6 +1258,10 @@ static void gen_expr(Node *n) {
       fprintf(out, "    add rax, rcx\n");
       fprintf(out, "    movzx rax, byte ptr [rax]\n");
       return;
+    case ND_FIELD:
+      gen_expr(n->lhs);
+      fprintf(out, "    mov rax, [rax + %ld]\n", n->ival);
+      return;
     case ND_CALL: {
       if (strcmp(n->name, "print") == 0) {
         int l = label_count++;
@@ -1031,10 +1282,9 @@ static void gen_expr(Node *n) {
         return;
       }
       if (strcmp(n->name, "alloc") == 0) {
-        /* Bump allocator over brk(2). The current break is cached in
-         * .Lcurbrk, 0 meaning not fetched yet. Watch out: the syscall
-         * instruction clobbers rcx and r11, so live values are kept on
-         * the stack across each syscall, never in registers. */
+        /* Bump allocator over brk(2). The current break is cached in .Lcurbrk
+         * (0 = not fetched yet). NB: syscall clobbers rcx/r11, so live values
+         * stay on the stack across each syscall. */
         int l = label_count++;
         gen_expr(n->args); /* -> rax: n */
         fprintf(out, "    push rax\n");
@@ -1088,8 +1338,8 @@ static void gen_expr(Node *n) {
         return;                   /* rax still holds the value */
       }
       if (strcmp(n->name, "argc") == 0) {
-        /* .Largv0 holds the initial rsp, saved by _start before anything
-         * was pushed. [rsp] at process entry is argc. */
+        /* .Largv0 holds the process's initial rsp, saved by _start before
+         * anything is pushed: [rsp] = argc at that point. */
         fprintf(out, "    mov rax, [.Largv0]\n");
         fprintf(out, "    mov rax, [rax]\n");
         return;
@@ -1116,15 +1366,29 @@ static void gen_expr(Node *n) {
         fprintf(out, "    movzx rax, al\n");
         return;
       }
+      if (strcmp(n->name, "outw") == 0) {
+        gen_expr(n->args);        /* port */
+        fprintf(out, "    push rax\n");
+        gen_expr(n->args->next);  /* value */
+        fprintf(out, "    pop rdx\n");   /* dx = port; ax = value's low 16 bits */
+        fprintf(out, "    out dx, ax\n");
+        return;                   /* rax still holds the value */
+      }
+      if (strcmp(n->name, "inw") == 0) {
+        gen_expr(n->args); /* -> rax: port */
+        fprintf(out, "    mov rdx, rax\n");
+        fprintf(out, "    in ax, dx\n");
+        fprintf(out, "    movzx rax, ax\n");
+        return;
+      }
 
-      /* The syscall wrappers and real function calls share the same
-       * argument plumbing: evaluate left to right, push each result.
-       * Builtins never have more than MAX_PARAMS args, so they always
-       * take the pop-based path. Calls with more args than that load the
-       * first six registers with mov instead of pop, because args 7 and
-       * up must stay on the stack where the callee expects to read them
-       * ([rbp+16+...]); one `add rsp` after the call reclaims the whole
-       * pushed block. */
+      /* Thin syscall wrappers and real function calls share the same argument
+       * plumbing: evaluate left-to-right onto the stack. Builtins always have
+       * arity <= MAX_PARAMS, so they only ever hit the pop-based path below.
+       * User calls with more than MAX_PARAMS args read the extra ones back
+       * non-destructively (they must stay on the stack -- the callee reads
+       * them the same way a caller-past-us would via [rbp+16+...]) and the
+       * whole pushed block is reclaimed with one `add rsp` after the call. */
       int i = 0;
       for (Node *a = n->args; a; a = a->next, i++) {
         gen_expr(a);
@@ -1153,9 +1417,9 @@ static void gen_expr(Node *n) {
         fprintf(out, "    mov rdx, 420\n");     /* mode 0644 */
         fprintf(out, "    mov rax, 2\n    syscall\n");
       } else if (n->is_indirect) {
-        /* r10 is free here (caller-saved, and not one of the six arg
-         * registers). Load the variable's value into it once the real
-         * args are in place, then call through it. */
+        /* r10 is scratch here (not one of the arg registers above, and
+         * caller-saved) -- load the pointer variable's value into it after
+         * the real args are already in place, then call through it. */
         if (n->is_global) fprintf(out, "    mov r10, [.G%s]\n", n->name);
         else fprintf(out, "    mov r10, [rbp - %ld]\n", n->ival);
         fprintf(out, "    call r10\n");
@@ -1250,6 +1514,13 @@ static void gen_stmt(Node *n) {
       fprintf(out, "    pop rdi\n");
       fprintf(out, "    mov byte ptr [rdi], al\n");
       return;
+    case ND_FIELD_ASSIGN:
+      gen_expr(n->lhs);                  /* base */
+      fprintf(out, "    push rax\n");
+      gen_expr(n->rhs);                  /* value */
+      fprintf(out, "    pop rdi\n");
+      fprintf(out, "    mov [rdi + %ld], rax\n", n->ival);
+      return;
     case ND_EXPR_STMT:
       gen_expr(n->lhs);
       return;
@@ -1313,9 +1584,8 @@ static void gen_function(Function *f) {
     if (i < MAX_PARAMS) {
       fprintf(out, "    mov [rbp - %ld], %s\n", (long)(i + 1) * 8, ARG_REGS[i]);
     } else {
-      /* Stack-passed. The caller left it at [rbp+16+8*(nparams-1-i)] --
-       * exactly where its left-to-right pushes put it at the moment of
-       * `call`, indexed from the end of the parameter list. */
+      /* Stack-passed: caller left it at [rbp+16+8*(nparams-1-i)], mirroring
+       * how its own stack looked at the moment of `call` (see gen_call). */
       long stack_off = 16 + (long)(f->nparams - 1 - i) * 8;
       fprintf(out, "    mov rax, [rbp + %ld]\n", stack_off);
       fprintf(out, "    mov [rbp - %ld], rax\n", (long)(i + 1) * 8);
@@ -1331,9 +1601,9 @@ static void gen_function(Function *f) {
 }
 
 /* ------------------------------------------------------------ token dump */
-/* `coff0 -t file.c0` prints the token stream, one token per line. The
- * c0-written lexer (c0/lex.c0) is diffed against this output, so the
- * format is a contract: keep the two in sync. */
+/* `coff0 -t file.c0` prints the token stream, one token per line. This is
+ * the reference output the c0-written lexer (c0/lex.c0) is diffed against,
+ * so the format is a contract: keep the two in sync. */
 
 static void dump_tokens(void) {
   for (int i = 0; i < ntokens; i++) {
@@ -1376,15 +1646,18 @@ static void dump_tokens(void) {
       case TK_LBRACKET: printf("LBRACKET\n"); break;
       case TK_RBRACKET: printf("RBRACKET\n"); break;
       case TK_KW_VOID: printf("VOID\n"); break;
+      case TK_KW_EXTERN: printf("EXTERN\n"); break;
+      case TK_DOT: printf("DOT\n"); break;
+      case TK_KW_LAYOUT: printf("LAYOUT\n"); break;
+      case TK_KW_SIZEOF: printf("SIZEOF\n"); break;
     }
   }
 }
 
 /* -------------------------------------------------------------- ast dump */
 /* `coff0 -a file.c0` prints the parse tree, one node per line, two-space
- * indent per depth, pre-resolve (names, not offsets). Like -t this is a
- * contract format: c0/parse.c0 is diffed against it. One detail to keep:
- * all GLOBAL lines dump before all FUNC lines, whatever the source order. */
+ * indent per depth, pre-resolve (names, not offsets). Like -t, this format
+ * is the contract the c0-written parser will be diffed against. */
 
 static void dump_node(Node *n, int depth) {
   if (!n) return;
@@ -1398,9 +1671,9 @@ static void dump_node(Node *n, int depth) {
       printf("\n");
       return;
     case ND_VAR: printf("VAR %s\n", n->name); return;
-    case ND_FUNCREF: printf("FUNCREF %s\n", n->name); return; /* never hit:
-      -a dumps pre-resolve and FUNCREF only exists post-resolve. Here so
-      the switch stays exhaustive. */
+    case ND_FUNCREF: printf("FUNCREF %s\n", n->name); return; /* never actually
+      hit: -a dumps pre-resolve, and FUNCREF only exists post-resolve (see
+      resolve()'s ND_VAR case) -- here purely for switch exhaustiveness. */
     case ND_ASSIGN:
       printf("ASSIGN %s\n", n->name);
       dump_node(n->rhs, depth + 1);
@@ -1469,6 +1742,18 @@ static void dump_node(Node *n, int depth) {
       dump_node(n->rhs, depth + 1);
       dump_node(n->cond, depth + 1);
       return;
+    case ND_FIELD:
+      printf("FIELD %s\n", n->name);
+      dump_node(n->lhs, depth + 1);
+      return;
+    case ND_FIELD_ASSIGN:
+      printf("FIELDASSIGN %s\n", n->name);
+      dump_node(n->lhs, depth + 1);
+      dump_node(n->rhs, depth + 1);
+      return;
+    case ND_SIZEOF:
+      printf("SIZEOF %s\n", n->name);
+      return;
   }
   return;
 binary:
@@ -1479,6 +1764,11 @@ binary:
 static void dump_ast(void) {
   for (Global *g = prog_globals; g; g = g->next)
     printf("GLOBAL %s %ld\n", g->name, g->init);
+  for (Layout *l = prog_layouts; l; l = l->next) {
+    printf("LAYOUT %s\n", l->name);
+    for (LayoutField *f = l->fields; f; f = f->next)
+      printf("  FIELDDECL %s\n", f->name);
+  }
   for (Function *f = prog_functions; f; f = f->next) {
     if (f->is_void) printf("FUNC void %s", f->name);
     else printf("FUNC %s", f->name);
@@ -1505,24 +1795,31 @@ static char *read_file(const char *path) {
 
 /* -------------------------------------------------------------- includes
  *
- * `include "path.c0";` is pure textual substitution, resolved before the
- * real lexer ever runs -- much like C's #include. The parser,
- * resolver and codegen do not know the feature exists. expand_file reads
- * a file, scans the raw text for include directives (skipping string
- * literals, char literals and // comments so none of them can trigger a
- * false match), and recursively splices each referenced file's expanded
- * content in place of the directive. The result is one flat buffer,
- * handed to tokenize() the same way a single file always was.
+ * `include "path.c0";` is pure textual substitution, resolved entirely
+ * before the real lexer ever runs -- like C's #include, not a language
+ * feature the parser/resolver/codegen need to know exists at all. This
+ * function reads a file, scans its raw text for include directives (while
+ * skipping over string literals and // comments so neither can trigger a
+ * false match), and recursively splices in each referenced file's own
+ * fully-expanded content in place of the directive -- producing one flat
+ * buffer that gets handed to tokenize() exactly as a single file always
+ * has. Deliberately NOT true separate compilation (no linking, no extern
+ * declarations, still one flat symbol namespace): that would need solving
+ * "how does one translation unit call into another by name," a wall this
+ * project has already hit and worked around with indirect calls several
+ * times, because nothing has needed it yet. The actual problem (my
+ * kernel's main source file grew too large to navigate as one file) is a
+ * file-organization problem, not a compilation-model one -- this solves
+ * exactly that, nothing more.
  *
- * This is not separate compilation, and it is not trying to be: no
- * linking, no extern declarations, still one flat symbol namespace. The
- * problem it solves is file organization, nothing more. I wanted to
- * split a source file that had grown too large to navigate, and that
- * does not need a compilation model, just splicing.
+ * Include paths are resolved relative to the file containing the
+ * directive (not the current working directory), so nested includes work
+ * regardless of where coff is invoked from -- the same convention C's
+ * #include "..." form uses.
  *
- * Include paths resolve relative to the file containing the directive,
- * not the current working directory, so nested includes work no matter
- * where coff is invoked from. Same convention as #include "..." in C.
+ * Error messages have no line-number info, matching every other error in
+ * this file (PARSEERROR/CODEGENERROR also carry none) -- not a regression
+ * introduced here.
  */
 
 typedef struct Growbuf Growbuf;
@@ -1549,8 +1846,9 @@ static void gb_puts_n(Growbuf *b, const char *s, long n) {
   for (long i = 0; i < n; i++) gb_putc(b, s[i]);
 }
 
-/* Directory part of `path`, trailing slash included so callers can
- * concatenate directly. "" when the path has no slash at all. */
+/* Directory portion of `path`, trailing slash included (so callers can
+ * concatenate directly), or "" if `path` has no slash (same-directory
+ * relative resolution, e.g. a top-level `coff1 main.c0 out.s` invocation). */
 static char *dirname_with_slash(const char *path) {
   const char *slash = strrchr(path, '/');
   if (!slash) return strdup("");
@@ -1570,11 +1868,12 @@ static char *join_path(const char *dir, const char *rel) {
   return out;
 }
 
-/* The chain of currently-open includes, for cycle detection. The
- * expected shape is one entry file including a handful of leaf files
- * that do not include each other, so this is not a full include-guard
- * system -- but a cycle would otherwise recurse until the stack blows up
- * with no useful error, and that is cheap to prevent here. */
+/* Currently-open include chain, for cycle detection -- a real doubly-
+ * nested or diamond-shaped include graph is not the expected shape (the
+ * driving use case is one entry file including several leaf subsystem
+ * files, none of which include each other), but a cycle would otherwise
+ * recurse until the stack overflows with no clear error, so it is cheap
+ * insurance to check for directly rather than leave as a footgun. */
 #define INCLUDE_MAX_DEPTH 32
 static const char *include_stack[INCLUDE_MAX_DEPTH];
 static int include_depth = 0;
@@ -1608,12 +1907,16 @@ static void expand_file(Growbuf *out, const char *path) {
       gb_puts_n(out, start, p - start);
       continue;
     }
-    /* Char literals need the same verbatim-copy treatment as strings.
-     * Found the hard way: this scanner's own source contains `!= '"'`, a
-     * char literal holding a double-quote. Without this case the scanner
-     * saw that bare `"` and entered string-skip mode at the wrong spot,
-     * swallowing everything up to the next `"` in the file as string
-     * content and corrupting everything after it. */
+    /* Char literals ('x', including quote characters like '"' or '\'')
+     * need the same verbatim-copy treatment as strings -- found by a real
+     * false positive: this very scanner's own source contains `!= '"'`
+     * (a char literal for the double-quote character). Without this case,
+     * the scanner has no notion of "inside a char literal" at all, so it
+     * sees that bare `"` and wrongly enters STRING mode there instead,
+     * scanning forward to whatever `"` happens to appear next in the file
+     * -- silently swallowing a large, arbitrary span of real code as if
+     * it were string content, then corrupting everything scanned after
+     * that point. */
     if (*p == '\'') {
       const char *start = p;
       p++;
@@ -1719,6 +2022,16 @@ int main(int argc, char **argv) {
     glob_declare(g->name);
   }
 
+  for (Global *e = prog_externs; e; e = e->next) {
+    if (find_builtin(e->name)) error("'%s' is a builtin and cannot be used as extern", e->name);
+    for (Global *g = prog_globals; g; g = g->next) {
+      if (strcmp(g->name, e->name) == 0) error("'%s' is both a global and an extern", e->name);
+    }
+    extern_declare(e->name);
+  }
+
+  for (Layout *l = prog_layouts; l; l = l->next) layout_declare(l);
+
   for (Function *f = prog_functions; f; f = f->next) resolve_function(f);
 
   out = fopen(argv[2], "w");
@@ -1747,8 +2060,8 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* alloc()'s cached program break, then argc/argv's saved initial rsp,
-   * then one .quad slot per global. */
+  /* alloc()'s cached program break, argc/argv's saved initial rsp, then one
+   * .quad slot per global. */
   fprintf(out, "\n.section .data\n");
   fprintf(out, ".Lcurbrk:\n    .quad 0\n");
   fprintf(out, ".Largv0:\n    .quad 0\n");

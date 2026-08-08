@@ -1,0 +1,25 @@
+// expect: 99
+//
+// tests/74_layout_global_and_chain.c0 - a layout pointer in a global, and chained field access
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A global variable holding a layout pointer, plus a chained field access
+// (n.next.val) -- allowed for free by the postfix grammar, same "an int
+// that happens to be a valid address" spirit as buf[i][j].
+layout Node {
+    int val;
+    int next;
+}
+
+int head;
+
+int main() {
+    int a;
+    int b;
+    a = alloc(sizeof(Node));
+    b = alloc(sizeof(Node));
+    a.val = 7;
+    a.next = b;
+    b.val = 99;
+    head = a;
+    return head.next.val;
+}

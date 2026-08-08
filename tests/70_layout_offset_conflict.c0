@@ -1,0 +1,9 @@
+// expect: compile-error
+//
+// tests/70_layout_offset_conflict.c0 - a shared field name at conflicting offsets is rejected
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// 'y' is field 1 (offset 8) in A but field 0 (offset 0) in B -- every layout
+// that shares a field name must agree on its position.
+layout A { int x; int y; }
+layout B { int y; int x; }
+int main() { return 0; }

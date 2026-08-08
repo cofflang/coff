@@ -447,6 +447,9 @@ int main() {
             else if (word_is(buf, start, len, "break") == 1) { print("BREAK\n"); }
             else if (word_is(buf, start, len, "continue") == 1) { print("CONTINUE\n"); }
             else if (word_is(buf, start, len, "void") == 1) { print("VOID\n"); }
+            else if (word_is(buf, start, len, "extern") == 1) { print("EXTERN\n"); }
+            else if (word_is(buf, start, len, "layout") == 1) { print("LAYOUT\n"); }
+            else if (word_is(buf, start, len, "sizeof") == 1) { print("SIZEOF\n"); }
             else {
                 print("IDENT ");
                 i = start;
@@ -568,6 +571,7 @@ int main() {
         else if (c == ',') { print("COMMA\n"); pos = pos + 1; }
         else if (c == '[') { print("LBRACKET\n"); pos = pos + 1; }
         else if (c == ']') { print("RBRACKET\n"); pos = pos + 1; }
+        else if (c == '.') { print("DOT\n"); pos = pos + 1; }
         else { print("LEXERROR\n"); return 1; }
     }
 

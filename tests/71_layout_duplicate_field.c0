@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/71_layout_duplicate_field.c0 - the same field name twice in one layout is rejected
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+layout A { int x; int x; }
+int main() { return 0; }

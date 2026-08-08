@@ -1,0 +1,5 @@
+// expect: compile-error
+//
+// tests/73_sizeof_unknown_layout.c0 - sizeof of an undeclared layout is rejected
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() { return sizeof(Nope); }

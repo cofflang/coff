@@ -1,0 +1,23 @@
+// expect: 33
+//
+// tests/68_layout_basic.c0 - a layout declaration, sizeof, and field read/write
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A layout allocates nothing by itself. It only gives each field name an
+// offset, so sizeof(Entity) is a compile-time constant and e.x is sugar
+// over load64/store64 at that offset.
+layout Entity {
+    int x;
+    int y;
+    int vx;
+    int vy;
+}
+
+int main() {
+    int e;
+    e = alloc(sizeof(Entity));
+    e.x = 10;
+    e.y = 20;
+    e.vx = 1;
+    e.vy = 2;
+    return e.x + e.y + e.vx + e.vy;
+}
