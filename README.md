@@ -7,6 +7,11 @@ references -- is a value of that type. coff compiles c0 straight to x86_64
 assembly, and the binaries it produces are freestanding: no libc, no
 runtime, just `_start` and raw syscalls.
 
+It can also skip the assembler entirely and emit machine code directly,
+either as a flat binary or as an ELF64 executable for Moonshot, the
+operating system I am writing in c0. That backend is what every program
+running in ring 3 on that kernel is built through.
+
 The compiler is written in c0 and compiles itself. Once bootstrapped, you
 need nothing except this repository and the system assembler and linker
 (gcc is only needed once, for the bootstrap).
@@ -74,7 +79,27 @@ short-circuiting `&&`/`||`, string literals, char literals, hex literals,
 `buf[i]` indexing (sugar over byte load/store), and function references: a
 bare function name is its address, and calling through a variable holding
 one is an indirect call. `include "file.c0";` splits a program across
-files by plain textual substitution.
+files by plain textual substitution. `extern int name;` declares a global
+that some other object file defines.
+
+`layout` gives a block of memory named offsets:
+
+```c
+layout Entity {
+    int x;
+    int y;
+}
+
+int e;
+e = alloc(sizeof(Entity));
+e.x = 10;
+```
+
+A layout allocates nothing by itself. It only maps each field name to an
+offset, so `sizeof(Entity)` is a compile-time constant and `e.x` is sugar
+over `load64`/`store64`. Because there is no type system, a field name has
+one offset across the whole program: two layouts may share a name only if
+they agree on its position.
 
 There is no type checking, no `%` operator, no optimizer, and nothing is
 ever freed. Some of that will change, some of it is the design. The full
@@ -85,6 +110,29 @@ I/O and memory are compiler builtins that map directly to syscalls:
 `load8`/`store8`, `load64`/`store64`, `exit`, `argc`/`argv`, and
 `outb`/`inb` for port I/O in freestanding code. They are all listed with
 their signatures in `coff0.c`'s header comment.
+
+## Output modes
+
+By default coff emits x86_64 assembly for the system assembler. Two flags
+change that:
+
+| Flag | What it emits |
+|------|---------------|
+| (none) | x86_64 assembly text, to be run through `as` and `ld`. |
+| `--raw` | A flat binary of machine code, no assembler involved. Linux syscall numbers. |
+| `--elf` | An ELF64 executable for Moonshot, my OS kernel. Its own syscall numbers, and the OS builtins below. |
+
+`--elf` adds builtins that are syscalls on that kernel and exist in no
+other mode: `win_info` and `win_max` for the window a program was given,
+`present` and `blit` and `fill` for drawing, `key_poll` for input, and
+`readfile`. Calling one outside `--elf` is a compile error.
+
+The distinction `win_info` versus `win_max` is worth knowing if you write
+against this: `win_info` is the window's size right now and changes
+whenever the window manager reflows, while `win_max` is the largest window
+the machine can ever hand out. Since `alloc` is bump-only and cannot grow
+a buffer, a program sizes its frame buffer once from `win_max` and treats
+`win_info` as the region it is currently allowed to draw into.
 
 ## Testing
 
@@ -97,10 +145,18 @@ link, execute, check the exit code (and the exact stdout, where a test has
 an `.expected_stdout` file). Then each c0-written stage is diffed byte for
 byte against coff0 over the whole corpus, and last the bootstrap fixpoint
 is checked: `coff.c0` compiling itself three generations deep, all
-byte-identical.
+byte-identical. That is 267 checks, and they all have to stay green.
 
-Those byte-for-byte checks are how I trust the compiler at all, so the
-suite has to stay green.
+Those byte-for-byte checks are how I trust the compiler at all. They do
+have one real limit worth stating plainly: `coff0.c` implements only the
+text backend, so nothing in this suite says anything about `--raw` or
+`--elf`. Every check of the machine-code backend is a differential check
+against a compiler that does not have one. I have found five
+silent-wrong-code bugs in that backend so far, every one of them by eye
+after something looked wrong on screen, and the suite was green through
+all of them. The backend is instead covered outside this repository, by
+compiling small programs whose exit code is only correct if codegen is
+correct and running them on the kernel itself.
 
 ## Contributing
 

@@ -1,0 +1,27 @@
+// expect: 14
+//
+// tests/69_layout_shared_field_name.c0 - two layouts sharing field names at the same offsets
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// Two layouts may reuse a field name as long as they agree on its position
+// (both declare x first, y second -- see field_declare_or_check).
+layout Position {
+    int x;
+    int y;
+}
+
+layout Velocity {
+    int x;
+    int y;
+}
+
+int main() {
+    int p;
+    int v;
+    p = alloc(sizeof(Position));
+    v = alloc(sizeof(Velocity));
+    p.x = 5;
+    p.y = 6;
+    v.x = 1;
+    v.y = 2;
+    return p.x + p.y + v.x + v.y;
+}

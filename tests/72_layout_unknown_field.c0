@@ -1,0 +1,11 @@
+// expect: compile-error
+//
+// tests/72_layout_unknown_field.c0 - a field name no layout ever declared is rejected
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// Field offsets come from the layout declarations, so a name that appears
+// in none of them has no offset to resolve to.
+int main() {
+    int e;
+    e = alloc(8);
+    return e.nope;
+}
