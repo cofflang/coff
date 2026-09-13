@@ -1,0 +1,1060 @@
+// smed.c0 - the assembler and linker for c0 and coff, written in c0
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0.
+//
+// coff is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your
+// option) any later version. coff is distributed in the hope that it
+// will be useful, but WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+// the GNU General Public License for more details. You should have
+// received a copy of the license along with coff; if not, see
+// <https://www.gnu.org/licenses/>.
+
+// Purpose: turn the assembly text coff emits into a finished executable,
+// with no GNU tool in between. Called as `smed input.s output`. The name
+// is Swedish for smith, the thing that forges raw machine code out of
+// text.
+//
+// WHY THIS EXISTS
+//
+// Ken Thompson, 1984: "I could have picked on any program-handling program
+// such as an assembler, a loader, or even hardware microcode."  Until now
+// every coff binary and every kernel image of my OS passed through GNU as
+// and GNU ld, which meant that the two components with the most leverage
+// over the final bytes were also the two nothing in this project could
+// check.  They were the largest UNMITIGATED rows in TRUST.md.  smed
+// replaces both.
+//
+// It is one tool rather than a separate assembler and linker.  The Unix
+// split exists so that many objects from many languages can be combined
+// later, and this project links exactly one translation unit at a time, so
+// the split would buy nothing and cost an object file format, a symbol table
+// format and a relocation record format -- three more things to audit for no
+// benefit.  smed resolves every symbol in one pass and writes the finished
+// executable directly.
+//
+// HOW IT WORKS
+//
+// Two passes over the source text.  Pass 1 walks every line, adds up the
+// size of each instruction and records the address of every label.  Pass 2
+// walks the same lines again and emits the bytes, now able to resolve any
+// forward reference because pass 1 already placed every label.
+//
+// The pass 1 sizes are exact rather than approximate because smed never
+// picks a short encoding.  A real assembler relaxes -- it starts with a
+// short jump, discovers the target moved out of range, widens it, and
+// repeats until the layout stops changing.  smed always emits the wide form
+// (rel32 branches, disp32 memory operands, imm32 immediates), so an
+// instruction's size depends only on the instruction itself and pass 1 and
+// pass 2 agree by construction.  The cost is a slightly larger binary.  The
+// benefit is that the whole iterate-to-a-fixpoint problem disappears, and
+// with it a class of bug that would be very hard to see.
+//
+// LAYOUT
+//
+// One PT_LOAD segment, read/write/execute, at 0x400000, with p_offset 0 so
+// file offset 0 maps to the base address and no separate mapping arithmetic
+// is needed.  Code and data are emitted in the order they appear in the
+// source, which works because coff puts .text first, then .rodata, then
+// .data, and never returns to an earlier section.  smed checks that
+// assumption rather than trusting it.
+//
+// SCOPE
+//
+// Milestone one is coff1 itself, so smed accepts the instruction subset coff
+// emits, which is a closed set of 71 shapes over 26 mnemonics.  It refuses
+// anything else loudly instead of guessing.  My OS kernel has a
+// hand-written boot stage on top of this, with mnemonics coff never emits;
+// supporting that is milestone two.
+
+int BASE = 0x400000;   // load address, matching what ld defaults to
+int HDRS = 120;        // 64-byte ELF header + 56-byte program header
+
+int src = 0;           // the whole input file
+int srclen = 0;
+int out = 0;           // emitted bytes, index 0 == file offset HDRS
+int outpos = 0;
+int pass = 0;          // 1 = measure and place labels, 2 = emit
+
+int sym_ptr = 0;       // label name, pointer into src
+int sym_len = 0;
+int sym_addr = 0;
+int sym_count = 0;
+int SYM_MAX = 8192;
+
+int entry_addr = 0;    // address of _start
+int seen_rodata = 0;   // section ordering check
+int seen_data = 0;
+
+int cp = 0;            // cursor while parsing one line
+int lineno = 0;
+
+// Two operand slots.  c0 has no structs worth using here and no multiple
+// return values, so parsed operands land in globals.  kind: 0 register,
+// 1 immediate, 2 memory, 3 symbol.
+int o0_kind = 0; int o0_reg = 0; int o0_imm = 0;
+int o0_base = 0; int o0_index = 0; int o0_scale = 0; int o0_disp = 0;
+int o0_sym = 0;  int o0_symlen = 0; int o0_bytesz = 0;
+int o1_kind = 0; int o1_reg = 0; int o1_imm = 0;
+int o1_base = 0; int o1_index = 0; int o1_scale = 0; int o1_disp = 0;
+int o1_sym = 0;  int o1_symlen = 0; int o1_bytesz = 0;
+
+void print_int(int v) {
+    int buf = alloc(24);
+    int i = 23;
+    int n = v;
+    if (n == 0) { print("0"); return; }
+    if (n < 0) { print("-"); n = 0 - n; }
+    buf[i] = 0;
+    while (n > 0) {
+        i = i - 1;
+        buf[i] = 48 + (n - (n / 10) * 10);
+        n = n / 10;
+    }
+    print(buf + i);
+    return;
+}
+
+void serr(int msg) {
+    print("smed: ");
+    print(msg);
+    print("\n");
+    exit(1);
+    return;
+}
+
+// Failing loudly with the line number matters more here than anywhere else
+// in the stack: a wrong byte in an assembler is a silently miscompiled
+// program, not a crash, and this tool has no oracle above it.
+void serr_at(int msg) {
+    print("smed: line ");
+    print_int(lineno);
+    print(": ");
+    print(msg);
+    print("\n");
+    exit(1);
+    return;
+}
+
+// --- output ---------------------------------------------------------------
+// In pass 1 nothing is stored, only counted, so the same emit calls drive
+// both passes and the two can never disagree about a size.
+
+// Two's complement narrowing, written out because c0 has no unsigned type
+// and no shift operators, and because division in c0 truncates toward zero
+// rather than flooring.  That last detail caused the first real smed bug:
+// a displacement of -8 was emitted as 000000f8 instead of fffffff8, because
+// -8 / 256 is 0 and not -1, so every negative stack offset addressed the
+// wrong side of rbp and the binary faulted immediately.
+int u32(int v) {
+    int u = v;
+    if (u < 0) { u = u + 4294967296; }
+    return u;
+}
+
+void emit1(int b) {
+    int u = b;
+    if (u < 0) { u = u + 256; }
+    if (pass == 2) { store8(out + outpos, u - (u / 256) * 256); }
+    outpos = outpos + 1;
+    return;
+}
+
+void emit4(int v) {
+    int u = u32(v);
+    emit1(u - (u / 256) * 256);
+    emit1((u / 256) - (u / 65536) * 256);
+    emit1((u / 65536) - (u / 16777216) * 256);
+    emit1(u / 16777216);
+    return;
+}
+
+// Splits a 64-bit value into two 32-bit halves.  The floor adjustment on
+// the negative side matters: c0 divides toward zero, so a plain v/2^32 is
+// one too high for any negative value that is not an exact multiple, which
+// showed up as a wrong movabs for the packed font bitmap in
+// tests/64_large_hex_literal.c0.
+void emit8(int v) {
+    int hi = 0;
+    int lo = 0;
+    if (v < 0) { hi = (v - 4294967295) / 4294967296; } else { hi = v / 4294967296; }
+    lo = v - hi * 4294967296;
+    emit4(lo);
+    emit4(hi);
+    return;
+}
+
+int here() {
+    return BASE + HDRS + outpos;
+}
+
+// --- character helpers ----------------------------------------------------
+
+int is_space(int c) {
+    if (c == 32) { return 1; }
+    if (c == 9) { return 1; }
+    return 0;
+}
+
+int is_digit(int c) {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+int is_name_char(int c) {
+    if (c >= 97 && c <= 122) { return 1; }   // a-z
+    if (c >= 65 && c <= 90) { return 1; }    // A-Z
+    if (is_digit(c) == 1) { return 1; }
+    if (c == 95) { return 1; }               // _
+    if (c == 46) { return 1; }               // . so .Lstr0 is one name
+    return 0;
+}
+
+void skip_space() {
+    while (cp < srclen && is_space(src[cp]) == 1) { cp = cp + 1; }
+    return;
+}
+
+int at_eol() {
+    if (cp >= srclen) { return 1; }
+    if (src[cp] == 10) { return 1; }
+    return 0;
+}
+
+// Compares a slice of src against a NUL-terminated literal.
+int slice_is(int p, int n, int lit) {
+    int i = 0;
+    while (i < n) {
+        if (lit[i] == 0) { return 0; }
+        if (src[p + i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    if (lit[n] != 0) { return 0; }
+    return 1;
+}
+
+int word_start = 0;
+int word_len = 0;
+
+// Reads a name at the cursor into word_start/word_len.
+void read_word() {
+    skip_space();
+    word_start = cp;
+    while (cp < srclen && is_name_char(src[cp]) == 1) { cp = cp + 1; }
+    word_len = cp - word_start;
+    return;
+}
+
+int read_num() {
+    int neg = 0;
+    int v = 0;
+    int c = 0;
+    skip_space();
+    if (cp < srclen && src[cp] == 45) { neg = 1; cp = cp + 1; skip_space(); }
+    if (cp + 1 < srclen && src[cp] == 48 && src[cp + 1] == 120) {
+        cp = cp + 2;
+        while (cp < srclen) {
+            c = src[cp];
+            if (is_digit(c) == 1) { v = v * 16 + (c - 48); }
+            else if (c >= 97 && c <= 102) { v = v * 16 + (c - 97 + 10); }
+            else if (c >= 65 && c <= 70) { v = v * 16 + (c - 65 + 10); }
+            else { cp = cp; break; }
+            cp = cp + 1;
+        }
+    } else {
+        if (cp >= srclen || is_digit(src[cp]) == 0) { serr_at("expected a number"); }
+        while (cp < srclen && is_digit(src[cp]) == 1) {
+            v = v * 10 + (src[cp] - 48);
+            cp = cp + 1;
+        }
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+// --- registers ------------------------------------------------------------
+// Returns the architectural register number, or -1 if the word is not a
+// register name.  al is register 0 in its 8-bit form and callers that accept
+// it know they are dealing with a byte operand.
+
+int reg_num(int p, int n) {
+    if (slice_is(p, n, "rax") == 1) { return 0; }
+    if (slice_is(p, n, "rcx") == 1) { return 1; }
+    if (slice_is(p, n, "rdx") == 1) { return 2; }
+    if (slice_is(p, n, "rbx") == 1) { return 3; }
+    if (slice_is(p, n, "rsp") == 1) { return 4; }
+    if (slice_is(p, n, "rbp") == 1) { return 5; }
+    if (slice_is(p, n, "rsi") == 1) { return 6; }
+    if (slice_is(p, n, "rdi") == 1) { return 7; }
+    if (slice_is(p, n, "r8") == 1)  { return 8; }
+    if (slice_is(p, n, "r9") == 1)  { return 9; }
+    if (slice_is(p, n, "r10") == 1) { return 10; }
+    if (slice_is(p, n, "r11") == 1) { return 11; }
+    if (slice_is(p, n, "al") == 1)  { return 0; }
+    return 0 - 1;
+}
+
+int is_byte_reg(int p, int n) {
+    if (slice_is(p, n, "al") == 1) { return 1; }
+    return 0;
+}
+
+// --- symbol table ---------------------------------------------------------
+
+void sym_add(int p, int n, int a) {
+    if (sym_count >= SYM_MAX) { serr("too many symbols"); }
+    store64(sym_ptr + sym_count * 8, p);
+    store64(sym_len + sym_count * 8, n);
+    store64(sym_addr + sym_count * 8, a);
+    sym_count = sym_count + 1;
+    return;
+}
+
+int sym_find(int p, int n) {
+    int i = 0;
+    int q = 0;
+    int m = 0;
+    int j = 0;
+    int ok = 0;
+    while (i < sym_count) {
+        q = load64(sym_ptr + i * 8);
+        m = load64(sym_len + i * 8);
+        if (m == n) {
+            ok = 1;
+            j = 0;
+            while (j < n) {
+                if (src[q + j] != src[p + j]) { ok = 0; j = n; }
+                j = j + 1;
+            }
+            if (ok == 1) { return load64(sym_addr + i * 8); }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// In pass 1 no symbol is known yet, so every reference resolves to a
+// placeholder of the right size.  Pass 2 is where the real address appears,
+// and an unresolved symbol there is a hard error rather than a zero.
+int sym_ref(int p, int n) {
+    int a = 0;
+    if (pass == 1) { return 0; }
+    a = sym_find(p, n);
+    if (a < 0) { serr_at("undefined symbol"); }
+    return a;
+}
+
+// --- encoding primitives --------------------------------------------------
+
+void rex(int w, int r, int x, int b) {
+    int v = 64;
+    if (w == 1) { v = v + 8; }
+    if (r >= 8) { v = v + 4; }
+    if (x >= 8) { v = v + 2; }
+    if (b >= 8) { v = v + 1; }
+    emit1(v);
+    return;
+}
+
+void modrm(int mod, int reg, int rm) {
+    emit1(mod * 64 + (reg - (reg / 8) * 8) * 8 + (rm - (rm / 8) * 8));
+    return;
+}
+
+void sib(int scale, int index, int base) {
+    int s = 0;
+    if (scale == 1) { s = 0; }
+    else if (scale == 2) { s = 1; }
+    else if (scale == 4) { s = 2; }
+    else if (scale == 8) { s = 3; }
+    else { serr_at("bad scale"); }
+    emit1(s * 64 + (index - (index / 8) * 8) * 8 + (base - (base / 8) * 8));
+    return;
+}
+
+// Emits the ModRM (and SIB and displacement) for operand slot 1 used as a
+// memory reference, with reg_field in the reg position.  Always disp32 so
+// the size is fixed.
+void mem_modrm(int reg_field, int base, int index, int scale, int disp,
+               int symp, int symn) {
+    int d = disp;
+    if (symp != 0) {
+        // Absolute address form: mod=00, rm=100 (SIB), SIB base=101 means
+        // "no base, disp32 follows".  This is how a bare [symbol] is reached
+        // in a non-position-independent executable.
+        modrm(0, reg_field, 4);
+        sib(1, 4, 5);
+        emit4(sym_ref(symp, symn) + d);
+        return;
+    }
+    if (base < 0) { serr_at("memory operand with no base and no symbol"); }
+    if (index >= 0) {
+        modrm(2, reg_field, 4);
+        sib(scale, index, base);
+        emit4(d);
+        return;
+    }
+    // rsp (4) and r12 always need a SIB byte, because rm=100 is the escape.
+    if ((base - (base / 8) * 8) == 4) {
+        modrm(2, reg_field, 4);
+        sib(1, 4, base);
+        emit4(d);
+        return;
+    }
+    modrm(2, reg_field, base);
+    emit4(d);
+    return;
+}
+
+void mem_modrm_o1(int reg_field) {
+    mem_modrm(reg_field, o1_base, o1_index, o1_scale, o1_disp, o1_sym, o1_symlen);
+    return;
+}
+
+void mem_modrm_o0(int reg_field) {
+    mem_modrm(reg_field, o0_base, o0_index, o0_scale, o0_disp, o0_sym, o0_symlen);
+    return;
+}
+
+int rex_x_of(int index) {
+    if (index < 0) { return 0; }
+    return index;
+}
+
+// --- operand parsing ------------------------------------------------------
+
+int p_kind = 0; int p_reg = 0; int p_imm = 0;
+int p_base = 0; int p_index = 0; int p_scale = 0; int p_disp = 0;
+int p_sym = 0;  int p_symlen = 0; int p_bytesz = 0;
+
+void parse_operand() {
+    int c = 0;
+    int sign = 0;
+    int r = 0;
+    p_kind = 0; p_reg = 0; p_imm = 0;
+    p_base = 0 - 1; p_index = 0 - 1; p_scale = 1; p_disp = 0;
+    p_sym = 0; p_symlen = 0; p_bytesz = 8;
+
+    skip_space();
+
+    // "byte ptr [..]" marks an 8-bit memory access.
+    read_word();
+    if (slice_is(word_start, word_len, "byte") == 1) {
+        p_bytesz = 1;
+        read_word();
+        if (slice_is(word_start, word_len, "ptr") == 0) { serr_at("expected ptr after byte"); }
+        skip_space();
+    } else if (slice_is(word_start, word_len, "qword") == 1) {
+        read_word();
+        if (slice_is(word_start, word_len, "ptr") == 0) { serr_at("expected ptr after qword"); }
+        skip_space();
+    } else {
+        cp = word_start;   // not a size prefix, rewind
+    }
+
+    skip_space();
+    c = src[cp];
+
+    if (c == 91) {   // '[' memory operand
+        cp = cp + 1;
+        skip_space();
+        read_word();
+        r = reg_num(word_start, word_len);
+        if (r >= 0) {
+            p_base = r;
+        } else {
+            p_sym = word_start;
+            p_symlen = word_len;
+        }
+        skip_space();
+        // optional  + reg*scale  and/or  +/- disp
+        while (cp < srclen && (src[cp] == 43 || src[cp] == 45)) {
+            sign = 1;
+            if (src[cp] == 45) { sign = 0 - 1; }
+            cp = cp + 1;
+            skip_space();
+            if (is_digit(src[cp]) == 1) {
+                p_disp = p_disp + sign * read_num();
+            } else {
+                read_word();
+                r = reg_num(word_start, word_len);
+                if (r < 0) { serr_at("expected a register in the index position"); }
+                if (sign < 0) { serr_at("cannot subtract an index register"); }
+                p_index = r;
+                skip_space();
+                if (cp < srclen && src[cp] == 42) {   // '*'
+                    cp = cp + 1;
+                    p_scale = read_num();
+                }
+            }
+            skip_space();
+        }
+        if (cp >= srclen || src[cp] != 93) { serr_at("expected ]"); }
+        cp = cp + 1;
+        p_kind = 2;
+        return;
+    }
+
+    if (is_digit(c) == 1 || c == 45) {
+        p_imm = read_num();
+        p_kind = 1;
+        return;
+    }
+
+    read_word();
+    if (word_len == 0) { serr_at("expected an operand"); }
+    r = reg_num(word_start, word_len);
+    if (r >= 0 && p_bytesz == 8) {
+        p_kind = 0;
+        p_reg = r;
+        if (is_byte_reg(word_start, word_len) == 1) { p_bytesz = 1; }
+        return;
+    }
+    p_kind = 3;
+    p_sym = word_start;
+    p_symlen = word_len;
+    return;
+}
+
+void store_op0() {
+    o0_kind = p_kind; o0_reg = p_reg; o0_imm = p_imm;
+    o0_base = p_base; o0_index = p_index; o0_scale = p_scale; o0_disp = p_disp;
+    o0_sym = p_sym; o0_symlen = p_symlen; o0_bytesz = p_bytesz;
+    return;
+}
+
+void store_op1() {
+    o1_kind = p_kind; o1_reg = p_reg; o1_imm = p_imm;
+    o1_base = p_base; o1_index = p_index; o1_scale = p_scale; o1_disp = p_disp;
+    o1_sym = p_sym; o1_symlen = p_symlen; o1_bytesz = p_bytesz;
+    return;
+}
+
+// Parses "op0, op1" and reports how many operands were present.
+int parse_operands() {
+    skip_space();
+    if (at_eol() == 1) { return 0; }
+    parse_operand();
+    store_op0();
+    skip_space();
+    if (cp < srclen && src[cp] == 44) {   // ','
+        cp = cp + 1;
+        parse_operand();
+        store_op1();
+        return 2;
+    }
+    return 1;
+}
+
+// --- instruction encodings ------------------------------------------------
+// Each helper emits one complete instruction.  The comments name the Intel
+// opcode form so the encoding can be checked against the manual without
+// reverse engineering the arithmetic.
+
+int fits_i32(int v) {
+    if (v >= 0 - 2147483648 && v <= 2147483647) { return 1; }
+    return 0;
+}
+
+// mov r64, imm  ->  REX.W C7 /0 id when it fits, otherwise REX.W B8+r io
+void enc_mov_reg_imm(int r, int v) {
+    if (fits_i32(v) == 1) {
+        rex(1, 0, 0, r);
+        emit1(0xC7);
+        modrm(3, 0, r);
+        emit4(v);
+        return;
+    }
+    rex(1, 0, 0, r);
+    emit1(0xB8 + (r - (r / 8) * 8));
+    emit8(v);
+    return;
+}
+
+// The reg,reg forms all share a shape: REX.W, opcode, mod=11.
+void enc_rr(int op, int dst, int fromsrc) {
+    rex(1, fromsrc, 0, dst);
+    emit1(op);
+    modrm(3, fromsrc, dst);
+    return;
+}
+
+// ALU r64, imm32  ->  REX.W 81 /ext id
+void enc_alu_imm(int ext, int r, int v) {
+    if (fits_i32(v) == 0) { serr_at("immediate too large for this instruction"); }
+    rex(1, 0, 0, r);
+    emit1(0x81);
+    modrm(3, ext, r);
+    emit4(v);
+    return;
+}
+
+// --- one line -------------------------------------------------------------
+
+void do_directive() {
+    int v = 0;
+    if (slice_is(word_start, word_len, ".intel_syntax") == 1) {
+        read_word();   // consume "noprefix"; smed speaks nothing else
+        return;
+    }
+    if (slice_is(word_start, word_len, ".global") == 1) {
+        read_word();   // one executable, one entry point, nothing to export
+        return;
+    }
+    if (slice_is(word_start, word_len, ".section") == 1) {
+        // The linear layout below depends on coff never going back to an
+        // earlier section, so sections must appear in non-decreasing rank.
+        // A program with no string literals has no .rodata at all, which is
+        // why this is a rank comparison and not a "rodata must come first"
+        // rule -- the first version of this check rejected every small test
+        // program for exactly that reason.
+        read_word();
+        v = 0 - 1;
+        if (slice_is(word_start, word_len, ".text") == 1)   { v = 0; }
+        if (slice_is(word_start, word_len, ".rodata") == 1) { v = 1; }
+        if (slice_is(word_start, word_len, ".data") == 1)   { v = 2; }
+        if (v < 0) { serr_at("unknown section"); }
+        if (v < seen_rodata) { serr_at("sections are out of order, layout is not linear"); }
+        seen_rodata = v;
+        return;
+    }
+    if (slice_is(word_start, word_len, ".byte") == 1) {
+        v = read_num();
+        emit1(v);
+        skip_space();
+        while (cp < srclen && src[cp] == 44) {
+            cp = cp + 1;
+            v = read_num();
+            emit1(v);
+            skip_space();
+        }
+        return;
+    }
+    if (slice_is(word_start, word_len, ".quad") == 1) {
+        skip_space();
+        if (is_digit(src[cp]) == 1 || src[cp] == 45) {
+            emit8(read_num());
+        } else {
+            read_word();
+            emit8(sym_ref(word_start, word_len));
+        }
+        return;
+    }
+    serr_at("unknown directive");
+    return;
+}
+
+void do_instruction() {
+    int m = word_start;
+    int n = word_len;
+    int nops = 0;
+    int cc = 0;
+    int target = 0;
+
+    // Zero-operand forms first, so parse_operands is never called on them.
+    if (slice_is(m, n, "ret") == 1)     { emit1(0xC3); return; }
+    if (slice_is(m, n, "cqo") == 1)     { rex(1, 0, 0, 0); emit1(0x99); return; }
+    if (slice_is(m, n, "syscall") == 1) { emit1(0x0F); emit1(0x05); return; }
+    if (slice_is(m, n, "hlt") == 1)     { emit1(0xF4); return; }
+
+    // Branches and calls take a label, never a register, in the subset coff
+    // emits, so they are handled before the general operand parser.
+    cc = 0 - 1;
+    if (slice_is(m, n, "je") == 1)  { cc = 0x84; }
+    if (slice_is(m, n, "jz") == 1)  { cc = 0x84; }
+    if (slice_is(m, n, "jne") == 1) { cc = 0x85; }
+    if (slice_is(m, n, "jnz") == 1) { cc = 0x85; }
+    if (slice_is(m, n, "jl") == 1)  { cc = 0x8C; }
+    if (slice_is(m, n, "jle") == 1) { cc = 0x8E; }
+    if (slice_is(m, n, "jg") == 1)  { cc = 0x8F; }
+    if (slice_is(m, n, "jge") == 1) { cc = 0x8D; }
+    if (cc >= 0) {
+        read_word();
+        emit1(0x0F);
+        emit1(cc);
+        // rel32 is measured from the end of the instruction, which is why
+        // here() is read after the opcode bytes and four more are added for
+        // the displacement itself.
+        target = sym_ref(word_start, word_len);
+        emit4(target - (here() + 4));
+        return;
+    }
+    // jmp and call take either a label or, for c0 function pointers, a
+    // register holding the target address.
+    if (slice_is(m, n, "jmp") == 1) {
+        read_word();
+        cc = reg_num(word_start, word_len);
+        if (cc >= 0) {
+            if (cc >= 8) { rex(0, 0, 0, cc); }
+            emit1(0xFF); modrm(3, 4, cc);   // jmp r/m64 -> FF /4
+            return;
+        }
+        emit1(0xE9);
+        target = sym_ref(word_start, word_len);
+        emit4(target - (here() + 4));
+        return;
+    }
+    if (slice_is(m, n, "call") == 1) {
+        read_word();
+        cc = reg_num(word_start, word_len);
+        if (cc >= 0) {
+            if (cc >= 8) { rex(0, 0, 0, cc); }
+            emit1(0xFF); modrm(3, 2, cc);   // call r/m64 -> FF /2
+            return;
+        }
+        emit1(0xE8);
+        target = sym_ref(word_start, word_len);
+        emit4(target - (here() + 4));
+        return;
+    }
+
+    // Port I/O.  Both forms are fixed-register in the encoding, so the
+    // operands are checked rather than parsed: out dx, al is EE and
+    // in al, dx is EC, with no ModRM byte at all.
+    if (slice_is(m, n, "out") == 1) {
+        read_word();
+        if (slice_is(word_start, word_len, "dx") == 0) { serr_at("out wants dx"); }
+        skip_space();
+        if (cp < srclen && src[cp] == 44) { cp = cp + 1; }
+        read_word();
+        if (slice_is(word_start, word_len, "al") == 0) { serr_at("out wants al"); }
+        emit1(0xEE);
+        return;
+    }
+    if (slice_is(m, n, "in") == 1) {
+        read_word();
+        if (slice_is(word_start, word_len, "al") == 0) { serr_at("in wants al"); }
+        skip_space();
+        if (cp < srclen && src[cp] == 44) { cp = cp + 1; }
+        read_word();
+        if (slice_is(word_start, word_len, "dx") == 0) { serr_at("in wants dx"); }
+        emit1(0xEC);
+        return;
+    }
+
+    // setCC al  ->  0F 9x, always on al in coff output
+    cc = 0 - 1;
+    if (slice_is(m, n, "sete") == 1)  { cc = 0x94; }
+    if (slice_is(m, n, "setne") == 1) { cc = 0x95; }
+    if (slice_is(m, n, "setl") == 1)  { cc = 0x9C; }
+    if (slice_is(m, n, "setge") == 1) { cc = 0x9D; }
+    if (slice_is(m, n, "setle") == 1) { cc = 0x9E; }
+    if (slice_is(m, n, "setg") == 1)  { cc = 0x9F; }
+    if (cc >= 0) {
+        nops = parse_operands();
+        if (nops != 1 || o0_kind != 0) { serr_at("setcc wants one register"); }
+        emit1(0x0F);
+        emit1(cc);
+        modrm(3, 0, o0_reg);
+        return;
+    }
+
+    nops = parse_operands();
+
+    if (slice_is(m, n, "push") == 1) {
+        if (o0_kind != 0) { serr_at("push wants a register"); }
+        if (o0_reg >= 8) { rex(0, 0, 0, o0_reg); }
+        emit1(0x50 + (o0_reg - (o0_reg / 8) * 8));
+        return;
+    }
+    if (slice_is(m, n, "pop") == 1) {
+        if (o0_kind != 0) { serr_at("pop wants a register"); }
+        if (o0_reg >= 8) { rex(0, 0, 0, o0_reg); }
+        emit1(0x58 + (o0_reg - (o0_reg / 8) * 8));
+        return;
+    }
+    if (slice_is(m, n, "idiv") == 1) {
+        if (o0_kind != 0) { serr_at("idiv wants a register"); }
+        rex(1, 0, 0, o0_reg); emit1(0xF7); modrm(3, 7, o0_reg);
+        return;
+    }
+    if (slice_is(m, n, "neg") == 1) {
+        rex(1, 0, 0, o0_reg); emit1(0xF7); modrm(3, 3, o0_reg);
+        return;
+    }
+    if (slice_is(m, n, "inc") == 1) {
+        rex(1, 0, 0, o0_reg); emit1(0xFF); modrm(3, 0, o0_reg);
+        return;
+    }
+
+    if (slice_is(m, n, "mov") == 1) {
+        if (o0_kind == 0 && o1_kind == 1) { enc_mov_reg_imm(o0_reg, o1_imm); return; }
+        if (o0_kind == 0 && o1_kind == 0) {
+            if (o0_bytesz == 1 || o1_bytesz == 1) { serr_at("byte mov reg,reg unsupported"); }
+            enc_rr(0x89, o0_reg, o1_reg);
+            return;
+        }
+        if (o0_kind == 0 && o1_kind == 2) {
+            // mov r, [mem].  A byte-sized source would need movzx, and coff
+            // always writes that explicitly, so a byte here is a bug.
+            if (o1_bytesz == 1) { serr_at("byte load needs movzx"); }
+            rex(1, o0_reg, rex_x_of(o1_index), o1_base);
+            emit1(0x8B);
+            mem_modrm_o1(o0_reg);
+            return;
+        }
+        if (o0_kind == 2 && o1_kind == 0) {
+            if (o0_bytesz == 1) {
+                // mov byte ptr [mem], al  ->  88 /r, no REX.W
+                if (o0_base >= 8 || rex_x_of(o0_index) >= 8 || o1_reg >= 8) {
+                    rex(0, o1_reg, rex_x_of(o0_index), o0_base);
+                }
+                emit1(0x88);
+                mem_modrm_o0(o1_reg);
+                return;
+            }
+            rex(1, o1_reg, rex_x_of(o0_index), o0_base);
+            emit1(0x89);
+            mem_modrm_o0(o1_reg);
+            return;
+        }
+        serr_at("unsupported mov form");
+    }
+
+    if (slice_is(m, n, "movzx") == 1) {
+        if (o1_kind == 0) {
+            // movzx r64, al  ->  REX.W 0F B6 /r
+            rex(1, o0_reg, 0, o1_reg);
+            emit1(0x0F); emit1(0xB6);
+            modrm(3, o0_reg, o1_reg);
+            return;
+        }
+        if (o1_kind == 2) {
+            rex(1, o0_reg, rex_x_of(o1_index), o1_base);
+            emit1(0x0F); emit1(0xB6);
+            mem_modrm_o1(o0_reg);
+            return;
+        }
+        serr_at("unsupported movzx form");
+    }
+
+    if (slice_is(m, n, "lea") == 1) {
+        if (o1_kind != 2) { serr_at("lea wants a memory operand"); }
+        rex(1, o0_reg, rex_x_of(o1_index), o1_base);
+        emit1(0x8D);
+        mem_modrm_o1(o0_reg);
+        return;
+    }
+
+    if (slice_is(m, n, "add") == 1) {
+        if (o1_kind == 0) { enc_rr(0x01, o0_reg, o1_reg); return; }
+        if (o1_kind == 1) { enc_alu_imm(0, o0_reg, o1_imm); return; }
+        serr_at("unsupported add form");
+    }
+    if (slice_is(m, n, "sub") == 1) {
+        if (o1_kind == 0) { enc_rr(0x29, o0_reg, o1_reg); return; }
+        if (o1_kind == 1) { enc_alu_imm(5, o0_reg, o1_imm); return; }
+        serr_at("unsupported sub form");
+    }
+    if (slice_is(m, n, "xor") == 1) {
+        if (o1_kind == 0) { enc_rr(0x31, o0_reg, o1_reg); return; }
+        serr_at("unsupported xor form");
+    }
+    if (slice_is(m, n, "or") == 1) {
+        if (o1_kind == 0) { enc_rr(0x09, o0_reg, o1_reg); return; }
+        if (o1_kind == 1) { enc_alu_imm(1, o0_reg, o1_imm); return; }
+        serr_at("unsupported or form");
+    }
+    if (slice_is(m, n, "test") == 1) {
+        if (o1_kind == 0) { enc_rr(0x85, o0_reg, o1_reg); return; }
+        serr_at("unsupported test form");
+    }
+    if (slice_is(m, n, "cmp") == 1) {
+        if (o0_kind == 0 && o1_kind == 0) { enc_rr(0x39, o0_reg, o1_reg); return; }
+        if (o0_kind == 0 && o1_kind == 1) { enc_alu_imm(7, o0_reg, o1_imm); return; }
+        if (o0_kind == 2 && o1_kind == 1) {
+            // cmp byte ptr [mem], imm8  ->  80 /7 ib
+            if (o0_bytesz != 1) { serr_at("cmp mem,imm is only supported byte-sized"); }
+            if (o0_base >= 8 || rex_x_of(o0_index) >= 8) {
+                rex(0, 0, rex_x_of(o0_index), o0_base);
+            }
+            emit1(0x80);
+            mem_modrm_o0(7);
+            emit1(o1_imm);
+            return;
+        }
+        serr_at("unsupported cmp form");
+    }
+    if (slice_is(m, n, "imul") == 1) {
+        if (o1_kind != 0) { serr_at("unsupported imul form"); }
+        // imul r64, r/m64  ->  REX.W 0F AF /r, reg field is the destination
+        rex(1, o0_reg, 0, o1_reg);
+        emit1(0x0F); emit1(0xAF);
+        modrm(3, o0_reg, o1_reg);
+        return;
+    }
+
+    serr_at("unknown mnemonic");
+    return;
+}
+
+// Walks the whole source once.  Called twice, with pass set to 1 then 2.
+void run_pass() {
+    int c = 0;
+    outpos = 0;
+    seen_rodata = 0;
+    seen_data = 0;
+    cp = 0;
+    lineno = 1;
+    while (cp < srclen) {
+        skip_space();
+        if (at_eol() == 1) {
+            if (cp < srclen) { cp = cp + 1; lineno = lineno + 1; }
+            continue;
+        }
+        c = src[cp];
+        if (c == 46) {
+            // A leading dot is either a directive or a local label such as
+            // .Lstr0, told apart by whether a colon follows the name.
+            read_word();
+            skip_space();
+            if (cp < srclen && src[cp] == 58) {
+                cp = cp + 1;
+                if (pass == 1) { sym_add(word_start, word_len, here()); }
+            } else {
+                cp = word_start;
+                read_word();
+                do_directive();
+            }
+        } else {
+            read_word();
+            skip_space();
+            if (cp < srclen && src[cp] == 58) {
+                cp = cp + 1;
+                if (pass == 1) {
+                    sym_add(word_start, word_len, here());
+                    if (slice_is(word_start, word_len, "_start") == 1) {
+                        entry_addr = here();
+                    }
+                }
+            } else {
+                do_instruction();
+            }
+        }
+        // Anything left on the line is a stray operand smed did not consume,
+        // which means it misparsed something.  Better to stop than to emit a
+        // plausible-looking wrong instruction.
+        skip_space();
+        if (at_eol() == 0) { serr_at("trailing text on line"); }
+        if (cp < srclen) { cp = cp + 1; lineno = lineno + 1; }
+    }
+    return;
+}
+
+// --- ELF ------------------------------------------------------------------
+// Deliberately the same shape as coff's own --elf writer: one PT_LOAD with
+// p_offset 0, so the file maps at BASE and no offset arithmetic is needed.
+// Permissions are read/write/execute because the .data section shares the
+// single segment with the code.
+
+void hdr_b(int buf, int pos, int b) { store8(buf + pos, b); return; }
+
+void hdr_16(int buf, int pos, int v) {
+    hdr_b(buf, pos, v - (v / 256) * 256);
+    hdr_b(buf, pos + 1, (v / 256) - (v / 65536) * 256);
+    return;
+}
+
+void hdr_32(int buf, int pos, int v) {
+    int u = u32(v);
+    hdr_b(buf, pos,     u - (u / 256) * 256);
+    hdr_b(buf, pos + 1, (u / 256) - (u / 65536) * 256);
+    hdr_b(buf, pos + 2, (u / 65536) - (u / 16777216) * 256);
+    hdr_b(buf, pos + 3, (u / 16777216) - (u / 16777216 / 256) * 256);
+    return;
+}
+
+void hdr_64(int buf, int pos, int v) {
+    int hi = 0;
+    if (v < 0) { hi = 0 - 1; } else { hi = v / 4294967296; }
+    hdr_32(buf, pos, v);
+    hdr_32(buf, pos + 4, hi);
+    return;
+}
+
+void write_elf(int fd) {
+    int total = HDRS + outpos;
+    int hdr = alloc(HDRS);
+    int i = 0;
+    while (i < HDRS) { store8(hdr + i, 0); i = i + 1; }
+
+    hdr_b(hdr, 0, 0x7F);
+    hdr_b(hdr, 1, 69); hdr_b(hdr, 2, 76); hdr_b(hdr, 3, 70);   // E L F
+    hdr_b(hdr, 4, 2);    // ELFCLASS64
+    hdr_b(hdr, 5, 1);    // ELFDATA2LSB
+    hdr_b(hdr, 6, 1);    // EV_CURRENT
+
+    hdr_16(hdr, 16, 2);      // e_type = ET_EXEC
+    hdr_16(hdr, 18, 62);     // e_machine = EM_X86_64
+    hdr_32(hdr, 20, 1);      // e_version
+    hdr_64(hdr, 24, entry_addr);
+    hdr_64(hdr, 32, 64);     // e_phoff
+    hdr_64(hdr, 40, 0);      // e_shoff, no section headers
+    hdr_32(hdr, 48, 0);      // e_flags
+    hdr_16(hdr, 52, 64);     // e_ehsize
+    hdr_16(hdr, 54, 56);     // e_phentsize
+    hdr_16(hdr, 56, 1);      // e_phnum
+    hdr_16(hdr, 58, 0);      // e_shentsize
+    hdr_16(hdr, 60, 0);      // e_shnum
+    hdr_16(hdr, 62, 0);      // e_shstrndx
+
+    hdr_32(hdr, 64, 1);      // p_type = PT_LOAD
+    hdr_32(hdr, 68, 7);      // p_flags = R | W | X
+    hdr_64(hdr, 72, 0);      // p_offset
+    hdr_64(hdr, 80, BASE);   // p_vaddr
+    hdr_64(hdr, 88, BASE);   // p_paddr
+    hdr_64(hdr, 96, total);  // p_filesz
+    hdr_64(hdr, 104, total); // p_memsz
+    hdr_64(hdr, 112, 4096);  // p_align
+
+    write(fd, hdr, HDRS);
+    write(fd, out, outpos);
+    return;
+}
+
+int main() {
+    int infd = 0;
+    int outfd = 0;
+    int got = 0;
+    int cap = 4194304;
+
+    if (argc() != 3) {
+        print("usage: smed input.s output\n");
+        exit(1);
+    }
+
+    sym_ptr = alloc(SYM_MAX * 8);
+    sym_len = alloc(SYM_MAX * 8);
+    sym_addr = alloc(SYM_MAX * 8);
+
+    infd = open_read(argv(1));
+    if (infd < 0) { serr("cannot open input"); }
+    src = alloc(cap);
+    srclen = 0;
+    got = read(infd, src, cap);
+    while (got > 0) {
+        srclen = srclen + got;
+        got = read(infd, src + srclen, cap - srclen);
+    }
+    close(infd);
+    if (srclen >= cap) { serr("input larger than the read buffer"); }
+
+    out = alloc(cap);
+
+    pass = 1;
+    run_pass();
+    if (entry_addr == 0) { serr("no _start label"); }
+
+    pass = 2;
+    run_pass();
+
+    outfd = open_write(argv(2));
+    if (outfd < 0) { serr("cannot open output"); }
+    write_elf(outfd);
+    close(outfd);
+    return 0;
+}

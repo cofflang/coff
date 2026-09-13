@@ -24,12 +24,28 @@
 # stage diffed against coff0 over the whole corpus) and finally the
 # bootstrap fixpoint checks: coff.c0 compiling itself, three
 # generations deep, all byte-identical.
+#
+# What this suite does NOT establish: that the toolchain is free of a
+# Ken Thompson "trusting trust" payload. The bootstrap fixpoint below
+# (stage1 == stage2 == stage3) is the property such a payload is designed
+# to preserve, not evidence against one. See ./verify_bootstrap.sh and
+# TRUST.md for the checks that actually bear on that question.
 set -u
 
 cd "$(dirname "$0")"
 
-echo "Building coff0..."
-gcc -Wall -Wextra -o coff0 coff0.c || { echo "coff0 failed to build"; exit 1; }
+# The seed compiler is selectable so the whole suite can be run without gcc
+# anywhere in it: `CC=tcc ./run_tests.sh` is verified to produce a
+# byte-identical coff1 and a byte-identical Moonshot kernel. That matters
+# because tcc is reachable from the 357-byte hex0 seed through the
+# stage0/M2-Planet/Mes chain, and gcc is not reachable from anything.
+# Same selection as verify_bootstrap.sh, so the two scripts always build
+# the same coff0.
+if [ -z "${CC:-}" ]; then
+  if command -v tcc >/dev/null 2>&1; then CC=tcc; else CC=gcc; fi
+fi
+echo "Building coff0 (CC=$CC)..."
+$CC -Wall -Wextra -o coff0 coff0.c || { echo "coff0 failed to build"; exit 1; }
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT

@@ -20,9 +20,11 @@
  */
 
 /*
- * Purpose: the bootstrap stage. Plain C, compiled with the host gcc, and
- * it exists so the self-hosted compiler (c0/coff.c0) has something to be
- * compiled by the first time. After that it stays around as the oracle:
+ * Purpose: the bootstrap stage. Plain C, buildable by any C compiler --
+ * tcc by preference, because tcc can be bootstrapped from a hand-auditable
+ * seed and gcc cannot (see TRUST.md) -- and it exists so the self-hosted
+ * compiler (c0/coff.c0) has something to be compiled by the first time.
+ * After that it stays around as the oracle:
  * run_tests.sh diffs the output of every c0-written stage against this
  * one, byte for byte. It is not the compiler you are meant to use day to
  * day - that is coff1, the binary built from c0/coff.c0.
