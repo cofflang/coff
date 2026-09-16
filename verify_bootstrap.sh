@@ -435,20 +435,17 @@ echo ""
   # Build code is code. The xz-utils backdoor (CVE-2024-3094) did not live
   # in the library source at all: it lived in the build machinery and in
   # files that looked like test data. Both of those categories exist here
-  # -- run_tests.sh and my kernel's build script decide what gets compiled,
-  # and one of the kernel's generators bakes its test programs into the
-  # shipped image as byte arrays. A "test" file in this project becomes
-  # code running inside the operating system, so it is hashed like code.
-  # The kernel-side files are hashed when the kernel tree sits next to
-  # this one, and silently left out otherwise.
+  # -- run_tests.sh decides what gets compiled here, and a "test" file in
+  # this project is input to the compiler under test, so it is hashed like
+  # code. The kernel's build script and its generators (which bake test
+  # programs into the shipped image as byte arrays) are the same category,
+  # but they live in the kernel's repository and are recorded there: for
+  # the same reason no binary is hashed above, nothing outside this
+  # repository is either, or the committed manifest would match only one
+  # of the two layouts the README describes. The kernel sources still go
+  # into the DDC corpus (stage 3) when they sit next to this tree.
   sha256sum run_tests.sh verify_bootstrap.sh smed_tests.sh 2>/dev/null
-  for f in ../moonshot/build.sh ../moonshot/gen_seed.py \
-           ../moonshot/gen_elf_tests.py; do
-    [ -f "$f" ] && sha256sum "$f"
-  done
   find tests -name '*.c0' -o -name '*.expected_stdout' 2>/dev/null \
-    | LC_ALL=C sort | xargs sha256sum 2>/dev/null
-  [ -d ../moonshot/elf_tests ] && find ../moonshot/elf_tests -type f \
     | LC_ALL=C sort | xargs sha256sum 2>/dev/null
 } > "$tmpdir/manifest"
 
