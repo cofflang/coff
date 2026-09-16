@@ -143,10 +143,14 @@ seed. Closing that is item 2 below.
 **`./run_tests.sh`** — the unit tests, the differential stages and the
 fixpoint checks. `CC=tcc` runs the whole thing without gcc.
 
-**The kernel build** — hash-gates `coff1` against `BOOTSTRAP.sha256` on
-every build and refuses to produce a kernel on mismatch. Re-bootstraps and
-re-runs the full audit when `coff.c0` moves. Prefers tcc as the seed compiler
-when present. Fails closed.
+**The kernel build** — hash-gates `coff1` on every build and refuses to
+produce a kernel on mismatch. Since this repository commits no binaries and
+its manifest records none, the kernel's build script keeps its own record of
+the `coff1` hash, written right after a passing audit and nowhere else. A
+`coff1` with no recorded hash at all is unverified, not tampered: it gets the
+full audit before compiling anything. Re-bootstraps and re-runs the full
+audit when `coff.c0` moves. Prefers tcc as the seed compiler when present.
+Fails closed.
 
 **`./smed_tests.sh`** — four checks on the assembler: a differential corpus
 against as+ld over every c0 source, the compiler rebuilding itself through
@@ -156,8 +160,9 @@ tool anywhere in the pipeline.
 **`BOOTSTRAP.sha256`** — hashes of every bootstrap artifact, every build
 script and the whole test corpus, plus the versions of every tool trusted to
 produce them. In this repository it covers sources, scripts and tests, since
-no binaries are committed. Regenerate deliberately with `--write-manifest`;
-never to make a failure go away.
+no binaries are committed, and nothing outside this repository, so the same
+committed file matches whether or not the kernel sits next to it. Regenerate
+deliberately with `--write-manifest`; never to make a failure go away.
 
 ### What the fixpoint test is not
 
