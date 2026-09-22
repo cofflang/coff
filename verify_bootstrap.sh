@@ -31,13 +31,17 @@
 # What it checks, in order of what it would catch:
 #
 #   1. Committed artifacts match a fresh rebuild. In my own tree coff0,
-#      coff1.s and coff1 are checked in and the kernel build runs the coff1
-#      binary directly. A tampered binary committed once would compile
-#      every kernel from then on, and a binary diff inside a commit is not
-#      something a human reads. This stage rebuilds the whole chain from
-#      source and compares bytes. This repository commits no binaries, so
-#      here the comparisons report SKIP unless you have built into the
-#      tree; the rebuild itself still has to succeed.
+#      coff1.s, coff1, smed.s and smed are checked in and the kernel build
+#      runs those binaries directly. A tampered binary committed once would
+#      compile or assemble every kernel from then on, and a binary diff
+#      inside a commit is not something a human reads. This stage rebuilds
+#      the whole chain from source and compares bytes. Since smed took over
+#      assembling and linking the kernel, smed is on that path too, so it
+#      is rebuilt and compared the same way: coff1 must reproduce smed.s
+#      from c0/smed.c0, and smed must reproduce itself from that assembly.
+#      This repository commits no binaries, so here the comparisons report
+#      SKIP unless you have built into the tree; the rebuilds themselves
+#      still have to succeed.
 #
 #   2. The bootstrap fixpoint. Kept here as well as in run_tests.sh so a
 #      single command covers the whole trust story.
@@ -212,6 +216,40 @@ else
   warn "no committed coff1 to compare against"
 fi
 
+# smed sits on the same path: coff1 compiles it, and it assembles and links
+# the kernel image. A tampered smed never has to touch a compiler to put
+# whatever it likes into the final binary, which is precisely the hiding
+# place Thompson pointed at. So it gets the same treatment as coff1 -- its
+# assembly must be what coff1 emits from c0/smed.c0, and the binary must be
+# what smed makes of that assembly, with no GNU tool in between.
+if [ -f "$tmpdir/coff1" ]; then
+  if "$tmpdir/coff1" c0/smed.c0 "$tmpdir/smed.s" 2>/dev/null; then
+    if [ -f smed.s ]; then
+      if cmpq "$tmpdir/smed.s" smed.s; then
+        ok "committed smed.s == coff1's output for c0/smed.c0"
+      else
+        bad "committed smed.s differs from what coff1 emits for c0/smed.c0"
+      fi
+    else
+      warn "no committed smed.s to compare against"
+    fi
+    if [ -x smed ]; then
+      if ./smed "$tmpdir/smed.s" "$tmpdir/smed_self" 2>/dev/null \
+         && cmpq "$tmpdir/smed_self" smed; then
+        ok "committed smed == smed assembling its own source (the binary that links the kernel)"
+      else
+        bad "committed smed is not what smed produces from its own source"
+        echo "     this is the binary the kernel is assembled and linked with."
+        echo "     do not build a kernel until this is explained."
+      fi
+    else
+      warn "no committed smed to compare against"
+    fi
+  else
+    bad "coff1 could not compile c0/smed.c0"
+  fi
+fi
+
 echo ""
 echo "=== 2. Bootstrap fixpoint (consistency, not evidence of absence) ==="
 echo ""
@@ -351,7 +389,7 @@ else
     kernel_in_corpus=0
     if [ -d "$ms" ]; then
       kernel_in_corpus=1
-      for f in "$ms"/*.c0; do
+      for f in "$ms"/*.c0 "$ms"/programs/*.c0; do
         case "$f" in *_data.c0|*.bak*) continue ;; esac
         [ -f "$f" ] && corpus="$corpus $f"
       done
@@ -449,7 +487,9 @@ echo ""
     | LC_ALL=C sort | xargs sha256sum 2>/dev/null
 } > "$tmpdir/manifest"
 
-if [ "$write_manifest" -eq 1 ]; then
+if [ "$write_manifest" -eq 1 ] && [ "$fail" -ne 0 ]; then
+  bad "not writing BOOTSTRAP.sha256: $fail check(s) failed above"
+elif [ "$write_manifest" -eq 1 ]; then
   cp "$tmpdir/manifest" BOOTSTRAP.sha256
   echo "wrote BOOTSTRAP.sha256"
 elif [ -f BOOTSTRAP.sha256 ]; then

@@ -7,10 +7,9 @@ references -- is a value of that type. coff compiles c0 straight to x86_64
 assembly, and the binaries it produces are freestanding: no libc, no
 runtime, just `_start` and raw syscalls.
 
-It can also skip the assembler entirely and emit machine code directly,
-either as a flat binary or as an ELF64 executable for Moonshot, the
-operating system I am writing in c0. That backend is what every program
-running in ring 3 on that kernel is built through.
+It can also target Moonshot, the operating system I am writing in c0,
+which is what every program running in ring 3 on that kernel is built
+through. Same assembly backend, that kernel's syscall numbers.
 
 The compiler is written in c0 and compiles itself, and the repository
 carries its own assembler and linker, smed, also written in c0. Once
@@ -30,7 +29,7 @@ program.
 | `c0/smed.c0` | The assembler and linker, in c0. Turns the assembly `coff1` emits into a finished executable, with no GNU tool in between. |
 | `tests/` | The test programs, which double as the input set for the differential checks. |
 | `run_tests.sh` | Builds coff0 and runs the compiler test suite. |
-| `smed_tests.sh` | Checks smed against GNU as and ld over every program in the tree, then runs the suite with no GNU tool in the pipeline. |
+| `smed_tests.sh` | Checks smed against GNU as and ld over every program in the tree, then runs the suite with no GNU tool in the pipeline. The last check builds my kernel with both and compares them, when it is checked out alongside. |
 | `verify_bootstrap.sh` | The trusting-trust audit: rebuild, fixpoint, determinism, and diverse double-compiling against a second C compiler. |
 | `TRUST.md` | What is trusted, what is checked, and what is not. Read it before changing how anything here is built. |
 | `BOOTSTRAP.sha256` | Hashes of every source, script and test file, so tampering shows up as a text diff. |
@@ -53,9 +52,27 @@ ld coff1.o -o coff1
 ./coff1 c0/smed.c0 smed.s
 as smed.s -o smed.o
 ld smed.o -o smed
+
+# 4. have smed rebuild itself, so the binary you keep is its own output
+./smed smed.s smed.new
+mv smed.new smed
+chmod +x smed
 ```
 
-After step 3 you do not need the C compiler, `as` or `ld` anymore. `coff1`
+Step 4 is not decoration. The `smed` from step 3 was made by `as` and `ld`,
+which is the one thing this repository exists to stop depending on, and it
+is a different binary from the one smed makes of the same assembly, because
+smed does not pick the short encodings binutils picks. Running it once more
+through itself reaches a fixpoint immediately, and that is the binary the
+audit expects to find. Skip step 4 and `./verify_bootstrap.sh` will tell
+you the committed smed is not what smed produces from its own source, which
+would be correct.
+
+(Note the temporary name. Linux refuses to write to a running executable,
+so `./smed smed.s smed` fails with "cannot open output" rather than
+corrupting anything.)
+
+After step 4 you do not need the C compiler, `as` or `ld` anymore. `coff1`
 compiles c0, including its own source, and `smed` assembles and links what
 it emits, including its own source. The test scripts still use gcc or tcc
 to rebuild `coff0`, and `as`/`ld` as an oracle to check `smed` against.
@@ -88,6 +105,19 @@ chmod +x hello
 `smed` writes a plain file, so the executable bit is yours to set. `as` and
 `ld` produce an equivalent binary from the same `hello.s` if you prefer
 them.
+
+The full form is:
+
+```
+smed [-T linker.ld] [--base ADDR] [-m symbols.map] input.s [more.s ...] output
+```
+
+Several inputs are assembled and linked together in the order given, which
+is how a kernel made of hand-written boot assembly plus compiler output
+gets built in one call. `-T` reads a GNU ld linker script, so an existing
+script keeps working unchanged; `--base` sets the load address when no
+script says otherwise; `-m` writes a symbol map, which is a plain list of
+addresses and names, useful for checking a layout against another linker's.
 
 The process exit code is whatever `main` returns. With no arguments,
 `coff1` reads c0 source on stdin and writes assembly to stdout instead;
@@ -136,18 +166,33 @@ their signatures in `coff0.c`'s header comment.
 
 ## Output modes
 
-By default coff emits x86_64 assembly text. Two flags change that:
+coff emits x86_64 assembly text, always. One flag changes who that
+assembly is for:
 
 | Flag | What it emits |
 |------|---------------|
-| (none) | x86_64 assembly text, to be run through `smed` (or `as` and `ld`). |
-| `--raw` | A flat binary of machine code, no assembler involved. Linux syscall numbers. |
-| `--elf` | An ELF64 executable for Moonshot, my OS kernel. Its own syscall numbers, and the OS builtins below. |
+| (none) | Assembly for Linux. Linux syscall numbers. |
+| `--elf` | Assembly for Moonshot, my OS kernel. Its own syscall numbers, and the OS builtins below. |
+
+Either way the output is assembly text that `smed` turns into a finished
+binary. For the Moonshot target, `smed --base 0x80000000` places the image
+where that kernel maps user programs.
+
+Until September 2026 `--elf` selected an entirely separate backend that
+wrote machine code byte by byte, and `--raw` did the same for Linux. Both
+are gone. They were the one code path with no differential oracle, since
+`coff0.c` never had a machine-code backend to be compared against, and
+several silent wrong-code bugs were found in them by eye. Removing them was
+worth more than building an oracle for them: `--elf` is now a handful of
+emit sites that differ in a syscall number, `coff0.c` has the same flag,
+and the two are diffed against each other like everything else.
 
 `--elf` adds builtins that are syscalls on that kernel and exist in no
 other mode: `win_info` and `win_max` for the window a program was given,
-`present` and `blit` and `fill` for drawing, `key_poll` for input, and
-`readfile`. Calling one outside `--elf` is a compile error.
+`present` and `blit` and `fill` for drawing, `key_poll` and `mouse_poll`
+for input, `glyph` for the kernel's font, `ticks` for the timer, and
+`readfile`. Calling one outside `--elf` is a compile error, and calling a
+Linux-only builtin such as `argv` or `open_read` under `--elf` is too.
 
 The distinction `win_info` versus `win_max` is worth knowing if you write
 against this: `win_info` is the window's size right now and changes
@@ -161,6 +206,7 @@ a buffer, a program sizes its frame buffer once from `win_max` and treats
 ```sh
 ./run_tests.sh
 ./smed_tests.sh     # needs the coff1 from Building in the tree
+                    # check 5 also needs my kernel at ../moonshot, and skips without it
 ```
 
 Every test program goes through the real pipeline: compile, assemble,
@@ -180,16 +226,28 @@ emit identical bytes; and the whole suite runs again with no GNU tool in
 the pipeline. The oracle is the thing being replaced, which is the same
 trick `coff0` plays for `coff1`.
 
-Those byte-for-byte checks are how I trust the compiler at all. They do
-have one real limit worth stating plainly: `coff0.c` implements only the
-text backend, so nothing in this suite says anything about `--raw` or
-`--elf`. Every check of the machine-code backend is a differential check
-against a compiler that does not have one. I have found several
-silent-wrong-code bugs in that backend, every one of them by eye after
-something looked wrong on screen, and the suite was green through all of
-them. The backend is instead covered outside this repository, by compiling
-small programs whose exit code is only correct if codegen is correct and
-running them on the kernel itself.
+There is a fifth check that only runs when my kernel is checked out at
+`../moonshot`, and reports SKIP otherwise. It exists because the boot code
+and the ring-3 trampolines are hand-written assembly full of instructions
+no c0 program ever emits, so the corpus above says nothing about `lgdt`,
+`iretq`, control registers or the far jump into long mode. The kernel is
+built twice from the very same sources, once by `as` and `ld` and once by
+`smed`, and the two are compared: the entry point, the multiboot header and
+every linker-script symbol must land at the same addresses, and the
+hand-written code must disassemble to the same instruction sequence. Bytes
+are not compared, because smed never picks a short encoding where a long
+one works, but small immediates are, since an earlier version that
+normalised those away let a wrong segment selector through.
+
+Those byte-for-byte checks are how I trust the compiler at all. The limit
+that used to be stated here, that nothing in the suite said anything about
+the machine-code backends, is gone with the backends themselves: `--elf` is
+now the same code path as the default one and `coff0.c` implements it too,
+so it is diffed byte for byte like everything else. What is still true is
+that the suite cannot tell whether a program behaves correctly *on the
+kernel*, only that both compilers agree about it. That part is covered
+outside this repository, by small programs whose exit code is only correct
+if codegen is correct, run on the kernel itself.
 
 ## Trust
 

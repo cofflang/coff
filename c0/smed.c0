@@ -71,37 +71,99 @@
 // hand-written boot stage on top of this, with mnemonics coff never emits;
 // supporting that is milestone two.
 
-int BASE = 0x400000;   // load address, matching what ld defaults to
+int BASE = 0x400000;   // load address when no script says otherwise (--base)
 int HDRS = 120;        // 64-byte ELF header + 56-byte program header
+int PAGE = 4096;
 
-int src = 0;           // the whole input file
-int srclen = 0;
-int out = 0;           // emitted bytes, index 0 == file offset HDRS
-int outpos = 0;
 int pass = 0;          // 1 = measure and place labels, 2 = emit
+int bits = 64;         // .code32 / .code64
 
-int sym_ptr = 0;       // label name, pointer into src
-int sym_len = 0;
-int sym_addr = 0;
-int sym_count = 0;
-int SYM_MAX = 8192;
+// --- inputs ---------------------------------------------------------------
+// src/srclen/cp describe whichever buffer is being parsed right now: an
+// input file or the linker script.
 
-int entry_addr = 0;    // address of _start
-int seen_rodata = 0;   // section ordering check
-int seen_data = 0;
-
-int cp = 0;            // cursor while parsing one line
+int src = 0;
+int srclen = 0;
+int cp = 0;
 int lineno = 0;
+int cur_name = 0;      // name of the file being parsed, for messages
 
-// Two operand slots.  c0 has no structs worth using here and no multiple
-// return values, so parsed operands land in globals.  kind: 0 register,
-// 1 immediate, 2 memory, 3 symbol.
-int o0_kind = 0; int o0_reg = 0; int o0_imm = 0;
-int o0_base = 0; int o0_index = 0; int o0_scale = 0; int o0_disp = 0;
-int o0_sym = 0;  int o0_symlen = 0; int o0_bytesz = 0;
-int o1_kind = 0; int o1_reg = 0; int o1_imm = 0;
-int o1_base = 0; int o1_index = 0; int o1_scale = 0; int o1_disp = 0;
-int o1_sym = 0;  int o1_symlen = 0; int o1_bytesz = 0;
+int NIN_MAX = 16;
+int in_names = 0;      // argv pointers
+int in_bufs = 0;
+int in_lens = 0;
+int in_count = 0;
+
+int script = 0;        // the linker script text, or 0
+int scriptlen = 0;
+int script_name = 0;
+int map_name = 0;      // -m output, or 0
+int file_len = 0;      // length of the buffer read_file last returned
+
+// --- sections -------------------------------------------------------------
+
+int SECT_MAX = 64;
+int sect_name = 0;     // pointer into whichever buffer named it first
+int sect_namelen = 0;
+int sect_size = 0;     // measured by pass 1
+int sect_pos = 0;      // cursor within the section, both passes
+int sect_buf = 0;      // pass 2 bytes
+int sect_base = 0;     // address, known after layout
+int sect_align = 0;    // largest .balign asked for inside it
+int sect_data = 0;     // 1 once any real byte (not a reservation) lands
+int sect_count = 0;
+int cur = -1;          // current section
+
+int script_sects = 0;  // how many sections the script placed
+int seg_vaddr = 0;     // address of file offset seg_off
+int seg_off = 0;
+int layout_base = 0;   // first section address, from `. = 1M` or default
+int have_base = 0;
+
+// --- symbols --------------------------------------------------------------
+
+int SYM_MAX = 16384;
+int sym_ptr = 0;
+int sym_len = 0;
+int sym_sect = 0;      // section index, or -1 for an absolute value
+int sym_off = 0;       // offset within the section, or the value
+int sym_count = 0;
+
+int entry_ptr = 0;     // entry symbol name; "_start" unless ENTRY() says
+int entry_len = 0;
+int entry_buf = 0;     // the buffer entry_ptr points into
+int entry_addr = 0;
+
+// Set whenever an expression resolved a symbol.  Sizes must not depend on
+// symbols (a symbol is 0 in pass 1 and real in pass 2), so `.skip` and
+// `.balign` refuse expressions that used one.
+int expr_used_sym = 0;
+
+// --- operands -------------------------------------------------------------
+// Two operand slots, each a row of fields.  c0 has no structs, so the row is
+// a small table indexed by slot and field.
+
+int ops = 0;
+int F_KIND = 0;   // 0 register, 1 immediate, 2 memory
+int F_REG = 1;
+int F_IMM = 2;
+int F_BASE = 3;
+int F_INDEX = 4;
+int F_SCALE = 5;
+int F_DISP = 6;
+int F_SYM = 7;
+int F_SYMLEN = 8;
+int F_WIDTH = 9;  // 8/16/32/64, or 0 when nothing said
+int F_CLASS = 10; // 0 general, 1 segment, 2 control
+int F_HASSYM = 11;
+int NF = 12;
+
+int og(int s, int f) { return load64(ops + (s * NF + f) * 8); }
+void os(int s, int f, int v) { store64(ops + (s * NF + f) * 8, v); return; }
+
+// Register lookup results, since a function can return only one value.
+int reg_width = 0;
+int reg_class = 0;
 
 void print_int(int v) {
     int buf = alloc(24);
@@ -119,6 +181,15 @@ void print_int(int v) {
     return;
 }
 
+void print_slice(int p, int n) {
+    int buf = alloc(n + 1);
+    int i = 0;
+    while (i < n) { buf[i] = p[i]; i = i + 1; }
+    buf[n] = 0;
+    print(buf);
+    return;
+}
+
 void serr(int msg) {
     print("smed: ");
     print(msg);
@@ -127,11 +198,12 @@ void serr(int msg) {
     return;
 }
 
-// Failing loudly with the line number matters more here than anywhere else
-// in the stack: a wrong byte in an assembler is a silently miscompiled
+// Failing loudly with the file and line matters more here than anywhere
+// else in the stack: a wrong byte in an assembler is a silently miscompiled
 // program, not a crash, and this tool has no oracle above it.
 void serr_at(int msg) {
-    print("smed: line ");
+    print("smed: ");
+    if (cur_name != 0) { print(cur_name); print(":"); }
     print_int(lineno);
     print(": ");
     print(msg);
@@ -156,11 +228,29 @@ int u32(int v) {
     return u;
 }
 
+// coff's output names no section before its first instruction, so code
+// that arrives before any `.section` goes to .text, as it would with as.
+void need_section() {
+    if (cur < 0) { enter_section(".text", 5); }
+    return;
+}
+
 void emit1(int b) {
     int u = b;
+    int p = 0;
+    need_section();
     if (u < 0) { u = u + 256; }
-    if (pass == 2) { store8(out + outpos, u - (u / 256) * 256); }
-    outpos = outpos + 1;
+    p = load64(sect_pos + cur * 8);
+    if (pass == 2) { store8(load64(sect_buf + cur * 8) + p, u - (u / 256) * 256); }
+    store64(sect_pos + cur * 8, p + 1);
+    store64(sect_data + cur * 8, 1);
+    return;
+}
+
+void emit2(int v) {
+    int u = u32(v);
+    emit1(u - (u / 256) * 256);
+    emit1((u / 256) - (u / 65536) * 256);
     return;
 }
 
@@ -173,23 +263,59 @@ void emit4(int v) {
     return;
 }
 
-// Splits a 64-bit value into two 32-bit halves.  The floor adjustment on
-// the negative side matters: c0 divides toward zero, so a plain v/2^32 is
-// one too high for any negative value that is not an exact multiple, which
+// Splits a 64-bit value into two 32-bit halves.  The adjustment on the
+// negative side matters: c0 divides toward zero, so a plain v/2^32 is one
+// too high for any negative value that is not an exact multiple, which
 // showed up as a wrong movabs for the packed font bitmap in
-// tests/64_large_hex_literal.c0.
+// tests/64_large_hex_literal.c0.  It is done by fixing up the remainder
+// rather than by subtracting first, because the subtraction overflows for
+// the most negative values, and boot.s's trigger_doublefault loads exactly
+// 0x8000000000000000.
+int split_hi = 0;
+int split_lo = 0;
+
+void split64(int v) {
+    split_hi = v / 4294967296;
+    split_lo = v - split_hi * 4294967296;
+    if (split_lo < 0) { split_lo = split_lo + 4294967296; split_hi = split_hi - 1; }
+    return;
+}
+
 void emit8(int v) {
-    int hi = 0;
-    int lo = 0;
-    if (v < 0) { hi = (v - 4294967295) / 4294967296; } else { hi = v / 4294967296; }
-    lo = v - hi * 4294967296;
-    emit4(lo);
-    emit4(hi);
+    split64(v);
+    emit4(split_lo);
+    emit4(split_hi);
+    return;
+}
+
+// Reserves n bytes without marking the section as holding content.  The
+// bytes are zero in the file when the section is written at all.
+void skip_bytes(int n) {
+    need_section();
+    if (n < 0) { serr_at("negative reservation"); }
+    store64(sect_pos + cur * 8, load64(sect_pos + cur * 8) + n);
+    return;
+}
+
+// Alignment is relative to the section start, which is correct because
+// layout aligns every section start to the largest alignment requested
+// inside it (all powers of two, so the largest is a multiple of the rest).
+void align_to(int n) {
+    int p = 0;
+    int pad = 0;
+    need_section();
+    if (n < 1) { serr_at("bad alignment"); }
+    if (n > load64(sect_align + cur * 8)) { store64(sect_align + cur * 8, n); }
+    p = load64(sect_pos + cur * 8);
+    pad = (p / n) * n;
+    if (pad != p) { pad = pad + n - p; } else { pad = 0; }
+    skip_bytes(pad);
     return;
 }
 
 int here() {
-    return BASE + HDRS + outpos;
+    need_section();
+    return load64(sect_base + cur * 8) + load64(sect_pos + cur * 8);
 }
 
 // --- character helpers ----------------------------------------------------
@@ -197,6 +323,7 @@ int here() {
 int is_space(int c) {
     if (c == 32) { return 1; }
     if (c == 9) { return 1; }
+    if (c == 13) { return 1; }
     return 0;
 }
 
@@ -225,15 +352,30 @@ int at_eol() {
     return 0;
 }
 
-// Compares a slice of src against a NUL-terminated literal.
+int peek() {
+    if (cp >= srclen) { return 0; }
+    return src[cp];
+}
+
+// Compares a slice against a NUL-terminated literal.
 int slice_is(int p, int n, int lit) {
     int i = 0;
     while (i < n) {
         if (lit[i] == 0) { return 0; }
-        if (src[p + i] != lit[i]) { return 0; }
+        if (p[i] != lit[i]) { return 0; }
         i = i + 1;
     }
     if (lit[n] != 0) { return 0; }
+    return 1;
+}
+
+int slices_eq(int p, int n, int q, int m) {
+    int i = 0;
+    if (n != m) { return 0; }
+    while (i < n) {
+        if (p[i] != q[i]) { return 0; }
+        i = i + 1;
+    }
     return 1;
 }
 
@@ -249,39 +391,232 @@ void read_word() {
     return;
 }
 
+int word_is(int lit) { return slice_is(src + word_start, word_len, lit); }
+
+// Comments are blanked before parsing rather than skipped during it, so the
+// parser only ever sees code.  `#` runs to the end of the line, `/* */` can
+// span lines; both are replaced by spaces and the newlines inside a block
+// comment are kept so line numbers in messages stay right.
+void strip_comments(int buf, int n) {
+    int i = 0;
+    while (i < n) {
+        if (buf[i] == 35) {   // '#'
+            while (i < n && buf[i] != 10) { buf[i] = 32; i = i + 1; }
+        } else if (buf[i] == 47 && i + 1 < n && buf[i + 1] == 42) {   // "/*"
+            buf[i] = 32; buf[i + 1] = 32; i = i + 2;
+            while (i < n) {
+                if (buf[i] == 42 && i + 1 < n && buf[i + 1] == 47) {
+                    buf[i] = 32; buf[i + 1] = 32; i = i + 2;
+                    break;
+                }
+                if (buf[i] != 10) { buf[i] = 32; }
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    return;
+}
+
+// --- symbol table ---------------------------------------------------------
+
+int sym_find(int p, int n) {
+    int i = 0;
+    while (i < sym_count) {
+        if (slices_eq(load64(sym_ptr + i * 8), load64(sym_len + i * 8), p, n) == 1) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+void sym_add(int p, int n, int sect, int off) {
+    if (sym_count >= SYM_MAX) { serr("too many symbols"); }
+    if (sym_find(p, n) >= 0) {
+        print("smed: duplicate symbol ");
+        print_slice(p, n);
+        print("\n");
+        exit(1);
+    }
+    store64(sym_ptr + sym_count * 8, p);
+    store64(sym_len + sym_count * 8, n);
+    store64(sym_sect + sym_count * 8, sect);
+    store64(sym_off + sym_count * 8, off);
+    sym_count = sym_count + 1;
+    return;
+}
+
+int sym_value(int i) {
+    int s = load64(sym_sect + i * 8);
+    if (s < 0) { return load64(sym_off + i * 8); }
+    return load64(sect_base + s * 8) + load64(sym_off + i * 8);
+}
+
+// A label: defined once, in pass 1, at the current place.
+void label_here(int p, int n) {
+    need_section();
+    if (pass == 1) { sym_add(p, n, cur, load64(sect_pos + cur * 8)); }
+    return;
+}
+
+// An absolute symbol (`.set`, or `name = .` at the top of a script) can
+// depend on other symbols, so it is entered in pass 1 and its value is
+// assigned again in pass 2 when everything it refers to is known.
+void sym_set(int p, int n, int v) {
+    int i = 0;
+    if (pass == 1) { sym_add(p, n, 0 - 1, v); return; }
+    i = sym_find(p, n);
+    if (i < 0) { serr_at("symbol vanished between passes"); }
+    store64(sym_off + i * 8, v);
+    return;
+}
+
+// In pass 1 no symbol is known yet, so every reference resolves to a
+// placeholder.  Pass 2 is where the real value appears, and an unresolved
+// symbol there is a hard error rather than a zero.
+int sym_ref(int p, int n) {
+    int i = 0;
+    expr_used_sym = 1;
+    if (pass == 1) { return 0; }
+    i = sym_find(p, n);
+    if (i < 0) {
+        print("smed: ");
+        if (cur_name != 0) { print(cur_name); print(":"); }
+        print_int(lineno);
+        print(": undefined symbol ");
+        print_slice(p, n);
+        print("\n");
+        exit(1);
+    }
+    return sym_value(i);
+}
+
+// --- numbers and expressions ----------------------------------------------
+// The kernel's boot.s writes `1 << 5`, `0b11`, `-(MB_MAGIC + MB_FLAGS)` and
+// `gdt64_end - gdt64 - 1`, and the linker script writes `1M`, so operands
+// are expressions rather than bare numbers.  Precedence follows gas: unary
+// minus and parentheses bind tightest, then * / << >>, then + -.
+
 int read_num() {
-    int neg = 0;
     int v = 0;
     int c = 0;
-    skip_space();
-    if (cp < srclen && src[cp] == 45) { neg = 1; cp = cp + 1; skip_space(); }
-    if (cp + 1 < srclen && src[cp] == 48 && src[cp + 1] == 120) {
+    int any = 0;
+    if (cp + 1 < srclen && src[cp] == 48 && (src[cp + 1] == 120 || src[cp + 1] == 88)) {
         cp = cp + 2;
         while (cp < srclen) {
             c = src[cp];
             if (is_digit(c) == 1) { v = v * 16 + (c - 48); }
             else if (c >= 97 && c <= 102) { v = v * 16 + (c - 97 + 10); }
             else if (c >= 65 && c <= 70) { v = v * 16 + (c - 65 + 10); }
-            else { cp = cp; break; }
+            else { break; }
+            any = 1;
+            cp = cp + 1;
+        }
+    } else if (cp + 1 < srclen && src[cp] == 48 && (src[cp + 1] == 98 || src[cp + 1] == 66)) {
+        cp = cp + 2;
+        while (cp < srclen && (src[cp] == 48 || src[cp] == 49)) {
+            v = v * 2 + (src[cp] - 48);
+            any = 1;
             cp = cp + 1;
         }
     } else {
-        if (cp >= srclen || is_digit(src[cp]) == 0) { serr_at("expected a number"); }
         while (cp < srclen && is_digit(src[cp]) == 1) {
             v = v * 10 + (src[cp] - 48);
+            any = 1;
             cp = cp + 1;
         }
     }
-    if (neg == 1) { return 0 - v; }
+    if (any == 0) { serr_at("expected a number"); }
+    // Linker-script suffixes.
+    if (cp < srclen && (src[cp] == 75 || src[cp] == 107)) { v = v * 1024; cp = cp + 1; }
+    else if (cp < srclen && (src[cp] == 77 || src[cp] == 109)) { v = v * 1048576; cp = cp + 1; }
+    return v;
+}
+
+int read_unary() {
+    int v = 0;
+    int c = 0;
+    skip_space();
+    c = peek();
+    if (c == 45) { cp = cp + 1; return 0 - read_unary(); }
+    if (c == 43) { cp = cp + 1; return read_unary(); }
+    if (c == 40) {
+        cp = cp + 1;
+        v = read_expr();
+        skip_space();
+        if (peek() != 41) { serr_at("expected )"); }
+        cp = cp + 1;
+        return v;
+    }
+    if (is_digit(c) == 1) { return read_num(); }
+    if (c == 46 && cp + 1 < srclen && is_name_char(src[cp + 1]) == 0) {
+        // A bare `.` is the location counter.
+        cp = cp + 1;
+        expr_used_sym = 1;
+        return here();
+    }
+    read_word();
+    if (word_len == 0) { serr_at("expected a value"); }
+    return sym_ref(src + word_start, word_len);
+}
+
+int read_mul() {
+    int v = read_unary();
+    int r = 0;
+    int i = 0;
+    skip_space();
+    while (cp < srclen) {
+        if (src[cp] == 42) {
+            cp = cp + 1; v = v * read_unary();
+        } else if (src[cp] == 47) {
+            cp = cp + 1; r = read_unary();
+            if (r == 0) { serr_at("division by zero"); }
+            v = v / r;
+        } else if (src[cp] == 60 && cp + 1 < srclen && src[cp + 1] == 60) {
+            cp = cp + 2; r = read_unary();
+            i = 0;
+            while (i < r) { v = v * 2; i = i + 1; }
+        } else if (src[cp] == 62 && cp + 1 < srclen && src[cp + 1] == 62) {
+            cp = cp + 2; r = read_unary();
+            i = 0;
+            while (i < r) { v = v / 2; i = i + 1; }
+        } else {
+            break;
+        }
+        skip_space();
+    }
+    return v;
+}
+
+int read_expr() {
+    int v = read_mul();
+    skip_space();
+    while (cp < srclen) {
+        if (src[cp] == 43) { cp = cp + 1; v = v + read_mul(); }
+        else if (src[cp] == 45) { cp = cp + 1; v = v - read_mul(); }
+        else { break; }
+        skip_space();
+    }
+    return v;
+}
+
+// An expression that must not depend on a symbol, because it decides a size.
+int read_const() {
+    int v = 0;
+    expr_used_sym = 0;
+    v = read_expr();
+    if (expr_used_sym == 1) { serr_at("this value must not depend on a symbol"); }
     return v;
 }
 
 // --- registers ------------------------------------------------------------
 // Returns the architectural register number, or -1 if the word is not a
-// register name.  al is register 0 in its 8-bit form and callers that accept
-// it know they are dealing with a byte operand.
+// register, and leaves the width and class in reg_width/reg_class.
 
 int reg_num(int p, int n) {
+    reg_width = 64; reg_class = 0;
     if (slice_is(p, n, "rax") == 1) { return 0; }
     if (slice_is(p, n, "rcx") == 1) { return 1; }
     if (slice_is(p, n, "rdx") == 1) { return 2; }
@@ -294,64 +629,50 @@ int reg_num(int p, int n) {
     if (slice_is(p, n, "r9") == 1)  { return 9; }
     if (slice_is(p, n, "r10") == 1) { return 10; }
     if (slice_is(p, n, "r11") == 1) { return 11; }
-    if (slice_is(p, n, "al") == 1)  { return 0; }
+    if (slice_is(p, n, "r12") == 1) { return 12; }
+    if (slice_is(p, n, "r13") == 1) { return 13; }
+    if (slice_is(p, n, "r14") == 1) { return 14; }
+    if (slice_is(p, n, "r15") == 1) { return 15; }
+    reg_width = 32;
+    if (slice_is(p, n, "eax") == 1) { return 0; }
+    if (slice_is(p, n, "ecx") == 1) { return 1; }
+    if (slice_is(p, n, "edx") == 1) { return 2; }
+    if (slice_is(p, n, "ebx") == 1) { return 3; }
+    if (slice_is(p, n, "esp") == 1) { return 4; }
+    if (slice_is(p, n, "ebp") == 1) { return 5; }
+    if (slice_is(p, n, "esi") == 1) { return 6; }
+    if (slice_is(p, n, "edi") == 1) { return 7; }
+    reg_width = 16;
+    if (slice_is(p, n, "ax") == 1) { return 0; }
+    if (slice_is(p, n, "cx") == 1) { return 1; }
+    if (slice_is(p, n, "dx") == 1) { return 2; }
+    if (slice_is(p, n, "bx") == 1) { return 3; }
+    reg_width = 8;
+    if (slice_is(p, n, "al") == 1) { return 0; }
+    if (slice_is(p, n, "cl") == 1) { return 1; }
+    if (slice_is(p, n, "dl") == 1) { return 2; }
+    if (slice_is(p, n, "bl") == 1) { return 3; }
+    reg_width = 16; reg_class = 1;
+    if (slice_is(p, n, "es") == 1) { return 0; }
+    if (slice_is(p, n, "cs") == 1) { return 1; }
+    if (slice_is(p, n, "ss") == 1) { return 2; }
+    if (slice_is(p, n, "ds") == 1) { return 3; }
+    if (slice_is(p, n, "fs") == 1) { return 4; }
+    if (slice_is(p, n, "gs") == 1) { return 5; }
+    reg_width = bits; reg_class = 2;
+    if (slice_is(p, n, "cr0") == 1) { return 0; }
+    if (slice_is(p, n, "cr2") == 1) { return 2; }
+    if (slice_is(p, n, "cr3") == 1) { return 3; }
+    if (slice_is(p, n, "cr4") == 1) { return 4; }
+    reg_width = 0; reg_class = 0;
     return 0 - 1;
-}
-
-int is_byte_reg(int p, int n) {
-    if (slice_is(p, n, "al") == 1) { return 1; }
-    return 0;
-}
-
-// --- symbol table ---------------------------------------------------------
-
-void sym_add(int p, int n, int a) {
-    if (sym_count >= SYM_MAX) { serr("too many symbols"); }
-    store64(sym_ptr + sym_count * 8, p);
-    store64(sym_len + sym_count * 8, n);
-    store64(sym_addr + sym_count * 8, a);
-    sym_count = sym_count + 1;
-    return;
-}
-
-int sym_find(int p, int n) {
-    int i = 0;
-    int q = 0;
-    int m = 0;
-    int j = 0;
-    int ok = 0;
-    while (i < sym_count) {
-        q = load64(sym_ptr + i * 8);
-        m = load64(sym_len + i * 8);
-        if (m == n) {
-            ok = 1;
-            j = 0;
-            while (j < n) {
-                if (src[q + j] != src[p + j]) { ok = 0; j = n; }
-                j = j + 1;
-            }
-            if (ok == 1) { return load64(sym_addr + i * 8); }
-        }
-        i = i + 1;
-    }
-    return 0 - 1;
-}
-
-// In pass 1 no symbol is known yet, so every reference resolves to a
-// placeholder of the right size.  Pass 2 is where the real address appears,
-// and an unresolved symbol there is a hard error rather than a zero.
-int sym_ref(int p, int n) {
-    int a = 0;
-    if (pass == 1) { return 0; }
-    a = sym_find(p, n);
-    if (a < 0) { serr_at("undefined symbol"); }
-    return a;
 }
 
 // --- encoding primitives --------------------------------------------------
 
 void rex(int w, int r, int x, int b) {
     int v = 64;
+    if (bits != 64) { serr_at("a REX prefix has no meaning in 32-bit code"); }
     if (w == 1) { v = v + 8; }
     if (r >= 8) { v = v + 4; }
     if (x >= 8) { v = v + 2; }
@@ -376,26 +697,83 @@ void sib(int scale, int index, int base) {
     return;
 }
 
-// Emits the ModRM (and SIB and displacement) for operand slot 1 used as a
-// memory reference, with reg_field in the reg position.  Always disp32 so
-// the size is fixed.
-void mem_modrm(int reg_field, int base, int index, int scale, int disp,
-               int symp, int symn) {
-    int d = disp;
-    if (symp != 0) {
-        // Absolute address form: mod=00, rm=100 (SIB), SIB base=101 means
-        // "no base, disp32 follows".  This is how a bare [symbol] is reached
-        // in a non-position-independent executable.
-        modrm(0, reg_field, 4);
-        sib(1, 4, 5);
-        emit4(sym_ref(symp, symn) + d);
+// The operand-size and REX prefixes for an instruction of the given width
+// whose ModRM will name reg_field and the registers of slot s.  Every
+// encoder goes through here so the width rules live in one place: 16-bit
+// wants 0x66, 64-bit wants REX.W (and is an error in .code32), and any
+// extended register wants a REX with the matching bit.
+void prefixes(int width, int reg_field, int s) {
+    int b = 0;
+    int x = 0;
+    if (width == 16) { emit1(0x66); }
+    if (og(s, F_KIND) == 2) {
+        b = og(s, F_BASE);
+        x = og(s, F_INDEX);
+    } else {
+        b = og(s, F_REG);
+    }
+    if (b < 0) { b = 0; }
+    if (x < 0) { x = 0; }
+    if (width == 64) {
+        rex(1, reg_field, x, b);
         return;
     }
-    if (base < 0) { serr_at("memory operand with no base and no symbol"); }
+    if (reg_field >= 8 || x >= 8 || b >= 8) { rex(0, reg_field, x, b); }
+    return;
+}
+
+// Bytes that will follow the ModRM group inside the same instruction (an
+// immediate), set by the encoder before rm_operand and cleared by it.  A
+// RIP-relative displacement counts from the end of the whole instruction,
+// immediate included, so the encoder has to say how long that tail is.
+int trailing = 0;
+
+// Emits the ModRM (and SIB and displacement) for slot s used as the r/m
+// operand, with reg_field in the reg position.  Always disp32 so the size
+// is fixed.
+void rm_operand(int reg_field, int s) {
+    int base = 0;
+    int index = 0;
+    int d = 0;
+    if (og(s, F_KIND) == 0) {
+        modrm(3, reg_field, og(s, F_REG));
+        trailing = 0;
+        return;
+    }
+    if (og(s, F_KIND) != 2) { serr_at("expected a register or memory operand"); }
+    base = og(s, F_BASE);
+    index = og(s, F_INDEX);
+    d = og(s, F_DISP);
+    if (og(s, F_SYM) != 0) { d = d + sym_ref(og(s, F_SYM), og(s, F_SYMLEN)); }
+    if (base < 0) {
+        if (index >= 0) { serr_at("an index register needs a base register"); }
+        if (bits == 64) {
+            // A bare [symbol] or [address] in 64-bit code is RIP-relative:
+            // mod=00 rm=101, disp32 measured from the end of the
+            // instruction.  The absolute form (the SIB escape with no base)
+            // takes a disp32 that the CPU sign-extends, so it can only
+            // reach the low 2GB and the top 2GB of the address space.
+            // Moonshot loads ring-3 programs at exactly 2GB, and the first
+            // program built this way faulted on its first store, at
+            // 0xFFFFFFFF80000338.  RIP-relative reaches anything within
+            // 2GB of the code, which every image here is.
+            modrm(0, reg_field, 5);
+            emit4(d - (here() + 4 + trailing));
+            trailing = 0;
+            return;
+        }
+        // 32-bit code has no RIP-relative form; mod=00 rm=101 is the plain
+        // absolute disp32.
+        modrm(0, reg_field, 5);
+        emit4(d);
+        trailing = 0;
+        return;
+    }
     if (index >= 0) {
         modrm(2, reg_field, 4);
-        sib(scale, index, base);
+        sib(og(s, F_SCALE), index, base);
         emit4(d);
+        trailing = 0;
         return;
     }
     // rsp (4) and r12 always need a SIB byte, because rm=100 is the escape.
@@ -403,266 +781,427 @@ void mem_modrm(int reg_field, int base, int index, int scale, int disp,
         modrm(2, reg_field, 4);
         sib(1, 4, base);
         emit4(d);
+        trailing = 0;
         return;
     }
     modrm(2, reg_field, base);
     emit4(d);
+    trailing = 0;
     return;
 }
 
-void mem_modrm_o1(int reg_field) {
-    mem_modrm(reg_field, o1_base, o1_index, o1_scale, o1_disp, o1_sym, o1_symlen);
+// One complete instruction of the shape  prefixes, opcode, ModRM: op2 is
+// the second opcode byte after 0F, or -1 for a one-byte opcode.
+void enc_rm(int width, int op, int op2, int reg_field, int s) {
+    prefixes(width, reg_field, s);
+    if (op2 >= 0) { emit1(0x0F); emit1(op2); } else { emit1(op); }
+    rm_operand(reg_field, s);
     return;
 }
-
-void mem_modrm_o0(int reg_field) {
-    mem_modrm(reg_field, o0_base, o0_index, o0_scale, o0_disp, o0_sym, o0_symlen);
-    return;
-}
-
-int rex_x_of(int index) {
-    if (index < 0) { return 0; }
-    return index;
-}
-
-// --- operand parsing ------------------------------------------------------
-
-int p_kind = 0; int p_reg = 0; int p_imm = 0;
-int p_base = 0; int p_index = 0; int p_scale = 0; int p_disp = 0;
-int p_sym = 0;  int p_symlen = 0; int p_bytesz = 0;
-
-void parse_operand() {
-    int c = 0;
-    int sign = 0;
-    int r = 0;
-    p_kind = 0; p_reg = 0; p_imm = 0;
-    p_base = 0 - 1; p_index = 0 - 1; p_scale = 1; p_disp = 0;
-    p_sym = 0; p_symlen = 0; p_bytesz = 8;
-
-    skip_space();
-
-    // "byte ptr [..]" marks an 8-bit memory access.
-    read_word();
-    if (slice_is(word_start, word_len, "byte") == 1) {
-        p_bytesz = 1;
-        read_word();
-        if (slice_is(word_start, word_len, "ptr") == 0) { serr_at("expected ptr after byte"); }
-        skip_space();
-    } else if (slice_is(word_start, word_len, "qword") == 1) {
-        read_word();
-        if (slice_is(word_start, word_len, "ptr") == 0) { serr_at("expected ptr after qword"); }
-        skip_space();
-    } else {
-        cp = word_start;   // not a size prefix, rewind
-    }
-
-    skip_space();
-    c = src[cp];
-
-    if (c == 91) {   // '[' memory operand
-        cp = cp + 1;
-        skip_space();
-        read_word();
-        r = reg_num(word_start, word_len);
-        if (r >= 0) {
-            p_base = r;
-        } else {
-            p_sym = word_start;
-            p_symlen = word_len;
-        }
-        skip_space();
-        // optional  + reg*scale  and/or  +/- disp
-        while (cp < srclen && (src[cp] == 43 || src[cp] == 45)) {
-            sign = 1;
-            if (src[cp] == 45) { sign = 0 - 1; }
-            cp = cp + 1;
-            skip_space();
-            if (is_digit(src[cp]) == 1) {
-                p_disp = p_disp + sign * read_num();
-            } else {
-                read_word();
-                r = reg_num(word_start, word_len);
-                if (r < 0) { serr_at("expected a register in the index position"); }
-                if (sign < 0) { serr_at("cannot subtract an index register"); }
-                p_index = r;
-                skip_space();
-                if (cp < srclen && src[cp] == 42) {   // '*'
-                    cp = cp + 1;
-                    p_scale = read_num();
-                }
-            }
-            skip_space();
-        }
-        if (cp >= srclen || src[cp] != 93) { serr_at("expected ]"); }
-        cp = cp + 1;
-        p_kind = 2;
-        return;
-    }
-
-    if (is_digit(c) == 1 || c == 45) {
-        p_imm = read_num();
-        p_kind = 1;
-        return;
-    }
-
-    read_word();
-    if (word_len == 0) { serr_at("expected an operand"); }
-    r = reg_num(word_start, word_len);
-    if (r >= 0 && p_bytesz == 8) {
-        p_kind = 0;
-        p_reg = r;
-        if (is_byte_reg(word_start, word_len) == 1) { p_bytesz = 1; }
-        return;
-    }
-    p_kind = 3;
-    p_sym = word_start;
-    p_symlen = word_len;
-    return;
-}
-
-void store_op0() {
-    o0_kind = p_kind; o0_reg = p_reg; o0_imm = p_imm;
-    o0_base = p_base; o0_index = p_index; o0_scale = p_scale; o0_disp = p_disp;
-    o0_sym = p_sym; o0_symlen = p_symlen; o0_bytesz = p_bytesz;
-    return;
-}
-
-void store_op1() {
-    o1_kind = p_kind; o1_reg = p_reg; o1_imm = p_imm;
-    o1_base = p_base; o1_index = p_index; o1_scale = p_scale; o1_disp = p_disp;
-    o1_sym = p_sym; o1_symlen = p_symlen; o1_bytesz = p_bytesz;
-    return;
-}
-
-// Parses "op0, op1" and reports how many operands were present.
-int parse_operands() {
-    skip_space();
-    if (at_eol() == 1) { return 0; }
-    parse_operand();
-    store_op0();
-    skip_space();
-    if (cp < srclen && src[cp] == 44) {   // ','
-        cp = cp + 1;
-        parse_operand();
-        store_op1();
-        return 2;
-    }
-    return 1;
-}
-
-// --- instruction encodings ------------------------------------------------
-// Each helper emits one complete instruction.  The comments name the Intel
-// opcode form so the encoding can be checked against the manual without
-// reverse engineering the arithmetic.
 
 int fits_i32(int v) {
     if (v >= 0 - 2147483648 && v <= 2147483647) { return 1; }
     return 0;
 }
 
-// mov r64, imm  ->  REX.W C7 /0 id when it fits, otherwise REX.W B8+r io
-void enc_mov_reg_imm(int r, int v) {
-    if (fits_i32(v) == 1) {
-        rex(1, 0, 0, r);
-        emit1(0xC7);
-        modrm(3, 0, r);
-        emit4(v);
-        return;
-    }
-    rex(1, 0, 0, r);
-    emit1(0xB8 + (r - (r / 8) * 8));
-    emit8(v);
-    return;
+int fits_i8(int v) {
+    if (v >= 0 - 128 && v <= 255) { return 1; }
+    return 0;
 }
 
-// The reg,reg forms all share a shape: REX.W, opcode, mod=11.
-void enc_rr(int op, int dst, int fromsrc) {
-    rex(1, fromsrc, 0, dst);
-    emit1(op);
-    modrm(3, fromsrc, dst);
-    return;
+int fits_i16(int v) {
+    if (v >= 0 - 32768 && v <= 65535) { return 1; }
+    return 0;
 }
 
-// ALU r64, imm32  ->  REX.W 81 /ext id
-void enc_alu_imm(int ext, int r, int v) {
-    if (fits_i32(v) == 0) { serr_at("immediate too large for this instruction"); }
-    rex(1, 0, 0, r);
-    emit1(0x81);
-    modrm(3, ext, r);
-    emit4(v);
-    return;
+int fits_u32(int v) {
+    if (v >= 0 - 2147483648 && v <= 4294967295) { return 1; }
+    return 0;
 }
 
-// --- one line -------------------------------------------------------------
-
-void do_directive() {
-    int v = 0;
-    if (slice_is(word_start, word_len, ".intel_syntax") == 1) {
-        read_word();   // consume "noprefix"; smed speaks nothing else
-        return;
-    }
-    if (slice_is(word_start, word_len, ".global") == 1) {
-        read_word();   // one executable, one entry point, nothing to export
-        return;
-    }
-    if (slice_is(word_start, word_len, ".section") == 1) {
-        // The linear layout below depends on coff never going back to an
-        // earlier section, so sections must appear in non-decreasing rank.
-        // A program with no string literals has no .rodata at all, which is
-        // why this is a rank comparison and not a "rodata must come first"
-        // rule -- the first version of this check rejected every small test
-        // program for exactly that reason.
-        read_word();
-        v = 0 - 1;
-        if (slice_is(word_start, word_len, ".text") == 1)   { v = 0; }
-        if (slice_is(word_start, word_len, ".rodata") == 1) { v = 1; }
-        if (slice_is(word_start, word_len, ".data") == 1)   { v = 2; }
-        if (v < 0) { serr_at("unknown section"); }
-        if (v < seen_rodata) { serr_at("sections are out of order, layout is not linear"); }
-        seen_rodata = v;
-        return;
-    }
-    if (slice_is(word_start, word_len, ".byte") == 1) {
-        v = read_num();
+// The immediate for an operand of the given width.  A 64-bit operand takes
+// a 32-bit immediate that the CPU sign-extends, so it must fit in a signed
+// 32-bit value; a 32-bit operand takes all 32 bits, so 0xC0000080 (an MSR
+// number in boot.s) is fine there and wrong for a 64-bit register.
+void emit_imm(int width, int v) {
+    if (width == 8) {
+        if (fits_i8(v) == 0) { serr_at("immediate does not fit in a byte"); }
         emit1(v);
-        skip_space();
-        while (cp < srclen && src[cp] == 44) {
-            cp = cp + 1;
-            v = read_num();
-            emit1(v);
+    } else if (width == 16) {
+        if (fits_i16(v) == 0) { serr_at("immediate does not fit in 16 bits"); }
+        emit2(v);
+    } else if (width == 32) {
+        if (fits_u32(v) == 0) { serr_at("immediate does not fit in 32 bits"); }
+        emit4(v);
+    } else {
+        if (fits_i32(v) == 0) { serr_at("immediate too large: a 64-bit operand takes a sign-extended 32-bit immediate"); }
+        emit4(v);
+    }
+    return;
+}
+
+// mov r, imm.  For 64-bit: REX.W C7 /0 id when it fits, otherwise
+// REX.W B8+r io.  Whether it fits must not depend on a symbol, because the
+// symbol is 0 in pass 1: a symbol-valued immediate always takes the imm32
+// form and is checked to fit in pass 2.  16- and 32-bit take B8+r.
+void enc_mov_reg_imm(int width, int r, int v, int hassym) {
+    int short_form = 0;
+    if (width == 64) {
+        if (hassym == 1) { short_form = 1; } else { short_form = fits_i32(v); }
+        if (short_form == 1) {
+            rex(1, 0, 0, r);
+            emit1(0xC7);
+            modrm(3, 0, r);
+            emit_imm(64, v);
+            return;
+        }
+        rex(1, 0, 0, r);
+        emit1(0xB8 + (r - (r / 8) * 8));
+        emit8(v);
+        return;
+    }
+    if (width == 16) { emit1(0x66); }
+    if (r >= 8) { rex(0, 0, 0, r); }
+    if (width == 8) { emit1(0xB0 + (r - (r / 8) * 8)); }
+    else { emit1(0xB8 + (r - (r / 8) * 8)); }
+    emit_imm(width, v);
+    return;
+}
+
+// --- operand parsing ------------------------------------------------------
+
+// The operand width of an instruction: the width of any general register
+// among its operands, else the `ptr` size given, else 0.
+int op_width(int nops) {
+    int w = 0;
+    int s = 0;
+    while (s < nops) {
+        if (og(s, F_KIND) == 0 && og(s, F_CLASS) == 0) { return og(s, F_WIDTH); }
+        s = s + 1;
+    }
+    s = 0;
+    while (s < nops) {
+        if (og(s, F_WIDTH) != 0) { w = og(s, F_WIDTH); }
+        s = s + 1;
+    }
+    return w;
+}
+
+void parse_operand(int s) {
+    int c = 0;
+    int sign = 0;
+    int r = 0;
+    int w = 0;
+    int f = 0;
+    f = 0;
+    while (f < NF) { os(s, f, 0); f = f + 1; }
+    os(s, F_BASE, 0 - 1);
+    os(s, F_INDEX, 0 - 1);
+    os(s, F_SCALE, 1);
+
+    skip_space();
+
+    // "byte ptr [..]" and friends name the access size.
+    read_word();
+    w = 0;
+    if (word_is("byte") == 1) { w = 8; }
+    if (word_is("word") == 1) { w = 16; }
+    if (word_is("dword") == 1) { w = 32; }
+    if (word_is("qword") == 1) { w = 64; }
+    if (w != 0) {
+        read_word();
+        if (word_is("ptr") == 0) { serr_at("expected ptr after a size"); }
+        os(s, F_WIDTH, w);
+    } else {
+        cp = word_start;   // not a size prefix, rewind
+    }
+
+    skip_space();
+    c = peek();
+
+    if (c == 91) {   // '[' memory operand
+        cp = cp + 1;
+        sign = 1;
+        while (1 == 1) {
             skip_space();
+            c = peek();
+            if (is_digit(c) == 1 || c == 40) {
+                expr_used_sym = 0;
+                os(s, F_DISP, og(s, F_DISP) + sign * read_expr());
+                if (expr_used_sym == 1) { os(s, F_HASSYM, 1); }
+            } else {
+                read_word();
+                if (word_len == 0) { serr_at("expected a register, number or symbol inside [ ]"); }
+                r = reg_num(src + word_start, word_len);
+                if (r >= 0) {
+                    if (reg_class != 0) { serr_at("only general registers can address memory"); }
+                    if (reg_width != bits) { serr_at("address register width does not match the code mode"); }
+                    if (sign < 0) { serr_at("cannot subtract a register"); }
+                    skip_space();
+                    if (peek() == 42) {   // '*'
+                        cp = cp + 1;
+                        if (og(s, F_INDEX) >= 0) { serr_at("two index registers"); }
+                        os(s, F_INDEX, r);
+                        // A plain number, not an expression: `rcx*8 + 8`
+                        // would otherwise read the displacement as part
+                        // of the scale.
+                        skip_space();
+                        os(s, F_SCALE, read_num());
+                    } else if (og(s, F_BASE) < 0) {
+                        os(s, F_BASE, r);
+                    } else if (og(s, F_INDEX) < 0) {
+                        os(s, F_INDEX, r);
+                    } else {
+                        serr_at("too many registers in one address");
+                    }
+                } else {
+                    if (sign < 0) { serr_at("cannot subtract a symbol"); }
+                    if (og(s, F_SYM) != 0) { serr_at("two symbols in one address"); }
+                    os(s, F_SYM, src + word_start);
+                    os(s, F_SYMLEN, word_len);
+                    os(s, F_HASSYM, 1);
+                }
+            }
+            skip_space();
+            c = peek();
+            if (c == 43) { sign = 1; cp = cp + 1; }
+            else if (c == 45) { sign = 0 - 1; cp = cp + 1; }
+            else { break; }
         }
+        if (peek() != 93) { serr_at("expected ]"); }
+        cp = cp + 1;
+        os(s, F_KIND, 2);
         return;
     }
-    if (slice_is(word_start, word_len, ".quad") == 1) {
+
+    read_word();
+    if (word_len > 0) {
+        r = reg_num(src + word_start, word_len);
+        if (r >= 0) {
+            if (og(s, F_WIDTH) != 0) { serr_at("a size prefix on a register operand"); }
+            os(s, F_KIND, 0);
+            os(s, F_REG, r);
+            os(s, F_WIDTH, reg_width);
+            os(s, F_CLASS, reg_class);
+            return;
+        }
+    }
+    // Not a register: an immediate expression, possibly naming a symbol.
+    cp = word_start;
+    expr_used_sym = 0;
+    os(s, F_IMM, read_expr());
+    if (expr_used_sym == 1) { os(s, F_HASSYM, 1); }
+    os(s, F_KIND, 1);
+    return;
+}
+
+// Parses "op0, op1[, op2]" and reports how many operands were present.  The
+// third slot only exists for imul r, r, imm.
+int parse_operands() {
+    int n = 0;
+    skip_space();
+    if (at_eol() == 1) { return 0; }
+    parse_operand(0);
+    n = 1;
+    skip_space();
+    while (n < 3 && peek() == 44) {   // ','
+        cp = cp + 1;
+        parse_operand(n);
+        n = n + 1;
         skip_space();
-        if (is_digit(src[cp]) == 1 || src[cp] == 45) {
-            emit8(read_num());
-        } else {
-            read_word();
-            emit8(sym_ref(word_start, word_len));
-        }
+    }
+    return n;
+}
+
+int is_reg(int s) { if (og(s, F_KIND) == 0) { return 1; } return 0; }
+int is_imm(int s) { if (og(s, F_KIND) == 1) { return 1; } return 0; }
+int is_mem(int s) { if (og(s, F_KIND) == 2) { return 1; } return 0; }
+int is_gp(int s) { if (og(s, F_KIND) == 0 && og(s, F_CLASS) == 0) { return 1; } return 0; }
+
+// --- instruction encodings ------------------------------------------------
+// Each branch emits one complete instruction.  The comments name the Intel
+// opcode form so the encoding can be checked against the manual without
+// reverse engineering the arithmetic.
+
+// The reg,reg and reg,mem ALU family: op is the r/m,r opcode (01 for add),
+// op8 its byte form, ext the /digit for the immediate form 81 (or 80 for a
+// byte, 83 is never used because that would be a short encoding).
+void enc_alu(int nops, int op, int op8, int ext) {
+    int w = 0;
+    if (nops != 2) { serr_at("this instruction wants two operands"); }
+    w = op_width(2);
+    if (is_reg(1) == 1) {
+        // op r/m, r
+        if (is_gp(1) == 0 || (is_reg(0) == 1 && is_gp(0) == 0)) { serr_at("only general registers here"); }
+        if (is_reg(0) == 1 && og(0, F_WIDTH) != og(1, F_WIDTH)) { serr_at("operand widths differ"); }
+        if (w == 8) { enc_rm(8, op8, 0 - 1, og(1, F_REG), 0); }
+        else { enc_rm(w, op, 0 - 1, og(1, F_REG), 0); }
         return;
     }
-    serr_at("unknown directive");
+    if (is_imm(1) == 1) {
+        if (w == 0) { serr_at("memory operand needs a size (byte/word/dword/qword ptr)"); }
+        if (is_reg(0) == 1 && is_gp(0) == 0) { serr_at("only general registers here"); }
+        if (w == 8) {
+            trailing = 1;
+            enc_rm(8, 0x80, 0 - 1, ext, 0);
+            emit_imm(8, og(1, F_IMM));
+            return;
+        }
+        if (w == 16) { trailing = 2; } else { trailing = 4; }
+        enc_rm(w, 0x81, 0 - 1, ext, 0);
+        emit_imm(w, og(1, F_IMM));
+        return;
+    }
+    if (is_mem(1) == 1 && is_gp(0) == 1) {
+        // op r, r/m  -> the opcode with bit 1 set (03 for add)
+        if (w == 8) { enc_rm(8, op8 + 2, 0 - 1, og(0, F_REG), 1); }
+        else { enc_rm(w, op + 2, 0 - 1, og(0, F_REG), 1); }
+        return;
+    }
+    serr_at("unsupported operand combination");
+    return;
+}
+
+// Unary r/m forms: F7 /ext (neg, not, idiv, mul) and FF /ext (inc, dec).
+void enc_unary(int nops, int op, int ext) {
+    int w = 0;
+    if (nops != 1) { serr_at("this instruction wants one operand"); }
+    w = op_width(1);
+    if (w == 0) { serr_at("operand needs a size"); }
+    if (is_reg(0) == 1 && is_gp(0) == 0) { serr_at("only general registers here"); }
+    if (w == 8) { enc_rm(8, op - 1, 0 - 1, ext, 0); }
+    else { enc_rm(w, op, 0 - 1, ext, 0); }
+    return;
+}
+
+void enc_shift(int nops, int ext) {
+    int w = 0;
+    if (nops != 2 || is_imm(1) == 0) { serr_at("shift wants r/m, imm"); }
+    w = op_width(2);
+    if (w == 0) { serr_at("operand needs a size"); }
+    // C1 /ext ib
+    trailing = 1;
+    if (w == 8) { enc_rm(8, 0xC0, 0 - 1, ext, 0); }
+    else { enc_rm(w, 0xC1, 0 - 1, ext, 0); }
+    emit_imm(8, og(1, F_IMM));
+    return;
+}
+
+void enc_mov(int nops) {
+    int w = 0;
+    if (nops != 2) { serr_at("mov wants two operands"); }
+
+    // Control and segment registers first: fixed encodings, no width rules.
+    if (is_reg(0) == 1 && og(0, F_CLASS) == 2) {
+        // mov crN, r  ->  0F 22 /r  (reg = crN, r/m = r)
+        if (is_gp(1) == 0 || og(1, F_WIDTH) != bits) { serr_at("mov cr wants a full-width general register"); }
+        if (og(1, F_REG) >= 8) { rex(0, 0, 0, og(1, F_REG)); }
+        emit1(0x0F); emit1(0x22);
+        modrm(3, og(0, F_REG), og(1, F_REG));
+        return;
+    }
+    if (is_reg(1) == 1 && og(1, F_CLASS) == 2) {
+        // mov r, crN  ->  0F 20 /r
+        if (is_gp(0) == 0 || og(0, F_WIDTH) != bits) { serr_at("mov from cr wants a full-width general register"); }
+        if (og(0, F_REG) >= 8) { rex(0, 0, 0, og(0, F_REG)); }
+        emit1(0x0F); emit1(0x20);
+        modrm(3, og(1, F_REG), og(0, F_REG));
+        return;
+    }
+    if (is_reg(0) == 1 && og(0, F_CLASS) == 1) {
+        // mov sreg, r/m16  ->  8E /r
+        if (is_gp(1) == 0 || og(1, F_WIDTH) != 16) { serr_at("mov to a segment register wants a 16-bit register"); }
+        emit1(0x8E);
+        modrm(3, og(0, F_REG), og(1, F_REG));
+        return;
+    }
+    if (is_reg(1) == 1 && og(1, F_CLASS) == 1) { serr_at("mov from a segment register is not supported"); }
+
+    w = op_width(2);
+    if (is_reg(0) == 1 && is_imm(1) == 1) {
+        enc_mov_reg_imm(w, og(0, F_REG), og(1, F_IMM), og(1, F_HASSYM));
+        return;
+    }
+    if (is_reg(0) == 1 && is_reg(1) == 1) {
+        if (og(0, F_WIDTH) != og(1, F_WIDTH)) { serr_at("mov between registers of different widths"); }
+        // mov r/m, r  ->  89 /r (88 for bytes)
+        if (w == 8) { enc_rm(8, 0x88, 0 - 1, og(1, F_REG), 0); }
+        else { enc_rm(w, 0x89, 0 - 1, og(1, F_REG), 0); }
+        return;
+    }
+    if (is_reg(0) == 1 && is_mem(1) == 1) {
+        // mov r, r/m  ->  8B /r.  A byte-sized load would need movzx, and
+        // coff always writes that explicitly, so a byte here is a bug.
+        if (og(1, F_WIDTH) != 0 && og(1, F_WIDTH) != w) { serr_at("mov width does not match the ptr size"); }
+        if (w == 8) { serr_at("byte load needs movzx"); }
+        enc_rm(w, 0x8B, 0 - 1, og(0, F_REG), 1);
+        return;
+    }
+    if (is_mem(0) == 1 && is_reg(1) == 1) {
+        if (og(0, F_WIDTH) != 0 && og(0, F_WIDTH) != w) { serr_at("mov width does not match the ptr size"); }
+        if (w == 8) { enc_rm(8, 0x88, 0 - 1, og(1, F_REG), 0); }
+        else { enc_rm(w, 0x89, 0 - 1, og(1, F_REG), 0); }
+        return;
+    }
+    if (is_mem(0) == 1 && is_imm(1) == 1) {
+        // mov r/m, imm  ->  C7 /0 id (C6 /0 ib for bytes, imm32 is
+        // sign-extended for qword)
+        if (w == 0) { serr_at("mov mem, imm needs a size (byte/word/dword/qword ptr)"); }
+        if (w == 8) { trailing = 1; enc_rm(8, 0xC6, 0 - 1, 0, 0); emit_imm(8, og(1, F_IMM)); return; }
+        if (w == 16) { trailing = 2; } else { trailing = 4; }
+        enc_rm(w, 0xC7, 0 - 1, 0, 0);
+        emit_imm(w, og(1, F_IMM));
+        return;
+    }
+    serr_at("unsupported mov form");
+    return;
+}
+
+// Branches take a label, or for c0 function pointers a register.
+void enc_branch(int op_reg_ext, int op_rel) {
+    int r = 0;
+    int target = 0;
+    read_word();
+    if (word_len == 0) { serr_at("branch wants a target"); }
+    r = reg_num(src + word_start, word_len);
+    if (r >= 0) {
+        if (reg_width != bits || reg_class != 0) { serr_at("indirect branch wants a full-width general register"); }
+        if (r >= 8) { rex(0, 0, 0, r); }
+        emit1(0xFF); modrm(3, op_reg_ext, r);   // FF /4 jmp, FF /2 call
+        return;
+    }
+    emit1(op_rel);
+    // rel32 is measured from the end of the instruction, which is why
+    // here() is read after the opcode bytes and four more are added for
+    // the displacement itself.
+    target = sym_ref(src + word_start, word_len);
+    emit4(target - (here() + 4));
     return;
 }
 
 void do_instruction() {
-    int m = word_start;
+    int m = src + word_start;
     int n = word_len;
     int nops = 0;
     int cc = 0;
     int target = 0;
+    int w = 0;
+    int sel = 0;
 
     // Zero-operand forms first, so parse_operands is never called on them.
     if (slice_is(m, n, "ret") == 1)     { emit1(0xC3); return; }
     if (slice_is(m, n, "cqo") == 1)     { rex(1, 0, 0, 0); emit1(0x99); return; }
     if (slice_is(m, n, "syscall") == 1) { emit1(0x0F); emit1(0x05); return; }
+    if (slice_is(m, n, "sysretq") == 1) { rex(1, 0, 0, 0); emit1(0x0F); emit1(0x07); return; }
+    if (slice_is(m, n, "iretq") == 1)   { rex(1, 0, 0, 0); emit1(0xCF); return; }
     if (slice_is(m, n, "hlt") == 1)     { emit1(0xF4); return; }
+    if (slice_is(m, n, "sti") == 1)     { emit1(0xFB); return; }
+    if (slice_is(m, n, "cli") == 1)     { emit1(0xFA); return; }
+    if (slice_is(m, n, "nop") == 1)     { emit1(0x90); return; }
+    if (slice_is(m, n, "rdmsr") == 1)   { emit1(0x0F); emit1(0x32); return; }
+    if (slice_is(m, n, "wrmsr") == 1)   { emit1(0x0F); emit1(0x30); return; }
 
-    // Branches and calls take a label, never a register, in the subset coff
-    // emits, so they are handled before the general operand parser.
+    // Conditional branches: 0F 8x rel32.
     cc = 0 - 1;
     if (slice_is(m, n, "je") == 1)  { cc = 0x84; }
     if (slice_is(m, n, "jz") == 1)  { cc = 0x84; }
@@ -672,71 +1211,68 @@ void do_instruction() {
     if (slice_is(m, n, "jle") == 1) { cc = 0x8E; }
     if (slice_is(m, n, "jg") == 1)  { cc = 0x8F; }
     if (slice_is(m, n, "jge") == 1) { cc = 0x8D; }
+    if (slice_is(m, n, "jb") == 1)  { cc = 0x82; }
+    if (slice_is(m, n, "jae") == 1) { cc = 0x83; }
+    if (slice_is(m, n, "ja") == 1)  { cc = 0x87; }
+    if (slice_is(m, n, "jbe") == 1) { cc = 0x86; }
     if (cc >= 0) {
         read_word();
         emit1(0x0F);
         emit1(cc);
-        // rel32 is measured from the end of the instruction, which is why
-        // here() is read after the opcode bytes and four more are added for
-        // the displacement itself.
-        target = sym_ref(word_start, word_len);
+        target = sym_ref(src + word_start, word_len);
         emit4(target - (here() + 4));
         return;
     }
-    // jmp and call take either a label or, for c0 function pointers, a
-    // register holding the target address.
     if (slice_is(m, n, "jmp") == 1) {
-        read_word();
-        cc = reg_num(word_start, word_len);
-        if (cc >= 0) {
-            if (cc >= 8) { rex(0, 0, 0, cc); }
-            emit1(0xFF); modrm(3, 4, cc);   // jmp r/m64 -> FF /4
+        skip_space();
+        if (is_digit(peek()) == 1) {
+            // jmp sel:offset, the far jump that loads a new CS.  boot.s
+            // uses it once, to enter the 64-bit code segment.  EA ptr16:32
+            // exists only in 32-bit code.
+            if (bits != 32) { serr_at("a far jump is only supported in 32-bit code"); }
+            sel = read_const();
+            skip_space();
+            if (peek() != 58) { serr_at("expected : in a far jump"); }
+            cp = cp + 1;
+            read_word();
+            emit1(0xEA);
+            emit4(sym_ref(src + word_start, word_len));
+            emit_imm(16, sel);
             return;
         }
-        emit1(0xE9);
-        target = sym_ref(word_start, word_len);
-        emit4(target - (here() + 4));
+        enc_branch(4, 0xE9);
         return;
     }
-    if (slice_is(m, n, "call") == 1) {
-        read_word();
-        cc = reg_num(word_start, word_len);
-        if (cc >= 0) {
-            if (cc >= 8) { rex(0, 0, 0, cc); }
-            emit1(0xFF); modrm(3, 2, cc);   // call r/m64 -> FF /2
-            return;
-        }
-        emit1(0xE8);
-        target = sym_ref(word_start, word_len);
-        emit4(target - (here() + 4));
-        return;
-    }
+    if (slice_is(m, n, "call") == 1) { enc_branch(2, 0xE8); return; }
 
     // Port I/O.  Both forms are fixed-register in the encoding, so the
     // operands are checked rather than parsed: out dx, al is EE and
-    // in al, dx is EC, with no ModRM byte at all.
-    if (slice_is(m, n, "out") == 1) {
-        read_word();
-        if (slice_is(word_start, word_len, "dx") == 0) { serr_at("out wants dx"); }
-        skip_space();
-        if (cp < srclen && src[cp] == 44) { cp = cp + 1; }
-        read_word();
-        if (slice_is(word_start, word_len, "al") == 0) { serr_at("out wants al"); }
-        emit1(0xEE);
-        return;
-    }
-    if (slice_is(m, n, "in") == 1) {
-        read_word();
-        if (slice_is(word_start, word_len, "al") == 0) { serr_at("in wants al"); }
-        skip_space();
-        if (cp < srclen && src[cp] == 44) { cp = cp + 1; }
-        read_word();
-        if (slice_is(word_start, word_len, "dx") == 0) { serr_at("in wants dx"); }
-        emit1(0xEC);
+    // in al, dx is EC, with no ModRM byte at all; ax and eax take the
+    // ED/EF opcodes, ax with the 16-bit prefix.
+    if (slice_is(m, n, "out") == 1 || slice_is(m, n, "in") == 1) {
+        nops = parse_operands();
+        if (nops != 2 || is_gp(0) == 0 || is_gp(1) == 0) { serr_at("in/out want two registers"); }
+        if (slice_is(m, n, "out") == 1) {
+            if (og(0, F_REG) != 2 || og(0, F_WIDTH) != 16) { serr_at("out wants dx first"); }
+            w = og(1, F_WIDTH);
+            if (og(1, F_REG) != 0) { serr_at("out wants al, ax or eax"); }
+            if (w == 8) { emit1(0xEE); return; }
+            if (w == 16) { emit1(0x66); }
+            if (w == 64) { serr_at("out has no 64-bit form"); }
+            emit1(0xEF);
+            return;
+        }
+        if (og(1, F_REG) != 2 || og(1, F_WIDTH) != 16) { serr_at("in wants dx second"); }
+        w = og(0, F_WIDTH);
+        if (og(0, F_REG) != 0) { serr_at("in wants al, ax or eax"); }
+        if (w == 8) { emit1(0xEC); return; }
+        if (w == 16) { emit1(0x66); }
+        if (w == 64) { serr_at("in has no 64-bit form"); }
+        emit1(0xED);
         return;
     }
 
-    // setCC al  ->  0F 9x, always on al in coff output
+    // setCC r/m8  ->  0F 9x, always on al in coff output
     cc = 0 - 1;
     if (slice_is(m, n, "sete") == 1)  { cc = 0x94; }
     if (slice_is(m, n, "setne") == 1) { cc = 0x95; }
@@ -746,145 +1282,145 @@ void do_instruction() {
     if (slice_is(m, n, "setg") == 1)  { cc = 0x9F; }
     if (cc >= 0) {
         nops = parse_operands();
-        if (nops != 1 || o0_kind != 0) { serr_at("setcc wants one register"); }
+        if (nops != 1 || is_gp(0) == 0 || og(0, F_WIDTH) != 8) { serr_at("setcc wants one byte register"); }
         emit1(0x0F);
         emit1(cc);
-        modrm(3, 0, o0_reg);
+        modrm(3, 0, og(0, F_REG));
         return;
     }
 
     nops = parse_operands();
 
     if (slice_is(m, n, "push") == 1) {
-        if (o0_kind != 0) { serr_at("push wants a register"); }
-        if (o0_reg >= 8) { rex(0, 0, 0, o0_reg); }
-        emit1(0x50 + (o0_reg - (o0_reg / 8) * 8));
-        return;
+        if (nops != 1) { serr_at("push wants one operand"); }
+        if (is_gp(0) == 1) {
+            // push r  ->  50+r.  The operand is the stack width of the
+            // mode; no REX.W, only REX.B for r8-r15.
+            if (og(0, F_WIDTH) != bits) { serr_at("push wants a full-width register"); }
+            if (og(0, F_REG) >= 8) { rex(0, 0, 0, og(0, F_REG)); }
+            emit1(0x50 + (og(0, F_REG) - (og(0, F_REG) / 8) * 8));
+            return;
+        }
+        if (is_imm(0) == 1) {
+            // push imm32  ->  68 id, sign-extended to the stack width
+            emit1(0x68);
+            emit_imm(bits, og(0, F_IMM));
+            return;
+        }
+        if (is_mem(0) == 1) {
+            // push r/m  ->  FF /6, stack-width, so no operand-size prefix
+            if (og(0, F_WIDTH) != 0 && og(0, F_WIDTH) != bits) { serr_at("push wants a full-width memory operand"); }
+            enc_rm(32, 0xFF, 0 - 1, 6, 0);
+            return;
+        }
+        serr_at("unsupported push form");
     }
     if (slice_is(m, n, "pop") == 1) {
-        if (o0_kind != 0) { serr_at("pop wants a register"); }
-        if (o0_reg >= 8) { rex(0, 0, 0, o0_reg); }
-        emit1(0x58 + (o0_reg - (o0_reg / 8) * 8));
+        if (nops != 1 || is_gp(0) == 0) { serr_at("pop wants a register"); }
+        if (og(0, F_WIDTH) != bits) { serr_at("pop wants a full-width register"); }
+        if (og(0, F_REG) >= 8) { rex(0, 0, 0, og(0, F_REG)); }
+        emit1(0x58 + (og(0, F_REG) - (og(0, F_REG) / 8) * 8));
         return;
     }
-    if (slice_is(m, n, "idiv") == 1) {
-        if (o0_kind != 0) { serr_at("idiv wants a register"); }
-        rex(1, 0, 0, o0_reg); emit1(0xF7); modrm(3, 7, o0_reg);
-        return;
-    }
-    if (slice_is(m, n, "neg") == 1) {
-        rex(1, 0, 0, o0_reg); emit1(0xF7); modrm(3, 3, o0_reg);
-        return;
-    }
-    if (slice_is(m, n, "inc") == 1) {
-        rex(1, 0, 0, o0_reg); emit1(0xFF); modrm(3, 0, o0_reg);
-        return;
-    }
+    if (slice_is(m, n, "idiv") == 1) { enc_unary(nops, 0xF7, 7); return; }
+    if (slice_is(m, n, "neg") == 1)  { enc_unary(nops, 0xF7, 3); return; }
+    if (slice_is(m, n, "not") == 1)  { enc_unary(nops, 0xF7, 2); return; }
+    if (slice_is(m, n, "inc") == 1)  { enc_unary(nops, 0xFF, 0); return; }
+    if (slice_is(m, n, "dec") == 1)  { enc_unary(nops, 0xFF, 1); return; }
 
-    if (slice_is(m, n, "mov") == 1) {
-        if (o0_kind == 0 && o1_kind == 1) { enc_mov_reg_imm(o0_reg, o1_imm); return; }
-        if (o0_kind == 0 && o1_kind == 0) {
-            if (o0_bytesz == 1 || o1_bytesz == 1) { serr_at("byte mov reg,reg unsupported"); }
-            enc_rr(0x89, o0_reg, o1_reg);
-            return;
-        }
-        if (o0_kind == 0 && o1_kind == 2) {
-            // mov r, [mem].  A byte-sized source would need movzx, and coff
-            // always writes that explicitly, so a byte here is a bug.
-            if (o1_bytesz == 1) { serr_at("byte load needs movzx"); }
-            rex(1, o0_reg, rex_x_of(o1_index), o1_base);
-            emit1(0x8B);
-            mem_modrm_o1(o0_reg);
-            return;
-        }
-        if (o0_kind == 2 && o1_kind == 0) {
-            if (o0_bytesz == 1) {
-                // mov byte ptr [mem], al  ->  88 /r, no REX.W
-                if (o0_base >= 8 || rex_x_of(o0_index) >= 8 || o1_reg >= 8) {
-                    rex(0, o1_reg, rex_x_of(o0_index), o0_base);
-                }
-                emit1(0x88);
-                mem_modrm_o0(o1_reg);
-                return;
-            }
-            rex(1, o1_reg, rex_x_of(o0_index), o0_base);
-            emit1(0x89);
-            mem_modrm_o0(o1_reg);
-            return;
-        }
-        serr_at("unsupported mov form");
+    if (slice_is(m, n, "mov") == 1) { enc_mov(nops); return; }
+
+    if (slice_is(m, n, "movabs") == 1) {
+        // movabs r64, imm64  ->  REX.W B8+r io, always the full form
+        if (nops != 2 || is_gp(0) == 0 || og(0, F_WIDTH) != 64 || is_imm(1) == 0) { serr_at("movabs wants r64, imm"); }
+        rex(1, 0, 0, og(0, F_REG));
+        emit1(0xB8 + (og(0, F_REG) - (og(0, F_REG) / 8) * 8));
+        emit8(og(1, F_IMM));
+        return;
     }
 
     if (slice_is(m, n, "movzx") == 1) {
-        if (o1_kind == 0) {
-            // movzx r64, al  ->  REX.W 0F B6 /r
-            rex(1, o0_reg, 0, o1_reg);
-            emit1(0x0F); emit1(0xB6);
-            modrm(3, o0_reg, o1_reg);
-            return;
-        }
-        if (o1_kind == 2) {
-            rex(1, o0_reg, rex_x_of(o1_index), o1_base);
-            emit1(0x0F); emit1(0xB6);
-            mem_modrm_o1(o0_reg);
-            return;
-        }
-        serr_at("unsupported movzx form");
+        // movzx r, r/m8  ->  0F B6 /r;  movzx r, r/m16  ->  0F B7 /r.  A
+        // memory source with no size is a byte, which is what coff writes.
+        if (nops != 2 || is_gp(0) == 0) { serr_at("movzx wants a register destination"); }
+        w = og(0, F_WIDTH);
+        if (w != 64 && w != 32) { serr_at("movzx destination must be 32 or 64 bits"); }
+        if (is_reg(1) == 1 && is_gp(1) == 0) { serr_at("movzx wants a general register source"); }
+        if (og(1, F_WIDTH) == 16) { enc_rm(w, 0, 0xB7, og(0, F_REG), 1); return; }
+        if (og(1, F_WIDTH) == 8 || og(1, F_WIDTH) == 0) { enc_rm(w, 0, 0xB6, og(0, F_REG), 1); return; }
+        serr_at("movzx source must be 8 or 16 bits");
     }
 
     if (slice_is(m, n, "lea") == 1) {
-        if (o1_kind != 2) { serr_at("lea wants a memory operand"); }
-        rex(1, o0_reg, rex_x_of(o1_index), o1_base);
-        emit1(0x8D);
-        mem_modrm_o1(o0_reg);
+        if (nops != 2 || is_gp(0) == 0 || is_mem(1) == 0) { serr_at("lea wants a register and a memory operand"); }
+        w = og(0, F_WIDTH);
+        if (w != 64 && w != 32) { serr_at("lea destination must be 32 or 64 bits"); }
+        enc_rm(w, 0x8D, 0 - 1, og(0, F_REG), 1);
         return;
     }
 
-    if (slice_is(m, n, "add") == 1) {
-        if (o1_kind == 0) { enc_rr(0x01, o0_reg, o1_reg); return; }
-        if (o1_kind == 1) { enc_alu_imm(0, o0_reg, o1_imm); return; }
-        serr_at("unsupported add form");
-    }
-    if (slice_is(m, n, "sub") == 1) {
-        if (o1_kind == 0) { enc_rr(0x29, o0_reg, o1_reg); return; }
-        if (o1_kind == 1) { enc_alu_imm(5, o0_reg, o1_imm); return; }
-        serr_at("unsupported sub form");
-    }
-    if (slice_is(m, n, "xor") == 1) {
-        if (o1_kind == 0) { enc_rr(0x31, o0_reg, o1_reg); return; }
-        serr_at("unsupported xor form");
-    }
-    if (slice_is(m, n, "or") == 1) {
-        if (o1_kind == 0) { enc_rr(0x09, o0_reg, o1_reg); return; }
-        if (o1_kind == 1) { enc_alu_imm(1, o0_reg, o1_imm); return; }
-        serr_at("unsupported or form");
-    }
+    if (slice_is(m, n, "add") == 1)  { enc_alu(nops, 0x01, 0x00, 0); return; }
+    if (slice_is(m, n, "or") == 1)   { enc_alu(nops, 0x09, 0x08, 1); return; }
+    if (slice_is(m, n, "and") == 1)  { enc_alu(nops, 0x21, 0x20, 4); return; }
+    if (slice_is(m, n, "sub") == 1)  { enc_alu(nops, 0x29, 0x28, 5); return; }
+    if (slice_is(m, n, "xor") == 1)  { enc_alu(nops, 0x31, 0x30, 6); return; }
+    if (slice_is(m, n, "cmp") == 1)  { enc_alu(nops, 0x39, 0x38, 7); return; }
     if (slice_is(m, n, "test") == 1) {
-        if (o1_kind == 0) { enc_rr(0x85, o0_reg, o1_reg); return; }
-        serr_at("unsupported test form");
-    }
-    if (slice_is(m, n, "cmp") == 1) {
-        if (o0_kind == 0 && o1_kind == 0) { enc_rr(0x39, o0_reg, o1_reg); return; }
-        if (o0_kind == 0 && o1_kind == 1) { enc_alu_imm(7, o0_reg, o1_imm); return; }
-        if (o0_kind == 2 && o1_kind == 1) {
-            // cmp byte ptr [mem], imm8  ->  80 /7 ib
-            if (o0_bytesz != 1) { serr_at("cmp mem,imm is only supported byte-sized"); }
-            if (o0_base >= 8 || rex_x_of(o0_index) >= 8) {
-                rex(0, 0, rex_x_of(o0_index), o0_base);
-            }
-            emit1(0x80);
-            mem_modrm_o0(7);
-            emit1(o1_imm);
+        // test r/m, r  ->  85 /r;  test r/m, imm  ->  F7 /0 id.  The
+        // immediate form shares no /digit family with the others, so it is
+        // spelled out here rather than through enc_alu.
+        if (nops != 2) { serr_at("test wants two operands"); }
+        w = op_width(2);
+        if (is_reg(1) == 1) {
+            if (w == 8) { enc_rm(8, 0x84, 0 - 1, og(1, F_REG), 0); }
+            else { enc_rm(w, 0x85, 0 - 1, og(1, F_REG), 0); }
             return;
         }
-        serr_at("unsupported cmp form");
+        if (is_imm(1) == 1) {
+            if (w == 0) { serr_at("operand needs a size"); }
+            if (w == 8) { trailing = 1; enc_rm(8, 0xF6, 0 - 1, 0, 0); emit_imm(8, og(1, F_IMM)); return; }
+            if (w == 16) { trailing = 2; } else { trailing = 4; }
+            enc_rm(w, 0xF7, 0 - 1, 0, 0);
+            emit_imm(w, og(1, F_IMM));
+            return;
+        }
+        serr_at("unsupported test form");
     }
+    if (slice_is(m, n, "shl") == 1) { enc_shift(nops, 4); return; }
+    if (slice_is(m, n, "shr") == 1) { enc_shift(nops, 5); return; }
+    if (slice_is(m, n, "sar") == 1) { enc_shift(nops, 7); return; }
+
     if (slice_is(m, n, "imul") == 1) {
-        if (o1_kind != 0) { serr_at("unsupported imul form"); }
-        // imul r64, r/m64  ->  REX.W 0F AF /r, reg field is the destination
-        rex(1, o0_reg, 0, o1_reg);
-        emit1(0x0F); emit1(0xAF);
-        modrm(3, o0_reg, o1_reg);
+        if (nops == 2 && is_gp(0) == 1 && (is_gp(1) == 1 || is_mem(1) == 1)) {
+            // imul r, r/m  ->  0F AF /r, reg field is the destination
+            w = og(0, F_WIDTH);
+            if (w != 64 && w != 32) { serr_at("imul wants a 32- or 64-bit destination"); }
+            enc_rm(w, 0, 0xAF, og(0, F_REG), 1);
+            return;
+        }
+        if (nops == 3 && is_gp(0) == 1 && (is_gp(1) == 1 || is_mem(1) == 1) && is_imm(2) == 1) {
+            // imul r, r/m, imm32  ->  69 /r id
+            w = og(0, F_WIDTH);
+            if (w != 64 && w != 32) { serr_at("imul wants a 32- or 64-bit destination"); }
+            trailing = 4;
+            enc_rm(w, 0x69, 0 - 1, og(0, F_REG), 1);
+            emit_imm(w, og(2, F_IMM));
+            return;
+        }
+        serr_at("unsupported imul form");
+    }
+
+    // System-table loads: 0F 01 /2 lgdt m, 0F 01 /3 lidt m, 0F 00 /3 ltr r/m16.
+    if (slice_is(m, n, "lgdt") == 1 || slice_is(m, n, "lidt") == 1) {
+        if (nops != 1 || is_mem(0) == 0) { serr_at("lgdt/lidt want a memory operand"); }
+        if (slice_is(m, n, "lgdt") == 1) { cc = 2; } else { cc = 3; }
+        enc_rm(32, 0, 0x01, cc, 0);
+        return;
+    }
+    if (slice_is(m, n, "ltr") == 1) {
+        if (nops != 1 || is_gp(0) == 0 || og(0, F_WIDTH) != 16) { serr_at("ltr wants a 16-bit register"); }
+        emit1(0x0F); emit1(0x00);
+        modrm(3, 3, og(0, F_REG));
         return;
     }
 
@@ -892,14 +1428,138 @@ void do_instruction() {
     return;
 }
 
-// Walks the whole source once.  Called twice, with pass set to 1 then 2.
-void run_pass() {
+// --- sections and directives ----------------------------------------------
+
+int sect_find(int p, int n) {
+    int i = 0;
+    while (i < sect_count) {
+        if (slices_eq(load64(sect_name + i * 8), load64(sect_namelen + i * 8), p, n) == 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Switches to a section, creating it on first mention.  Creation order is
+// what the default layout uses.
+void enter_section(int p, int n) {
+    int i = sect_find(p, n);
+    if (i < 0) {
+        if (pass != 1) { serr_at("a section appeared in pass 2 that pass 1 never saw"); }
+        if (sect_count >= SECT_MAX) { serr_at("too many sections"); }
+        i = sect_count;
+        store64(sect_name + i * 8, p);
+        store64(sect_namelen + i * 8, n);
+        store64(sect_size + i * 8, 0);
+        store64(sect_pos + i * 8, 0);
+        store64(sect_buf + i * 8, 0);
+        store64(sect_base + i * 8, 0);
+        store64(sect_align + i * 8, 1);
+        store64(sect_data + i * 8, 0);
+        sect_count = sect_count + 1;
+    }
+    cur = i;
+    return;
+}
+
+void skip_to_eol() {
+    while (cp < srclen && src[cp] != 10) { cp = cp + 1; }
+    return;
+}
+
+void do_directive() {
+    int v = 0;
+    int p = 0;
+    int n = 0;
+    if (word_is(".intel_syntax") == 1) {
+        read_word();   // consume "noprefix"; smed speaks nothing else
+        return;
+    }
+    if (word_is(".global") == 1 || word_is(".globl") == 1) {
+        read_word();   // every symbol is visible to every input already
+        return;
+    }
+    if (word_is(".code32") == 1) { bits = 32; return; }
+    if (word_is(".code64") == 1) { bits = 64; return; }
+    if (word_is(".section") == 1) {
+        read_word();
+        if (word_len == 0) { serr_at("section wants a name"); }
+        enter_section(src + word_start, word_len);
+        // Flags such as "a" or "ax" say nothing smed needs: every section
+        // lands in one RWX segment.
+        skip_space();
+        if (peek() == 44) { skip_to_eol(); }
+        return;
+    }
+    if (word_is(".text") == 1)   { enter_section(src + word_start, word_len); return; }
+    if (word_is(".data") == 1)   { enter_section(src + word_start, word_len); return; }
+    if (word_is(".bss") == 1)    { enter_section(src + word_start, word_len); return; }
+    if (word_is(".rodata") == 1) { enter_section(src + word_start, word_len); return; }
+    if (word_is(".byte") == 1) {
+        emit_imm(8, read_expr());
+        skip_space();
+        while (peek() == 44) { cp = cp + 1; emit_imm(8, read_expr()); skip_space(); }
+        return;
+    }
+    if (word_is(".word") == 1) {
+        emit_imm(16, read_expr());
+        skip_space();
+        while (peek() == 44) { cp = cp + 1; emit_imm(16, read_expr()); skip_space(); }
+        return;
+    }
+    if (word_is(".long") == 1) {
+        emit_imm(32, read_expr());
+        skip_space();
+        while (peek() == 44) { cp = cp + 1; emit_imm(32, read_expr()); skip_space(); }
+        return;
+    }
+    if (word_is(".quad") == 1) {
+        emit8(read_expr());
+        skip_space();
+        while (peek() == 44) { cp = cp + 1; emit8(read_expr()); skip_space(); }
+        return;
+    }
+    if (word_is(".skip") == 1 || word_is(".space") == 1) {
+        v = read_const();
+        skip_space();
+        if (peek() == 44) {
+            cp = cp + 1;
+            if (read_const() != 0) { serr_at("only zero fill is supported"); }
+        }
+        skip_bytes(v);
+        return;
+    }
+    if (word_is(".balign") == 1) {
+        v = read_const();
+        if (v < 1 || v > 65536) { serr_at("bad alignment"); }
+        align_to(v);
+        return;
+    }
+    if (word_is(".set") == 1) {
+        read_word();
+        if (word_len == 0) { serr_at(".set wants a name"); }
+        p = src + word_start;
+        n = word_len;
+        skip_space();
+        if (peek() != 44) { serr_at("expected , after the name"); }
+        cp = cp + 1;
+        v = read_expr();
+        sym_set(p, n, v);
+        return;
+    }
+    serr_at("unknown directive");
+    return;
+}
+
+// Walks one buffer.  Called once per pass per input.
+void run_source(int name, int buf, int n) {
     int c = 0;
-    outpos = 0;
-    seen_rodata = 0;
-    seen_data = 0;
+    cur_name = name;
+    src = buf;
+    srclen = n;
     cp = 0;
     lineno = 1;
+    cur = 0 - 1;
+    bits = 64;
     while (cp < srclen) {
         skip_space();
         if (at_eol() == 1) {
@@ -907,33 +1567,18 @@ void run_pass() {
             continue;
         }
         c = src[cp];
+        read_word();
+        if (word_len == 0) { serr_at("unexpected character"); }
+        skip_space();
+        if (peek() == 58) {   // ':' -- a label, possibly with more on the line
+            cp = cp + 1;
+            label_here(src + word_start, word_len);
+            continue;
+        }
         if (c == 46) {
-            // A leading dot is either a directive or a local label such as
-            // .Lstr0, told apart by whether a colon follows the name.
-            read_word();
-            skip_space();
-            if (cp < srclen && src[cp] == 58) {
-                cp = cp + 1;
-                if (pass == 1) { sym_add(word_start, word_len, here()); }
-            } else {
-                cp = word_start;
-                read_word();
-                do_directive();
-            }
+            do_directive();
         } else {
-            read_word();
-            skip_space();
-            if (cp < srclen && src[cp] == 58) {
-                cp = cp + 1;
-                if (pass == 1) {
-                    sym_add(word_start, word_len, here());
-                    if (slice_is(word_start, word_len, "_start") == 1) {
-                        entry_addr = here();
-                    }
-                }
-            } else {
-                do_instruction();
-            }
+            do_instruction();
         }
         // Anything left on the line is a stray operand smed did not consume,
         // which means it misparsed something.  Better to stop than to emit a
@@ -945,11 +1590,229 @@ void run_pass() {
     return;
 }
 
+// --- the linker script ----------------------------------------------------
+// Only the shapes moonshot's linker.ld uses.  It is walked once per pass,
+// before the inputs, so the sections it names are created in script order
+// (which is the layout order) and its own content -- reservations, LONG
+// words, symbols -- lands at the start of each section, ahead of whatever
+// the inputs contribute under the same name.
+
+void expect_char(int c, int msg) {
+    skip_space_nl();
+    if (peek() != c) { serr_at(msg); }
+    cp = cp + 1;
+    return;
+}
+
+void skip_space_nl() {
+    while (cp < srclen) {
+        if (src[cp] == 10) { lineno = lineno + 1; cp = cp + 1; }
+        else if (is_space(src[cp]) == 1) { cp = cp + 1; }
+        else { break; }
+    }
+    return;
+}
+
+// `. = expr` inside a section.  The only form used is `. = . + N`, which is
+// a reservation; anything else would move the counter backwards or to an
+// absolute place, neither of which the buffer model can express.
+void script_dot_assign() {
+    int v = 0;
+    int before = 0;
+    need_section();
+    before = load64(sect_pos + cur * 8);
+    expr_used_sym = 0;
+    skip_space_nl();
+    if (peek() != 46) { serr_at("inside a section, . can only be advanced (. = . + N)"); }
+    cp = cp + 1;
+    skip_space_nl();
+    if (peek() != 43) { serr_at("inside a section, . can only be advanced (. = . + N)"); }
+    cp = cp + 1;
+    v = read_expr();
+    if (expr_used_sym == 1) { serr_at("a reservation must not depend on a symbol"); }
+    skip_bytes(v);
+    return;
+}
+
+void script_section_body() {
+    int p = 0;
+    int n = 0;
+    while (1 == 1) {
+        skip_space_nl();
+        if (cp >= srclen) { serr_at("unterminated section block"); }
+        if (peek() == 125) { cp = cp + 1; return; }   // '}'
+        if (peek() == 42) {   // *(.name)  -- the inputs' contribution
+            cp = cp + 1;
+            expect_char(40, "expected ( after *");
+            read_word();
+            expect_char(41, "expected ) after the section name");
+            continue;
+        }
+        if (peek() == 46 && cp + 1 < srclen && is_name_char(src[cp + 1]) == 0) {
+            cp = cp + 1;
+            expect_char(61, "expected = after .");
+            script_dot_assign();
+            expect_char(59, "expected ;");
+            continue;
+        }
+        read_word();
+        if (word_len == 0) { serr_at("unexpected character in section block"); }
+        p = src + word_start;
+        n = word_len;
+        if (slice_is(p, n, "LONG") == 1) {
+            expect_char(40, "expected ( after LONG");
+            emit_imm(32, read_expr());
+            expect_char(41, "expected ) after LONG value");
+            continue;
+        }
+        if (slice_is(p, n, "QUAD") == 1) {
+            expect_char(40, "expected ( after QUAD");
+            emit8(read_expr());
+            expect_char(41, "expected ) after QUAD value");
+            continue;
+        }
+        // name = .;
+        expect_char(61, "expected = after a symbol name");
+        skip_space_nl();
+        if (peek() != 46) { serr_at("a symbol in a section can only be set to ."); }
+        cp = cp + 1;
+        expect_char(59, "expected ;");
+        label_here(p, n);
+    }
+    return;
+}
+
+void run_script() {
+    int p = 0;
+    int n = 0;
+    int last = 0;
+    int v = 0;
+    int placed = 0;   // sections this walk has opened
+    cur_name = script_name;
+    src = script;
+    srclen = scriptlen;
+    cp = 0;
+    lineno = 1;
+    cur = 0 - 1;
+    while (1 == 1) {
+        skip_space_nl();
+        if (cp >= srclen) { break; }
+        read_word();
+        if (word_len == 0) { serr_at("unexpected character in linker script"); }
+        p = src + word_start;
+        n = word_len;
+        if (slice_is(p, n, "ENTRY") == 1) {
+            expect_char(40, "expected ( after ENTRY");
+            read_word();
+            entry_ptr = src + word_start;
+            entry_len = word_len;
+            expect_char(41, "expected ) after the entry symbol");
+            continue;
+        }
+        if (slice_is(p, n, "SECTIONS") == 1) {
+            expect_char(123, "expected { after SECTIONS");
+            while (1 == 1) {
+                skip_space_nl();
+                if (cp >= srclen) { serr_at("unterminated SECTIONS"); }
+                if (peek() == 125) { cp = cp + 1; break; }
+                if (peek() == 46 && cp + 1 < srclen && is_name_char(src[cp + 1]) == 0) {
+                    // `. = 1M` before any section sets the base.
+                    cp = cp + 1;
+                    expect_char(61, "expected = after .");
+                    if (placed > 0) { serr_at("moving . between sections is not supported"); }
+                    v = read_const();
+                    layout_base = v;
+                    have_base = 1;
+                    expect_char(59, "expected ;");
+                    continue;
+                }
+                read_word();
+                if (word_len == 0) { serr_at("unexpected character in SECTIONS"); }
+                p = src + word_start;
+                n = word_len;
+                skip_space_nl();
+                if (peek() == 58) {   // name : { ... }
+                    cp = cp + 1;
+                    expect_char(123, "expected { after the section name");
+                    enter_section(p, n);
+                    placed = placed + 1;
+                    script_section_body();
+                    cur = 0 - 1;
+                    continue;
+                }
+                // name = .;  at the top level: the end of everything so far
+                expect_char(61, "expected : or = after a name");
+                skip_space_nl();
+                if (peek() != 46) { serr_at("a top-level symbol can only be set to ."); }
+                cp = cp + 1;
+                expect_char(59, "expected ;");
+                if (placed == 0) { serr_at("a symbol before any section"); }
+                last = sect_count - 1;
+                sym_set(p, n, load64(sect_base + last * 8) + load64(sect_size + last * 8));
+            }
+            continue;
+        }
+        serr_at("unknown linker script statement");
+    }
+    return;
+}
+
+// --- layout ---------------------------------------------------------------
+// Runs between the passes.  Section order is creation order, which the
+// script fixes when there is one.  Each section starts at the next address
+// aligned to the largest alignment requested inside it.
+
+void place_sections() {
+    int i = 0;
+    int a = 0;
+    int addr = 0;
+    int size = 0;
+    if (script != 0) {
+        if (have_base == 0) { serr("the linker script sets no base address (. = ...)"); }
+        seg_vaddr = layout_base;
+        seg_off = PAGE;
+        addr = layout_base;
+    } else {
+        seg_vaddr = BASE;
+        seg_off = 0;
+        addr = BASE + HDRS;
+    }
+    while (i < sect_count) {
+        a = load64(sect_align + i * 8);
+        if ((addr / a) * a != addr) { addr = (addr / a) * a + a; }
+        store64(sect_base + i * 8, addr);
+        size = load64(sect_pos + i * 8);
+        store64(sect_size + i * 8, size);
+        addr = addr + size;
+        i = i + 1;
+    }
+    return;
+}
+
+void zero(int buf, int n) {
+    int i = 0;
+    while (i < n) { store8(buf + i, 0); i = i + 1; }
+    return;
+}
+
 // --- ELF ------------------------------------------------------------------
-// Deliberately the same shape as coff's own --elf writer: one PT_LOAD with
-// p_offset 0, so the file maps at BASE and no offset arithmetic is needed.
-// Permissions are read/write/execute because the .data section shares the
-// single segment with the code.
+// One PT_LOAD, read/write/execute because .data shares the single segment
+// with the code.  Without a script p_offset is 0 so the file maps at BASE
+// with no offset arithmetic, the same shape as coff's own --elf writer.
+// With a script the segment starts one page into the file so that file
+// offsets and addresses stay congruent modulo the page size, the convention
+// every loader expects, and the first section sits exactly at the base
+// address the script asked for.
+//
+// A scripted image also carries a section header table holding only the
+// null entry.  It is not there for information: e_shnum of zero is the
+// ELF signal that the true count lives in the first section header, so
+// GRUB reads e_shoff, finds zero and refuses the kernel ("invalid section
+// header table offset in e_shoff") -- with no serial output and no other
+// hint, which is how this was found.  One all-zero 64-byte entry in the
+// otherwise empty page after the program header satisfies it, and since
+// that entry has no address and no size GRUB loads nothing from it.
+int SHOFF = 128;
 
 void hdr_b(int buf, int pos, int b) { store8(buf + pos, b); return; }
 
@@ -969,19 +1832,50 @@ void hdr_32(int buf, int pos, int v) {
 }
 
 void hdr_64(int buf, int pos, int v) {
-    int hi = 0;
-    if (v < 0) { hi = 0 - 1; } else { hi = v / 4294967296; }
-    hdr_32(buf, pos, v);
-    hdr_32(buf, pos + 4, hi);
+    split64(v);
+    hdr_32(buf, pos, split_lo);
+    hdr_32(buf, pos + 4, split_hi);
+    return;
+}
+
+void write_zeros(int fd, int n) {
+    int buf = 0;
+    int chunk = 0;
+    if (n <= 0) { return; }
+    buf = alloc(PAGE);
+    zero(buf, PAGE);
+    while (n > 0) {
+        chunk = n;
+        if (chunk > PAGE) { chunk = PAGE; }
+        write(fd, buf, chunk);
+        n = n - chunk;
+    }
     return;
 }
 
 void write_elf(int fd) {
-    int total = HDRS + outpos;
     int hdr = alloc(HDRS);
     int i = 0;
-    while (i < HDRS) { store8(hdr + i, 0); i = i + 1; }
+    int mem_end = 0;
+    int data_end = 0;
+    int filepos = 0;
+    int off = 0;
+    int size = 0;
 
+    // The file holds every section up to the last one with real content;
+    // whatever follows is reservation only and lives in p_memsz.
+    mem_end = seg_vaddr;
+    data_end = seg_vaddr;
+    while (i < sect_count) {
+        size = load64(sect_size + i * 8);
+        off = load64(sect_base + i * 8) + size;
+        if (off > mem_end) { mem_end = off; }
+        if (load64(sect_data + i * 8) == 1 && off > data_end) { data_end = off; }
+        i = i + 1;
+    }
+    if (script == 0) { data_end = mem_end; }
+
+    zero(hdr, HDRS);
     hdr_b(hdr, 0, 0x7F);
     hdr_b(hdr, 1, 69); hdr_b(hdr, 2, 76); hdr_b(hdr, 3, 70);   // E L F
     hdr_b(hdr, 4, 2);    // ELFCLASS64
@@ -993,68 +1887,237 @@ void write_elf(int fd) {
     hdr_32(hdr, 20, 1);      // e_version
     hdr_64(hdr, 24, entry_addr);
     hdr_64(hdr, 32, 64);     // e_phoff
-    hdr_64(hdr, 40, 0);      // e_shoff, no section headers
+    if (script != 0) { hdr_64(hdr, 40, SHOFF); } else { hdr_64(hdr, 40, 0); }   // e_shoff
     hdr_32(hdr, 48, 0);      // e_flags
     hdr_16(hdr, 52, 64);     // e_ehsize
     hdr_16(hdr, 54, 56);     // e_phentsize
     hdr_16(hdr, 56, 1);      // e_phnum
-    hdr_16(hdr, 58, 0);      // e_shentsize
-    hdr_16(hdr, 60, 0);      // e_shnum
+    if (script != 0) {
+        hdr_16(hdr, 58, 64);     // e_shentsize
+        hdr_16(hdr, 60, 1);      // e_shnum: the null entry only
+    } else {
+        hdr_16(hdr, 58, 0);
+        hdr_16(hdr, 60, 0);
+    }
     hdr_16(hdr, 62, 0);      // e_shstrndx
 
     hdr_32(hdr, 64, 1);      // p_type = PT_LOAD
     hdr_32(hdr, 68, 7);      // p_flags = R | W | X
-    hdr_64(hdr, 72, 0);      // p_offset
-    hdr_64(hdr, 80, BASE);   // p_vaddr
-    hdr_64(hdr, 88, BASE);   // p_paddr
-    hdr_64(hdr, 96, total);  // p_filesz
-    hdr_64(hdr, 104, total); // p_memsz
-    hdr_64(hdr, 112, 4096);  // p_align
+    hdr_64(hdr, 72, seg_off);            // p_offset
+    hdr_64(hdr, 80, seg_vaddr);          // p_vaddr
+    hdr_64(hdr, 88, seg_vaddr);          // p_paddr
+    hdr_64(hdr, 96, data_end - seg_vaddr);  // p_filesz
+    hdr_64(hdr, 104, mem_end - seg_vaddr);  // p_memsz
+    hdr_64(hdr, 112, PAGE);  // p_align
 
     write(fd, hdr, HDRS);
-    write(fd, out, outpos);
+    filepos = HDRS;
+    i = 0;
+    while (i < sect_count) {
+        size = load64(sect_size + i * 8);
+        if (load64(sect_base + i * 8) < data_end && size > 0) {
+            off = seg_off + (load64(sect_base + i * 8) - seg_vaddr);
+            if (off < filepos) { serr("sections overlap in the file"); }
+            write_zeros(fd, off - filepos);
+            write(fd, load64(sect_buf + i * 8), size);
+            filepos = off + size;
+        }
+        i = i + 1;
+    }
     return;
 }
 
-int main() {
-    int infd = 0;
-    int outfd = 0;
-    int got = 0;
-    int cap = 4194304;
+void write_map(int name) {
+    int fd = open_write(name);
+    int i = 0;
+    int line = alloc(4096);
+    int n = 0;
+    int p = 0;
+    int j = 0;
+    int v = 0;
+    int d = 0;
+    if (fd < 0) { serr("cannot open map output"); }
+    while (i < sym_count) {
+        v = sym_value(i);
+        j = 16;
+        while (j > 0) {
+            j = j - 1;
+            // Floor division by hand: an absolute symbol can be negative
+            // (MB_CHECKSUM), and truncating division would print it wrong.
+            d = v - (v / 16) * 16;
+            v = v / 16;
+            if (d < 0) { d = d + 16; v = v - 1; }
+            if (d < 10) { line[j] = 48 + d; } else { line[j] = 87 + d; }
+        }
+        line[16] = 32;
+        n = load64(sym_len + i * 8);
+        p = load64(sym_ptr + i * 8);
+        if (n > 4000) { n = 4000; }
+        j = 0;
+        while (j < n) { line[17 + j] = p[j]; j = j + 1; }
+        line[17 + n] = 10;
+        write(fd, line, 18 + n);
+        i = i + 1;
+    }
+    close(fd);
+    return;
+}
 
-    if (argc() != 3) {
-        print("usage: smed input.s output\n");
+int read_file(int name) {
+    int fd = open_read(name);
+    int cap = 8388608;
+    int buf = 0;
+    int len = 0;
+    int got = 0;
+    if (fd < 0) { print("smed: cannot open "); print(name); print("\n"); exit(1); }
+    buf = alloc(cap);
+    got = read(fd, buf, cap);
+    while (got > 0) {
+        len = len + got;
+        got = read(fd, buf + len, cap - len);
+    }
+    close(fd);
+    if (len >= cap) { serr("input larger than the read buffer"); }
+    strip_comments(buf, len);
+    file_len = len;
+    return buf;
+}
+
+int main() {
+    int i = 1;
+    int outfd = 0;
+    int out_name = 0;
+    int a = 0;
+    int e = 0;
+
+    if (argc() < 3) {
+        print("usage: smed [-T linker.ld] [--base ADDR] [-m symbols.map] input.s [more.s ...] output\n");
         exit(1);
     }
 
+    ops = alloc(2 * NF * 8 + NF * 8);
     sym_ptr = alloc(SYM_MAX * 8);
     sym_len = alloc(SYM_MAX * 8);
-    sym_addr = alloc(SYM_MAX * 8);
+    sym_sect = alloc(SYM_MAX * 8);
+    sym_off = alloc(SYM_MAX * 8);
+    sect_name = alloc(SECT_MAX * 8);
+    sect_namelen = alloc(SECT_MAX * 8);
+    sect_size = alloc(SECT_MAX * 8);
+    sect_pos = alloc(SECT_MAX * 8);
+    sect_buf = alloc(SECT_MAX * 8);
+    sect_base = alloc(SECT_MAX * 8);
+    sect_align = alloc(SECT_MAX * 8);
+    sect_data = alloc(SECT_MAX * 8);
+    in_names = alloc(NIN_MAX * 8);
+    in_bufs = alloc(NIN_MAX * 8);
+    in_lens = alloc(NIN_MAX * 8);
 
-    infd = open_read(argv(1));
-    if (infd < 0) { serr("cannot open input"); }
-    src = alloc(cap);
-    srclen = 0;
-    got = read(infd, src, cap);
-    while (got > 0) {
-        srclen = srclen + got;
-        got = read(infd, src + srclen, cap - srclen);
+    while (i < argc()) {
+        a = argv(i);
+        if (slice_is(a, 2, "-T") == 1 && i + 1 < argc()) {
+            script_name = argv(i + 1);
+            i = i + 2;
+        } else if (slice_is(a, 2, "-m") == 1 && i + 1 < argc()) {
+            map_name = argv(i + 1);
+            i = i + 2;
+        } else if (slice_is(a, 6, "--base") == 1 && i + 1 < argc()) {
+            // Where the single segment loads when no script says.  Moonshot
+            // ring-3 programs are built with --base 0x80000000, the address
+            // my kernel maps user images at; the default is what Linux
+            // executables use.
+            src = argv(i + 1);
+            srclen = 0;
+            while (src[srclen] != 0) { srclen = srclen + 1; }
+            cp = 0;
+            BASE = read_num();
+            if (cp != srclen) { serr("--base wants a number"); }
+            i = i + 2;
+        } else {
+            if (in_count >= NIN_MAX) { serr("too many inputs"); }
+            store64(in_names + in_count * 8, a);
+            in_count = in_count + 1;
+            i = i + 1;
+        }
     }
-    close(infd);
-    if (srclen >= cap) { serr("input larger than the read buffer"); }
+    if (in_count < 2) { serr("need at least one input and an output"); }
+    in_count = in_count - 1;
+    out_name = load64(in_names + in_count * 8);
 
-    out = alloc(cap);
+    i = 0;
+    while (i < in_count) {
+        store64(in_bufs + i * 8, read_file(load64(in_names + i * 8)));
+        store64(in_lens + i * 8, file_len);
+        i = i + 1;
+    }
+    if (script_name != 0) {
+        script = read_file(script_name);
+        scriptlen = file_len;
+    }
+    entry_buf = alloc(8);
+    entry_buf[0] = 95; entry_buf[1] = 115; entry_buf[2] = 116;   // _start
+    entry_buf[3] = 97; entry_buf[4] = 114; entry_buf[5] = 116; entry_buf[6] = 0;
+    entry_ptr = entry_buf;
+    entry_len = 6;
 
     pass = 1;
-    run_pass();
-    if (entry_addr == 0) { serr("no _start label"); }
+    if (script != 0) { run_script(); script_sects = sect_count; }
+    i = 0;
+    while (i < in_count) {
+        run_source(load64(in_names + i * 8), load64(in_bufs + i * 8), load64(in_lens + i * 8));
+        i = i + 1;
+    }
+    if (script != 0 && sect_count != script_sects) {
+        // An orphan section would land wherever the tool felt like putting
+        // it, which is exactly the kind of quiet layout decision a linker
+        // script exists to forbid.
+        print("smed: section ");
+        print_slice(load64(sect_name + script_sects * 8), load64(sect_namelen + script_sects * 8));
+        print(" is not placed by the linker script\n");
+        exit(1);
+    }
+
+    place_sections();
+    i = 0;
+    while (i < sect_count) {
+        a = alloc(load64(sect_size + i * 8) + 1);
+        zero(a, load64(sect_size + i * 8) + 1);
+        store64(sect_buf + i * 8, a);
+        store64(sect_pos + i * 8, 0);
+        store64(sect_data + i * 8, 0);
+        i = i + 1;
+    }
 
     pass = 2;
-    run_pass();
+    if (script != 0) { run_script(); }
+    i = 0;
+    while (i < in_count) {
+        run_source(load64(in_names + i * 8), load64(in_bufs + i * 8), load64(in_lens + i * 8));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < sect_count) {
+        if (load64(sect_pos + i * 8) != load64(sect_size + i * 8)) {
+            print("smed: section ");
+            print_slice(load64(sect_name + i * 8), load64(sect_namelen + i * 8));
+            print(" changed size between passes\n");
+            exit(1);
+        }
+        i = i + 1;
+    }
 
-    outfd = open_write(argv(2));
+    e = sym_find(entry_ptr, entry_len);
+    if (e < 0) {
+        print("smed: no entry symbol ");
+        print_slice(entry_ptr, entry_len);
+        print("\n");
+        exit(1);
+    }
+    entry_addr = sym_value(e);
+
+    outfd = open_write(out_name);
     if (outfd < 0) { serr("cannot open output"); }
     write_elf(outfd);
     close(outfd);
+    if (map_name != 0) { write_map(map_name); }
     return 0;
 }

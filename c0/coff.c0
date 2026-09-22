@@ -198,36 +198,24 @@ int gen_loop_depth = 0;
 
 int outfd = 1;
 
-// --- raw-bytes emission mode ---
-// When raw_mode is 1, codegen emits x86-64 machine code instead of assembly
-// text.  The output is a flat binary: code, then string data, then globals.
-// Function labels and call sites are tracked for post-codegen patching.
-int raw_mode = 0;
-int elf_mode = 0;   // --elf: emit ELF64 targeting Moonshot (implies raw_mode)
-int raw_buf  = 0;   // alloc'd buffer for raw bytes
-
-// ELF64 constants for the Moonshot ring-3 ABI.  The file is loaded at
-// USER_VIRT_BASE (2 GB) by the kernel's ELF loader; the entry point sits
-// at USER_VIRT_BASE + ELF_HDR_SIZE + ELF_PHDR_SIZE (past both headers).
-int ELF_HDR_SIZE  = 64;
-int ELF_PHDR_SIZE = 56;
-int ELF_USER_VIRT_BASE = 0x80000000;
-int raw_pos  = 0;   // current write offset in raw_buf
-int raw_cap  = 0;   // allocated capacity
-// Sized with real headroom rather than "exactly enough for today": label ids
-// come from one flat, never-reset counter shared by every if/while/&&/||/
-// print in the whole program, so a moderately large program reaches numbers
-// far above the old 256. Overflowing either table now errors loudly (see
-// raw_label / raw_je) instead of silently producing wrong jumps.
-int RAW_LABEL_CAP = 8192;
-int RAW_PATCH_CAP = 16384;
-int raw_labels    = 0;  // label → byte-offset map (RAW_LABEL_CAP slots × 8 bytes)
-int raw_patches   = 0;  // pending patch records (RAW_PATCH_CAP slots × 16 bytes: pos, label_id)
-int raw_patch_count = 0;
-int raw_funcs     = 0;  // function-name → byte-offset map (256 slots × 16 bytes: name_ptr, offset)
-int raw_func_count = 0;
-int raw_pending_calls = 0;  // pending call patches (256 slots × 16 bytes: pos, name_ptr)
-int raw_pending_call_count = 0;
+// --- --elf: the Moonshot ring-3 target -------------------------------------
+// The same assembly backend, aimed at Moonshot instead of Linux: the entry
+// stub and the builtins that reach the operating system (print, exit,
+// alloc, and the ring-3 syscalls win_info/fill/...) emit Moonshot's syscall
+// numbers, everything else is identical. smed assembles the result into the
+// ELF image Moonshot loads and runs (`smed --base 0x80000000`).
+//
+// Until 2026-09-17 --elf selected a second backend that wrote machine code
+// directly, byte by byte, with its own label patching, call patching,
+// inline string placement and ELF writer, and no globals, no function
+// pointers, no seventh argument. Every one of those hand-encoded
+// instructions was outside the differential test suite (coff0.c only ever
+// had the text backend) and three silent wrong-code bugs were found in it
+// by eye. It is gone: ring-3 programs now go through the one backend that
+// is checked against coff0.c on every test run, and through smed, which is
+// checked against GNU as. What is left of the mode is a handful of emit()
+// lines that differ in a syscall number.
+int elf_mode = 0;
 
 // Include-expansion state -- see the "includes" section below (right
 // after copy_bytes/streq) for the real logic; these are just the shared
@@ -302,287 +290,6 @@ void print_int(int v) {
     return;
 }
 
-// --- raw-bytes emitter ---------------------------------------------------------
-// When raw_mode is 1, codegen calls these instead of emit().  The output is
-// accumulated in raw_buf and flushed to outfd at the end.
-
-void raw_init() {
-    raw_cap = 65536;  // 64 KB initial buffer
-    raw_buf = alloc(raw_cap);
-    raw_pos = 0;
-    raw_labels  = alloc(RAW_LABEL_CAP * 8);
-    raw_patches = alloc(RAW_PATCH_CAP * 16);
-    raw_patch_count = 0;
-    raw_funcs   = alloc(256 * 16);  // 256 functions (name_ptr, offset)
-    raw_func_count = 0;
-    raw_pending_calls = alloc(256 * 16);  // 256 pending calls (pos, name_ptr)
-    raw_pending_call_count = 0;
-    // Mark all labels as undefined (-1).
-    int i = 0;
-    while (i < RAW_LABEL_CAP) {
-        store64(raw_labels + i * 8, -1);
-        i = i + 1;
-    }
-    return;
-}
-
-void raw_ensure(int n) {
-    if (raw_pos + n <= raw_cap) { return; }
-    int new_cap = raw_cap * 2;
-    int new_buf = alloc(new_cap);
-    int i = 0;
-    while (i < raw_pos) {
-        store8(new_buf + i, load8(raw_buf + i));
-        i = i + 1;
-    }
-    raw_buf = new_buf;
-    raw_cap = new_cap;
-    return;
-}
-
-void raw_byte(int b) {
-    raw_ensure(1);
-    store8(raw_buf + raw_pos, b);
-    raw_pos = raw_pos + 1;
-    return;
-}
-
-void raw_int32(int v) {
-    raw_ensure(4);
-    // Convert to unsigned for correct byte extraction with negative values.
-    int u = v;
-    if (u < 0) { u = u + 65536 * 65536; }  // + 2^32
-    store8(raw_buf + raw_pos, u - (u / 256) * 256);
-    store8(raw_buf + raw_pos + 1, (u / 256) - (u / 65536) * 256);
-    store8(raw_buf + raw_pos + 2, (u / 65536) - (u / 16777216) * 256);
-    store8(raw_buf + raw_pos + 3, u / 16777216);
-    raw_pos = raw_pos + 4;
-    return;
-}
-
-// Record the current raw_pos as label `id`.
-//
-// Overflowing the table used to `return` silently, which does not drop the
-// jump -- raw_patch_all still patches it, against a label that was never
-// recorded, so the program compiles "successfully" and jumps somewhere
-// wrong at runtime. Silently emitting incorrect code is the worst failure
-// mode available here, so this is a loud error instead.
-void raw_label(int id) {
-    if (id < 0 || id >= RAW_LABEL_CAP) { cerr(); }
-    store64(raw_labels + id * 8, raw_pos);
-    return;
-}
-
-// je rel32 to label `id`.  Emits placeholder; patched by raw_patch_all().
-void raw_je(int id) {
-    if (raw_patch_count >= RAW_PATCH_CAP) { cerr(); }
-    raw_ensure(6);
-    store8(raw_buf + raw_pos, 0x0F); raw_pos = raw_pos + 1;
-    store8(raw_buf + raw_pos, 0x84); raw_pos = raw_pos + 1;
-    store64(raw_patches + raw_patch_count * 16, raw_pos);
-    store64(raw_patches + raw_patch_count * 16 + 8, id);
-    raw_patch_count = raw_patch_count + 1;
-    raw_pos = raw_pos + 4;  // 4-byte placeholder offset
-    return;
-}
-
-// jne rel32 to label `id`.
-void raw_jne(int id) {
-    if (raw_patch_count >= RAW_PATCH_CAP) { cerr(); }
-    raw_ensure(6);
-    store8(raw_buf + raw_pos, 0x0F); raw_pos = raw_pos + 1;
-    store8(raw_buf + raw_pos, 0x85); raw_pos = raw_pos + 1;
-    store64(raw_patches + raw_patch_count * 16, raw_pos);
-    store64(raw_patches + raw_patch_count * 16 + 8, id);
-    raw_patch_count = raw_patch_count + 1;
-    raw_pos = raw_pos + 4;
-    return;
-}
-
-// jmp rel32 to label `id`.
-void raw_jmp(int id) {
-    if (raw_patch_count >= RAW_PATCH_CAP) { cerr(); }
-    raw_ensure(5);
-    store8(raw_buf + raw_pos, 0xE9); raw_pos = raw_pos + 1;
-    store64(raw_patches + raw_patch_count * 16, raw_pos);
-    store64(raw_patches + raw_patch_count * 16 + 8, id);
-    raw_patch_count = raw_patch_count + 1;
-    raw_pos = raw_pos + 4;
-    return;
-}
-
-// call function by name.  If the function position is already known, compute
-// the offset directly.  Otherwise record for post-codegen patching.
-void raw_call(int name) {
-    int found = 0;
-    int target = 0;
-    int fi = 0;
-    while (fi < raw_func_count) {
-        if (streq(load64(raw_funcs + fi * 16), name) == 1) {
-            target = load64(raw_funcs + fi * 16 + 8);
-            found = 1;
-            break;
-        }
-        fi = fi + 1;
-    }
-    raw_ensure(5);
-    store8(raw_buf + raw_pos, 0xE8); raw_pos = raw_pos + 1;
-    if (found == 1) {
-        int off = target - (raw_pos + 4);
-        raw_int32(off);
-        raw_pos = raw_pos - 4;  // raw_int32 advanced it — back up
-        raw_int32(off);          // and re-emit
-    } else {
-        // Record for patching.
-        store64(raw_pending_calls + raw_pending_call_count * 16, raw_pos);
-        store64(raw_pending_calls + raw_pending_call_count * 16 + 8, name);
-        raw_pending_call_count = raw_pending_call_count + 1;
-        raw_pos = raw_pos + 4;  // placeholder
-    }
-    return;
-}
-
-// Record function `name` at the current position.
-void raw_func_def(int name) {
-    if (raw_func_count >= 256) { return; }
-    store64(raw_funcs + raw_func_count * 16, name);
-    store64(raw_funcs + raw_func_count * 16 + 8, raw_pos);
-    raw_func_count = raw_func_count + 1;
-    return;
-}
-
-// Resolve all pending label patches and call patches.
-void raw_patch_all() {
-    // Patch labels.
-    int pi = 0;
-    while (pi < raw_patch_count) {
-        int patch_pos = load64(raw_patches + pi * 16);
-        int label_id  = load64(raw_patches + pi * 16 + 8);
-        int target = load64(raw_labels + label_id * 8);
-        int offset = target - (patch_pos + 4);
-        // Convert to unsigned 32-bit for byte extraction (c0's / truncates
-        // toward 0, which corrupts negative offsets' high bytes).
-        int u = offset;
-        if (u < 0) { u = u + 65536 * 65536; }
-        store8(raw_buf + patch_pos, u - (u / 256) * 256);
-        store8(raw_buf + patch_pos + 1,
-               (u / 256) - (u / 65536) * 256);
-        store8(raw_buf + patch_pos + 2,
-               (u / 65536) - (u / 16777216) * 256);
-        store8(raw_buf + patch_pos + 3, u / 16777216);
-        pi = pi + 1;
-    }
-    // Patch function calls.
-    pi = 0;
-    while (pi < raw_pending_call_count) {
-        int patch_pos = load64(raw_pending_calls + pi * 16);
-        int name      = load64(raw_pending_calls + pi * 16 + 8);
-        int target = 0;
-        int found_call = 0;
-        int fi = 0;
-        while (fi < raw_func_count) {
-            if (streq(load64(raw_funcs + fi * 16), name) == 1) {
-                target = load64(raw_funcs + fi * 16 + 8);
-                found_call = 1;
-                break;
-            }
-            fi = fi + 1;
-        }
-        if (found_call == 1) {
-            int offset = target - (patch_pos + 4);
-            int u = offset;
-            if (u < 0) { u = u + 65536 * 65536; }
-            store8(raw_buf + patch_pos, u - (u / 256) * 256);
-            store8(raw_buf + patch_pos + 1,
-                   (u / 256) - (u / 65536) * 256);
-            store8(raw_buf + patch_pos + 2,
-                   (u / 65536) - (u / 16777216) * 256);
-            store8(raw_buf + patch_pos + 3, u / 16777216);
-        }
-        pi = pi + 1;
-    }
-    return;
-}
-
-// Write the accumulated raw buffer to outfd.
-void raw_flush() {
-    write(outfd, raw_buf, raw_pos);
-    return;
-}
-
-// --- ELF64 header emission (--elf mode, Moonshot ring-3 ABI) ---------------
-// Builds a 120-byte header (64-byte ELF header + one 56-byte PT_LOAD phdr) in
-// an alloc'd buffer and writes it to outfd.  p_offset=0 so the entire file
-// (headers + code) is loaded at ELF_USER_VIRT_BASE; e_entry points to
-// USER_VIRT_BASE + 120, right past both headers where _start lives.
-
-void elf_hdr_byte(int buf, int pos, int b) {
-    store8(buf + pos, b);
-}
-
-void elf_hdr_int16(int buf, int pos, int v) {
-    int u = v; if (u < 0) { u = u + 65536; }
-    elf_hdr_byte(buf, pos,     u - (u / 256) * 256);
-    elf_hdr_byte(buf, pos + 1, u / 256);
-}
-
-void elf_hdr_int32(int buf, int pos, int v) {
-    int u = v; if (u < 0) { u = u + 65536 * 65536; }
-    elf_hdr_byte(buf, pos,     u - (u / 256) * 256);
-    elf_hdr_byte(buf, pos + 1, (u / 256) - (u / 65536) * 256);
-    elf_hdr_byte(buf, pos + 2, (u / 65536) - (u / 16777216) * 256);
-    elf_hdr_byte(buf, pos + 3, u / 16777216);
-}
-
-void elf_hdr_int64(int buf, int pos, int v) {
-    int hi = v / 65536 / 65536;
-    int lo = v - hi * 65536 * 65536;
-    elf_hdr_int32(buf, pos, lo);
-    elf_hdr_int32(buf, pos + 4, hi);
-}
-
-void elf_emit_header() {
-    int total = ELF_HDR_SIZE + ELF_PHDR_SIZE + raw_pos;
-    int entry = ELF_USER_VIRT_BASE + ELF_HDR_SIZE + ELF_PHDR_SIZE;
-    int hdr = alloc(120);
-    int i = 0;
-    while (i < 120) { store8(hdr + i, 0); i = i + 1; }
-
-    // e_ident magic
-    elf_hdr_byte(hdr, 0, 0x7F);
-    elf_hdr_byte(hdr, 1, 'E'); elf_hdr_byte(hdr, 2, 'L'); elf_hdr_byte(hdr, 3, 'F');
-    elf_hdr_byte(hdr, 4, 2);   // ELFCLASS64
-    elf_hdr_byte(hdr, 5, 1);   // ELFDATA2LSB
-    elf_hdr_byte(hdr, 6, 1);   // EV_CURRENT
-    // bytes 7-15 stay zero (OSABI, ABIVERSION, padding)
-
-    elf_hdr_int16(hdr, 16, 2);   // e_type = ET_EXEC
-    elf_hdr_int16(hdr, 18, 62);  // e_machine = EM_X86_64
-    elf_hdr_int32(hdr, 20, 1);   // e_version
-    elf_hdr_int64(hdr, 24, entry);  // e_entry
-    elf_hdr_int64(hdr, 32, 64);     // e_phoff (right after ELF header)
-    elf_hdr_int64(hdr, 40, 0);      // e_shoff (no section headers)
-    elf_hdr_int32(hdr, 48, 0);      // e_flags
-    elf_hdr_int16(hdr, 52, 64);     // e_ehsize
-    elf_hdr_int16(hdr, 54, 56);     // e_phentsize
-    elf_hdr_int16(hdr, 56, 1);      // e_phnum = 1
-    elf_hdr_int16(hdr, 58, 0);      // e_shentsize
-    elf_hdr_int16(hdr, 60, 0);      // e_shnum
-    elf_hdr_int16(hdr, 62, 0);      // e_shstrndx
-
-    // PT_LOAD program header at offset 64
-    elf_hdr_int32(hdr, 64, 1);   // p_type = PT_LOAD
-    elf_hdr_int32(hdr, 68, 5);   // p_flags = PF_R | PF_X
-    elf_hdr_int64(hdr, 72, 0);   // p_offset (load entire file)
-    elf_hdr_int64(hdr, 80, ELF_USER_VIRT_BASE);  // p_vaddr
-    elf_hdr_int64(hdr, 88, ELF_USER_VIRT_BASE);  // p_paddr
-    elf_hdr_int64(hdr, 96, total);   // p_filesz
-    elf_hdr_int64(hdr, 104, total);  // p_memsz
-    elf_hdr_int64(hdr, 112, 4096);   // p_align
-
-    write(outfd, hdr, 120);
-}
-
 int word_is(int buf, int start, int len, int kw) {
     int i = 0;
     int k = 0;
@@ -631,7 +338,7 @@ int streq(int a, int b) {
 // (differentially verified against it, and against lex.c0/parse.c0's own
 // identical mirrors), see coff0.c for the full design rationale. This is
 // the load-bearing copy: coff.c0 is what coff1 actually is, the compiler
-// my OS kernel is built with.
+// Moonshot is built with.
 
 // Directory portion of `path` (a null-terminated string), trailing slash
 // included so callers can concatenate directly, or a fresh empty string
@@ -1471,6 +1178,8 @@ int builtin_arity(int name) {
     if (streq(name, "ticks") == 1) { return 0; }
     if (streq(name, "readfile") == 1) { return 3; }
     if (streq(name, "present") == 1) { return 1; }
+    if (streq(name, "mouse_poll") == 1) { return 0; }
+    if (streq(name, "glyph") == 1) { return 2; }
     if (streq(name, "argc") == 1) { return 0; }
     if (streq(name, "argv") == 1) { return 1; }
     if (streq(name, "outb") == 1) { return 2; }
@@ -1786,27 +1495,6 @@ void gen_block(int nd) {
 
 void gen_binop(int nd, int k) {
     gen_expr(nd.child1);
-    if (raw_mode == 1) {
-        raw_byte(0x50);  // push rax
-        gen_expr(nd.child2);
-        raw_byte(0x48); raw_byte(0x89); raw_byte(0xC1);  // mov rcx, rax
-        raw_byte(0x58);  // pop rax
-        if (k == 7)  { raw_byte(0x48); raw_byte(0x01); raw_byte(0xC8); return; }
-        if (k == 8)  { raw_byte(0x48); raw_byte(0x29); raw_byte(0xC8); return; }
-        if (k == 9)  { raw_byte(0x48); raw_byte(0x0F); raw_byte(0xAF); raw_byte(0xC1); return; }
-        if (k == 10) {
-            raw_byte(0x48); raw_byte(0x99);  // cqo
-            raw_byte(0x48); raw_byte(0xF7); raw_byte(0xF9);  // idiv rcx
-            return;
-        }
-        if (k == 11) { raw_byte(0x48); raw_byte(0x39); raw_byte(0xC8); raw_byte(0x0F); raw_byte(0x94); raw_byte(0xC0); raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0xC0); return; }
-        if (k == 12) { raw_byte(0x48); raw_byte(0x39); raw_byte(0xC8); raw_byte(0x0F); raw_byte(0x95); raw_byte(0xC0); raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0xC0); return; }
-        if (k == 13) { raw_byte(0x48); raw_byte(0x39); raw_byte(0xC8); raw_byte(0x0F); raw_byte(0x9C); raw_byte(0xC0); raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0xC0); return; }
-        if (k == 14) { raw_byte(0x48); raw_byte(0x39); raw_byte(0xC8); raw_byte(0x0F); raw_byte(0x9E); raw_byte(0xC0); raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0xC0); return; }
-        if (k == 15) { raw_byte(0x48); raw_byte(0x39); raw_byte(0xC8); raw_byte(0x0F); raw_byte(0x9F); raw_byte(0xC0); raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0xC0); return; }
-        if (k == 16) { raw_byte(0x48); raw_byte(0x39); raw_byte(0xC8); raw_byte(0x0F); raw_byte(0x9D); raw_byte(0xC0); raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0xC0); return; }
-        return;
-    }
     emit("    push rax\n");
     gen_expr(nd.child2);
     emit("    mov rcx, rax\n");
@@ -1835,45 +1523,24 @@ void gen_call(int nd) {
     if (streq(name, "print") == 1) {
         l = label_count;
         // Uses two labels (l for .Lstrlen, l+1 for .Lstrlend).
-        if (raw_mode == 1) { label_count = label_count + 2; }
-        else { label_count = label_count + 1; }
+        label_count = label_count + 1;
         gen_expr(args);
-        if (raw_mode == 1) {
-            // rbx = rax (save string ptr), xor rcx, rcx
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC3);  // mov rbx, rax
-            raw_byte(0x48); raw_byte(0x31); raw_byte(0xC9);  // xor rcx, rcx
-            raw_label(l);  // .Lstrlen:
-            raw_byte(0x80); raw_byte(0x3C); raw_byte(0x0B); raw_byte(0x00);  // cmp [rbx+rcx], 0
-            raw_je(l + 1);  // je .Lstrlend
-            raw_byte(0x48); raw_byte(0xFF); raw_byte(0xC1);  // inc rcx
-            raw_jmp(l);  // jmp .Lstrlen
-            raw_label(l + 1);  // .Lstrlend:
-            if (elf_mode == 1) {
-                // Moonshot SYS_DEBUG_PRINT(str, len)
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0xDF);  // mov rdi, rbx
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0xCE);  // mov rsi, rcx
-                raw_byte(0xB8);  // mov eax, imm32
-                raw_int32(1);     // SYS_DEBUG_PRINT
-                raw_byte(0x0F); raw_byte(0x05);  // syscall
-            } else {
-                // Linux write(1, str, len)
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0xCA);  // mov rdx, rcx
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0xDE);  // mov rsi, rbx
-                raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC7);  // mov rdi, 1
-                raw_int32(1);
-                raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 1
-                raw_int32(1);
-                raw_byte(0x0F); raw_byte(0x05);  // syscall
-            }
+        emit("    mov rbx, rax\n");
+        emit("    xor rcx, rcx\n");
+        emit(".Lstrlen"); print_int(l); emit(":\n");
+        emit("    cmp byte ptr [rbx + rcx], 0\n");
+        emit("    je .Lstrlend"); print_int(l); emit("\n");
+        emit("    inc rcx\n");
+        emit("    jmp .Lstrlen"); print_int(l); emit("\n");
+        emit(".Lstrlend"); print_int(l); emit(":\n");
+        if (elf_mode == 1) {
+            // Moonshot SYS_DEBUG_PRINT(str, len) is 1.
+            emit("    mov rdi, rbx\n");
+            emit("    mov rsi, rcx\n");
+            emit("    mov rax, 1\n");
+            emit("    syscall\n");
         } else {
-            emit("    mov rbx, rax\n");
-            emit("    xor rcx, rcx\n");
-            emit(".Lstrlen"); print_int(l); emit(":\n");
-            emit("    cmp byte ptr [rbx + rcx], 0\n");
-            emit("    je .Lstrlend"); print_int(l); emit("\n");
-            emit("    inc rcx\n");
-            emit("    jmp .Lstrlen"); print_int(l); emit("\n");
-            emit(".Lstrlend"); print_int(l); emit(":\n");
+            // Linux write(1, str, len).
             emit("    mov rdx, rcx\n");
             emit("    mov rsi, rbx\n");
             emit("    mov rdi, 1\n");
@@ -1885,16 +1552,15 @@ void gen_call(int nd) {
     if (streq(name, "alloc") == 1) {
         if (elf_mode == 1) {
             // SYS_ALLOC(n) (6): bump-allocate from this ring-3 process's
-            // own private heap region, which the kernel sets up when it
-            // loads the binary. Returns 0 on failure -- no free, matching
-            // SYS_ALLOC's own bump-only design.
+            // own private heap region, which the kernel grants it when
+            // it loads the program. Returns 0 on failure -- no free,
+            // matching SYS_ALLOC's own bump-only design.
             gen_expr(args);
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC7);  // mov rdi, rax
-            raw_byte(0xB8); raw_int32(6);                     // mov eax, 6
-            raw_byte(0x0F); raw_byte(0x05);                   // syscall
+            emit("    mov rdi, rax\n");
+            emit("    mov rax, 6\n");
+            emit("    syscall\n");
             return;
         }
-        if (raw_mode == 1) { cerr(); }  // --raw (Linux) alloc has no codegen path yet
         l = label_count; label_count = label_count + 1;
         gen_expr(args);
         emit("    push rax\n");
@@ -1916,62 +1582,62 @@ void gen_call(int nd) {
     }
     if (streq(name, "load8") == 1) {
         gen_expr(args);
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0x00);
-        } else { emit("    movzx rax, byte ptr [rax]\n"); }
+ emit("    movzx rax, byte ptr [rax]\n"); 
         return;
     }
     if (streq(name, "store8") == 1) {
         gen_expr(args);
-        if (raw_mode == 1) {
-            raw_byte(0x50);  // push rax
-            gen_expr(args.sibling);
-            raw_byte(0x5F);  // pop rdi
-            raw_byte(0x88); raw_byte(0x07);  // mov [rdi], al
-        } else {
-            emit("    push rax\n");
-            gen_expr(args.sibling);
-            emit("    pop rdi\n");
-            emit("    mov byte ptr [rdi], al\n");
-        }
+        emit("    push rax\n");
+        gen_expr(args.sibling);
+        emit("    pop rdi\n");
+        emit("    mov byte ptr [rdi], al\n");
+    
         return;
     }
     if (streq(name, "exit") == 1) {
         gen_expr(args);
+        emit("    mov rdi, rax\n");
         if (elf_mode == 1) {
-            // Moonshot's SYS_EXIT is 0. This used to fall into the Linux
-            // branch below and emit syscall 60, which Moonshot does not
-            // implement -- so the kernel logged "unknown syscall 60",
-            // returned -1, and the program CARRIED ON as if nothing had
-            // happened. Every --elf program's exit() has been a no-op.
-            //
-            // It hid because `return` from main works fine (the entry stub
-            // does the exit) and nothing exercised exit() itself: the demos
-            // that call it on Esc were only ever checked for running, never
-            // for stopping. Found when Infecteria printed its death message
-            // 253 times and kept playing.
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC7);  // mov rdi, rax
-            raw_byte(0xB8); raw_int32(0);                     // mov eax, 0
-            raw_byte(0x0F); raw_byte(0x05);                   // syscall
-        } else if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC7);  // mov rdi, rax
-            raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 60
-            raw_int32(60);
-            raw_byte(0x0F); raw_byte(0x05);  // syscall
+            // Moonshot's SYS_EXIT is 0. This once fell through to the Linux
+            // number, 60, which Moonshot does not implement -- the kernel
+            // logged "unknown syscall 60", returned -1, and the program
+            // CARRIED ON. Every --elf program's exit() was a no-op, hidden
+            // because `return` from main goes through the entry stub and
+            // nothing exercised exit() itself, until Infecteria printed its
+            // death message 253 times and kept playing.
+            emit("    mov rax, 0\n");
         } else {
-            emit("    mov rdi, rax\n");
             emit("    mov rax, 60\n");
-            emit("    syscall\n");
         }
+        emit("    syscall\n");
         return;
     }
-    // --- Moonshot ring-3 builtins (--elf mode only) --------------------
+    // --- Moonshot ring-3 builtins (--elf only) ------------------------
+    // Each is one Moonshot syscall. Arguments follow the SYSCALL ABI: rdi,
+    // rsi, rdx, r10, r8 -- r10 for the fourth, not rcx, because the
+    // SYSCALL instruction clobbers rcx with the return RIP. Every argument
+    // is evaluated left to right onto the stack first, then popped into its
+    // register in reverse, so an argument expression may itself call.
+    if (elf_mode == 0) {
+        if (streq(name, "win_info") == 1 || streq(name, "win_max") == 1
+            || streq(name, "key_poll") == 1 || streq(name, "ticks") == 1
+            || streq(name, "present") == 1 || streq(name, "readfile") == 1
+            || streq(name, "blit") == 1 || streq(name, "fill") == 1
+            || streq(name, "mouse_poll") == 1
+            || streq(name, "glyph") == 1) { cerr(); }
+    } else {
+        // The Linux-only builtins have no meaning in ring 3 on Moonshot:
+        // there is no argv, no file descriptors and no port I/O.
+        if (streq(name, "argc") == 1 || streq(name, "argv") == 1
+            || streq(name, "write") == 1 || streq(name, "read") == 1
+            || streq(name, "open_read") == 1 || streq(name, "open_write") == 1
+            || streq(name, "close") == 1 || streq(name, "outb") == 1
+            || streq(name, "inb") == 1 || streq(name, "outw") == 1
+            || streq(name, "inw") == 1) { cerr(); }
+    }
     if (streq(name, "win_info") == 1) {
         // SYS_WIN_INFO (2): returns packed (width<<16)|height in rax.
-        if (elf_mode == 1) {
-            raw_byte(0xB8); raw_int32(2);      // mov eax, 2
-            raw_byte(0x0F); raw_byte(0x05);    // syscall
-        } else { cerr(); }
+        emit("    mov rax, 2\n    syscall\n");
         return;
     }
     if (streq(name, "win_max") == 1) {
@@ -1982,122 +1648,90 @@ void gen_call(int nd) {
         // window growing from half the screen to all of it would need a second
         // buffer the heap has no room for. win_info() is what changes; this is
         // what you budget for.
-        if (elf_mode == 1) {
-            raw_byte(0xB8); raw_int32(10);     // mov eax, 10
-            raw_byte(0x0F); raw_byte(0x05);    // syscall
-        } else { cerr(); }
+        emit("    mov rax, 10\n    syscall\n");
         return;
     }
     if (streq(name, "key_poll") == 1) {
         // SYS_KEY_POLL (4): returns packed key event or -1 in rax.
-        if (elf_mode == 1) {
-            raw_byte(0xB8); raw_int32(4);      // mov eax, 4
-            raw_byte(0x0F); raw_byte(0x05);    // syscall
-        } else { cerr(); }
+        emit("    mov rax, 4\n    syscall\n");
         return;
     }
     if (streq(name, "ticks") == 1) {
         // SYS_TICKS (7): returns the kernel's monotonic ~100Hz tick count.
-        if (elf_mode == 1) {
-            raw_byte(0xB8); raw_int32(7);      // mov eax, 7
-            raw_byte(0x0F); raw_byte(0x05);    // syscall
-        } else { cerr(); }
+        emit("    mov rax, 7\n    syscall\n");
+        return;
+    }
+    if (streq(name, "mouse_poll") == 1) {
+        // SYS_MOUSE_POLL (11): the pointer relative to this task's window,
+        // (x * 1024 + y) * 8 + buttons, or -1 when it is not over the window.
+        emit("    mov rax, 11\n    syscall\n");
+        return;
+    }
+    if (streq(name, "glyph") == 1) {
+        // SYS_GLYPH(ch, buf) (12): copies one character's font bitmap -- the
+        // kernel's own font, the one kakel draws with -- into the caller's
+        // memory, FONT_H bytes, row 0 first, each byte's bit 7 the leftmost
+        // pixel. Returns the cell size packed width * 65536 + height, so a
+        // program never hardcodes 8x8; with buf == 0 it returns that size and
+        // copies nothing, the way readfile()'s buf == 0 returns a file size.
+        //
+        // A bitmap rather than a draw call on purpose: ring-3 programs
+        // composite a whole frame and present() it in one syscall, because a
+        // multi-syscall draw sequence gets torn by the scheduler. Text has to
+        // go through the same compositing as everything else, so the kernel
+        // hands over the glyph and draws nothing.
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop rsi\n    pop rdi\n");
+        emit("    mov rax, 12\n    syscall\n");
         return;
     }
     if (streq(name, "present") == 1) {
-        // SYS_PRESENT(buf) (9): copy a whole window of pixels at once. One
-        // arg, so nothing but rdi is involved.
-        if (elf_mode == 1) {
-            gen_expr(args);
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC7);  // mov rdi, rax
-            raw_byte(0xB8); raw_int32(9);                     // mov eax, 9
-            raw_byte(0x0F); raw_byte(0x05);                   // syscall
-        } else { cerr(); }
+        // SYS_PRESENT(buf) (9): copy a whole window of pixels at once.
+        gen_expr(args);
+        emit("    mov rdi, rax\n");
+        emit("    mov rax, 9\n    syscall\n");
         return;
     }
     if (streq(name, "readfile") == 1) {
         // SYS_READFILE(name, buf, max) (8): reads a file from jakel into the
-        // process's own memory. Three args, so all three go in the plain
-        // SysV registers and none of the r10 business fill()/blit() need.
-        //
-        // With buf == 0 it returns the file's size without copying anything,
-        // which is how a program sizes an alloc() before the real read --
-        // there is no separate stat syscall and this costs nothing.
-        if (elf_mode == 1) {
-            int r = args;
-            while (r != 0) {
-                gen_expr(r);
-                raw_byte(0x50);  // push rax
-                r = r.sibling;
-            }
-            raw_byte(0x5A);                   // pop rdx (max)
-            raw_byte(0x5E);                   // pop rsi (buf)
-            raw_byte(0x5F);                   // pop rdi (name)
-            raw_byte(0xB8); raw_int32(8);     // mov eax, 8
-            raw_byte(0x0F); raw_byte(0x05);   // syscall
-        } else { cerr(); }
+        // process's own memory. With buf == 0 it returns the file's size
+        // without copying anything, which is how a program sizes an alloc()
+        // before the real read -- there is no separate stat syscall.
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop rdx\n    pop rsi\n    pop rdi\n");
+        emit("    mov rax, 8\n    syscall\n");
         return;
     }
     if (streq(name, "blit") == 1) {
-        // SYS_BLIT(buf, x, y, w, h) (5): 5 args.
-        if (elf_mode == 1) {
-            int a = args;
-            while (a != 0) {
-                gen_expr(a);
-                raw_byte(0x50);  // push rax
-                a = a.sibling;
-            }
-            // SYSCALL ABI: arg4→r10 (not rcx — SYSCALL clobbers rcx with RIP)
-            raw_byte(0x41); raw_byte(0x58);  // pop r8  (h)
-            raw_byte(0x41); raw_byte(0x5A);  // pop r10 (w)
-            raw_byte(0x5A);                   // pop rdx (y)
-            raw_byte(0x5E);                   // pop rsi (x)
-            raw_byte(0x5F);                   // pop rdi (buf)
-            raw_byte(0xB8); raw_int32(5);     // mov eax, 5
-            raw_byte(0x0F); raw_byte(0x05);   // syscall
-        } else { cerr(); }
+        // SYS_BLIT(buf, x, y, w, h) (5).
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop r8\n    pop r10\n    pop rdx\n    pop rsi\n    pop rdi\n");
+        emit("    mov rax, 5\n    syscall\n");
         return;
     }
     if (streq(name, "fill") == 1) {
-        // SYS_FILL(x, y, w, h, color) (3): 5 args. SYSCALL ABI.
-        if (elf_mode == 1) {
-            int a = args;
-            while (a != 0) {
-                gen_expr(a);
-                raw_byte(0x50);  // push rax
-                a = a.sibling;
-            }
-            // SYSCALL ABI: arg1=rdi, arg2=rsi, arg3=rdx, arg4=r10, arg5=r8
-            raw_byte(0x41); raw_byte(0x58);  // pop r8  (color)
-            raw_byte(0x41); raw_byte(0x5A);  // pop r10 (h)
-            raw_byte(0x5A);                   // pop rdx (w)
-            raw_byte(0x5E);                   // pop rsi (y)
-            raw_byte(0x5F);                   // pop rdi (x)
-            raw_byte(0xB8); raw_int32(3);     // mov eax, 3
-            raw_byte(0x0F); raw_byte(0x05);   // syscall
-        } else { cerr(); }
+        // SYS_FILL(x, y, w, h, color) (3).
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop r8\n    pop r10\n    pop rdx\n    pop rsi\n    pop rdi\n");
+        emit("    mov rax, 3\n    syscall\n");
         return;
     }
     if (streq(name, "load64") == 1) {
         gen_expr(args);
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x8B); raw_byte(0x00);  // mov rax, [rax]
-        } else { emit("    mov rax, [rax]\n"); }
+ emit("    mov rax, [rax]\n"); 
         return;
     }
     if (streq(name, "store64") == 1) {
         gen_expr(args);
-        if (raw_mode == 1) {
-            raw_byte(0x50);  // push rax
-            gen_expr(args.sibling);
-            raw_byte(0x5F);  // pop rdi
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0x07);  // mov [rdi], rax
-        } else {
-            emit("    push rax\n");
-            gen_expr(args.sibling);
-            emit("    pop rdi\n");
-            emit("    mov [rdi], rax\n");
-        }
+        emit("    push rax\n");
+        gen_expr(args.sibling);
+        emit("    pop rdi\n");
+        emit("    mov [rdi], rax\n");
+    
         return;
     }
     if (streq(name, "argc") == 1) {
@@ -2146,74 +1780,50 @@ void gen_call(int nd) {
     a = args;
     while (a != 0) {
         gen_expr(a);
-        if (raw_mode == 1) { raw_byte(0x50); }  // push rax
-        else { emit("    push rax\n"); }
+        emit("    push rax\n");
         a = a.sibling;
         nargs = nargs + 1;
     }
-    if (raw_mode == 1) {
-        // Pop args into registers.  For ≤6 args, pop in reverse order.
-        if (nargs <= 6) {
-            i = nargs - 1;
-            while (i >= 0) {
-                if (i == 0) { raw_byte(0x5F); }       // pop rdi
-                else if (i == 1) { raw_byte(0x5E); }   // pop rsi
-                else if (i == 2) { raw_byte(0x5A); }   // pop rdx
-                else if (i == 3) { raw_byte(0x59); }   // pop rcx
-                else if (i == 4) { raw_byte(0x41); raw_byte(0x58); }  // pop r8
-                else { raw_byte(0x41); raw_byte(0x59); }  // pop r9
-                i = i - 1;
-            }
+    if (nargs <= 6) {
+        i = nargs - 1;
+        while (i >= 0) {
+            emit("    pop "); emit(arg_reg(i)); emit("\n");
+            i = i - 1;
         }
-        // Emit the call.
-        if (nd.extra == 1 || nd.extra == 2) {
-            // Indirect call — not supported in raw mode yet.
-            cerr();
-        } else {
-            raw_call(name);
-        }
-        if (nargs > 6) { cerr(); }  // not supported yet
     } else {
-        if (nargs <= 6) {
-            i = nargs - 1;
-            while (i >= 0) {
-                emit("    pop "); emit(arg_reg(i)); emit("\n");
-                i = i - 1;
-            }
-        } else {
-            i = 0;
-            while (i < 6) {
-                emit("    mov "); emit(arg_reg(i)); emit(", [rsp + ");
-                print_int((nargs - 1 - i) * 8); emit("]\n");
-                i = i + 1;
-            }
+        i = 0;
+        while (i < 6) {
+            emit("    mov "); emit(arg_reg(i)); emit(", [rsp + ");
+            print_int((nargs - 1 - i) * 8); emit("]\n");
+            i = i + 1;
         }
-
-        if (streq(name, "write") == 1) { emit("    mov rax, 1\n    syscall\n"); return; }
-        if (streq(name, "read") == 1) { emit("    mov rax, 0\n    syscall\n"); return; }
-        if (streq(name, "close") == 1) { emit("    mov rax, 3\n    syscall\n"); return; }
-        if (streq(name, "open_read") == 1) {
-            emit("    mov rsi, 0\n");
-            emit("    mov rax, 2\n    syscall\n");
-            return;
-        }
-        if (streq(name, "open_write") == 1) {
-            emit("    mov rsi, 577\n");
-            emit("    mov rdx, 420\n");
-            emit("    mov rax, 2\n    syscall\n");
-            return;
-        }
-        if (nd.extra == 1) {
-            emit("    mov r10, [.G"); emit(name); emit("]\n");
-            emit("    call r10\n");
-        } else if (nd.extra == 2) {
-            emit("    mov r10, [rbp - "); print_int(nd.ival); emit("]\n");
-            emit("    call r10\n");
-        } else {
-            emit("    call "); emit(name); emit("\n");
-        }
-        if (nargs > 6) { emit("    add rsp, "); print_int(nargs * 8); emit("\n"); }
     }
+
+    if (streq(name, "write") == 1) { emit("    mov rax, 1\n    syscall\n"); return; }
+    if (streq(name, "read") == 1) { emit("    mov rax, 0\n    syscall\n"); return; }
+    if (streq(name, "close") == 1) { emit("    mov rax, 3\n    syscall\n"); return; }
+    if (streq(name, "open_read") == 1) {
+        emit("    mov rsi, 0\n");
+        emit("    mov rax, 2\n    syscall\n");
+        return;
+    }
+    if (streq(name, "open_write") == 1) {
+        emit("    mov rsi, 577\n");
+        emit("    mov rdx, 420\n");
+        emit("    mov rax, 2\n    syscall\n");
+        return;
+    }
+    if (nd.extra == 1) {
+        emit("    mov r10, [.G"); emit(name); emit("]\n");
+        emit("    call r10\n");
+    } else if (nd.extra == 2) {
+        emit("    mov r10, [rbp - "); print_int(nd.ival); emit("]\n");
+        emit("    call r10\n");
+    } else {
+        emit("    call "); emit(name); emit("\n");
+    }
+    if (nargs > 6) { emit("    add rsp, "); print_int(nargs * 8); emit("\n"); }
+
     return;
 }
 
@@ -2222,128 +1832,53 @@ void gen_expr(int nd) {
     int l = 0;
     // --- literal ---
     if (k == 1) {
-        if (raw_mode == 1) {
-            // movabs rax, imm64 -- BOTH halves of the immediate. The high
-            // word used to be hardcoded to 0, silently truncating every
-            // literal to 32 bits: c0's int is 64-bit, so any constant above
-            // 0xFFFFFFFF (and every negative one) lost its top half with no
-            // error. Found via a ring-3 sprite whose pixel data is seeded by
-            // store64 of 64-bit literals -- each one covers two pixels, so
-            // exactly the odd-numbered pixels (the high half) came out zero
-            // and the sprite rendered as vertical stripes.
-            //
-            // raw_int32 already masks to the low 32 bits of whatever it is
-            // given, so the low word can pass ival straight through. The
-            // high word needs FLOOR division, not c0's truncate-toward-zero
-            // `/`, or negative literals land one short.
-            int hi = nd.ival / (65536 * 65536);
-            if (nd.ival < 0) {
-                if (hi * (65536 * 65536) != nd.ival) { hi = hi - 1; }
-            }
-            raw_byte(0x48); raw_byte(0xB8);  // mov rax, imm64
-            raw_int32(nd.ival);              // low 32 bits
-            raw_int32(hi);                   // high 32 bits
-        } else {
-            emit("    mov rax, "); print_int(nd.ival); emit("\n");
-        }
+        emit("    mov rax, "); print_int(nd.ival); emit("\n");
+    
         return;
     }
     // --- string literal ---
     if (k == 2) {
-        if (raw_mode == 1) {
-            int str_idx = nd.extra;
-            int str_ptr = load64(string_ptrs + str_idx * 8);
-            int str_len = load64(string_lens + str_idx * 8);
-            // jmp rel8 over string data (EB + offset)
-            int jmp_pos = raw_pos;
-            raw_byte(0xEB);
-            raw_byte(str_len + 1);  // +1 for NUL
-            // String bytes + NUL.
-            int si = 0;
-            while (si < str_len) {
-                raw_byte(load8(str_ptr + si));
-                si = si + 1;
-            }
-            raw_byte(0);  // NUL
-            // lea rax, [rip + offset] — string starts right after jmp.
-            raw_byte(0x48); raw_byte(0x8D); raw_byte(0x05);
-            int str_start = jmp_pos + 2;
-            int lea_end   = raw_pos + 4;  // +4 for the disp32 we are about to emit
-            int off = str_start - lea_end;
-            int u = off; if (u < 0) { u = u + 65536 * 65536; }
-            raw_byte(u - (u / 256) * 256);
-            raw_byte((u / 256) - (u / 65536) * 256);
-            raw_byte((u / 65536) - (u / 16777216) * 256);
-            raw_byte(u / 16777216);
-            return;
-        }
         emit("    lea rax, [.Lstr"); print_int(nd.extra); emit("]\n");
         return;
     }
     // --- variable read ---
     if (k == 3) {
-        if (raw_mode == 1) {
-            if (nd.extra == 1) {
-                // Global: mov rax, [rip+...].  We need to know the global's
-                // offset in the data section.  For the MVP, treat globals
-                // as unsupported in raw mode and fall through.
-                cerr();
-            } else {
-                // Local: mov rax, [rbp - offset]
-                raw_byte(0x48); raw_byte(0x8B); raw_byte(0x85);
-                raw_int32(0 - nd.ival);
-            }
+        if (nd.extra == 1) {
+            emit("    mov rax, [.G"); emit(nd.sval); emit("]\n");
         } else {
-            if (nd.extra == 1) {
-                emit("    mov rax, [.G"); emit(nd.sval); emit("]\n");
-            } else {
-                emit("    mov rax, [rbp - "); print_int(nd.ival); emit("]\n");
-            }
+            emit("    mov rax, [rbp - "); print_int(nd.ival); emit("]\n");
         }
+    
         return;
     }
     // --- function reference ---
     if (k == 29) {
-        if (raw_mode == 1) { cerr(); }
         emit("    lea rax, ["); emit(nd.sval); emit("]\n");
         return;
     }
     // --- unary neg ---
     if (k == 17) {
         gen_expr(nd.child1);
-        if (raw_mode == 1) { raw_byte(0x48); raw_byte(0xF7); raw_byte(0xD8); }
-        else { emit("    neg rax\n"); }
+        emit("    neg rax\n");
         return;
     }
     // --- array index (load8 offset) ---
     if (k == 27) {
         gen_expr(nd.child1);
-        if (raw_mode == 1) {
-            raw_byte(0x50);  // push rax
-            gen_expr(nd.child2);
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC1);  // mov rcx, rax
-            raw_byte(0x58);  // pop rax
-            raw_byte(0x48); raw_byte(0x01); raw_byte(0xC8);  // add rax, rcx
-            raw_byte(0x48); raw_byte(0x0F); raw_byte(0xB6); raw_byte(0x00);  // movzx rax, byte [rax]
-        } else {
-            emit("    push rax\n");
-            gen_expr(nd.child2);
-            emit("    mov rcx, rax\n");
-            emit("    pop rax\n");
-            emit("    add rax, rcx\n");
-            emit("    movzx rax, byte ptr [rax]\n");
-        }
+        emit("    push rax\n");
+        gen_expr(nd.child2);
+        emit("    mov rcx, rax\n");
+        emit("    pop rax\n");
+        emit("    add rax, rcx\n");
+        emit("    movzx rax, byte ptr [rax]\n");
+    
         return;
     }
     // --- field read (e.field, sugar over load64(base + offset)) ---
     if (k == 30) {
         gen_expr(nd.child1);
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x8B); raw_byte(0x80);  // mov rax, [rax+disp32]
-            raw_int32(nd.ival);
-        } else {
-            emit("    mov rax, [rax + "); print_int(nd.ival); emit("]\n");
-        }
+        emit("    mov rax, [rax + "); print_int(nd.ival); emit("]\n");
+    
         return;
     }
     // --- function call ---
@@ -2361,34 +1896,19 @@ void gen_expr(int nd) {
         // literals are emitted inline in the code stream) jumps landing on
         // the wrong literal. Same two-label reservation print() already does.
         l = label_count;
-        if (raw_mode == 1) { label_count = label_count + 2; }
-        else { label_count = label_count + 1; }
+        label_count = label_count + 1;
         gen_expr(nd.child1);
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x83); raw_byte(0xF8); raw_byte(0x00);  // cmp rax, 0
-            raw_je(l);  // je .Lfalse
-            gen_expr(nd.child2);
-            raw_byte(0x48); raw_byte(0x83); raw_byte(0xF8); raw_byte(0x00);  // cmp rax, 0
-            raw_je(l);
-            raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 1
-            raw_int32(1);
-            raw_jmp(l + 1);  // jmp .Landend (l+1 is the "landend" label)
-            raw_label(l);    // .Lfalse:
-            raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 0
-            raw_int32(0);
-            raw_label(l + 1); // .Landend:
-        } else {
-            emit("    cmp rax, 0\n");
-            emit("    je .Lfalse"); print_int(l); emit("\n");
-            gen_expr(nd.child2);
-            emit("    cmp rax, 0\n");
-            emit("    je .Lfalse"); print_int(l); emit("\n");
-            emit("    mov rax, 1\n");
-            emit("    jmp .Landend"); print_int(l); emit("\n");
-            emit(".Lfalse"); print_int(l); emit(":\n");
-            emit("    mov rax, 0\n");
-            emit(".Landend"); print_int(l); emit(":\n");
-        }
+        emit("    cmp rax, 0\n");
+        emit("    je .Lfalse"); print_int(l); emit("\n");
+        gen_expr(nd.child2);
+        emit("    cmp rax, 0\n");
+        emit("    je .Lfalse"); print_int(l); emit("\n");
+        emit("    mov rax, 1\n");
+        emit("    jmp .Landend"); print_int(l); emit("\n");
+        emit(".Lfalse"); print_int(l); emit(":\n");
+        emit("    mov rax, 0\n");
+        emit(".Landend"); print_int(l); emit(":\n");
+    
         return;
     }
     // --- OR short-circuit ---
@@ -2396,34 +1916,19 @@ void gen_expr(int nd) {
         // Two labels in raw mode (l = .Ltrue, l+1 = .Lorend) -- see the AND
         // case above for why reserving only one silently corrupts jumps.
         l = label_count;
-        if (raw_mode == 1) { label_count = label_count + 2; }
-        else { label_count = label_count + 1; }
+        label_count = label_count + 1;
         gen_expr(nd.child1);
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x83); raw_byte(0xF8); raw_byte(0x00);  // cmp rax, 0
-            raw_jne(l);  // jne .Ltrue
-            gen_expr(nd.child2);
-            raw_byte(0x48); raw_byte(0x83); raw_byte(0xF8); raw_byte(0x00);  // cmp rax, 0
-            raw_jne(l);
-            raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 0
-            raw_int32(0);
-            raw_jmp(l + 1);  // jmp .Lorend
-            raw_label(l);    // .Ltrue:
-            raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 1
-            raw_int32(1);
-            raw_label(l + 1); // .Lorend:
-        } else {
-            emit("    cmp rax, 0\n");
-            emit("    jne .Ltrue"); print_int(l); emit("\n");
-            gen_expr(nd.child2);
-            emit("    cmp rax, 0\n");
-            emit("    jne .Ltrue"); print_int(l); emit("\n");
-            emit("    mov rax, 0\n");
-            emit("    jmp .Lorend"); print_int(l); emit("\n");
-            emit(".Ltrue"); print_int(l); emit(":\n");
-            emit("    mov rax, 1\n");
-            emit(".Lorend"); print_int(l); emit(":\n");
-        }
+        emit("    cmp rax, 0\n");
+        emit("    jne .Ltrue"); print_int(l); emit("\n");
+        gen_expr(nd.child2);
+        emit("    cmp rax, 0\n");
+        emit("    jne .Ltrue"); print_int(l); emit("\n");
+        emit("    mov rax, 0\n");
+        emit("    jmp .Lorend"); print_int(l); emit("\n");
+        emit(".Ltrue"); print_int(l); emit(":\n");
+        emit("    mov rax, 1\n");
+        emit(".Lorend"); print_int(l); emit(":\n");
+    
         return;
     }
     cerr();
@@ -2437,75 +1942,45 @@ void gen_stmt(int nd) {
     if (k == 5) {
         if (nd.child2 != 0) { gen_expr(nd.child2); }
         else {
-            if (raw_mode == 1) { raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0); raw_int32(0); }
-            else { emit("    mov rax, 0\n"); }
+            emit("    mov rax, 0\n");
         }
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0x85);  // mov [rbp+disp32], rax
-            raw_int32(0 - nd.ival);
-        } else {
-            emit("    mov [rbp - "); print_int(nd.ival); emit("], rax\n");
-        }
+        emit("    mov [rbp - "); print_int(nd.ival); emit("], rax\n");
+    
         return;
     }
     // --- assignment (k=4) ---
     if (k == 4) {
         gen_expr(nd.child2);
-        if (raw_mode == 1) {
-            if (nd.extra == 1) { cerr(); }  // globals not yet
-            else {
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0x85);  // mov [rbp+disp32], rax
-                raw_int32(0 - nd.ival);
-            }
+        if (nd.extra == 1) {
+            emit("    mov [.G"); emit(nd.sval); emit("], rax\n");
         } else {
-            if (nd.extra == 1) {
-                emit("    mov [.G"); emit(nd.sval); emit("], rax\n");
-            } else {
-                emit("    mov [rbp - "); print_int(nd.ival); emit("], rax\n");
-            }
+            emit("    mov [rbp - "); print_int(nd.ival); emit("], rax\n");
         }
+    
         return;
     }
     // --- array-index assignment (k=28) ---
     if (k == 28) {
         gen_expr(nd.child1);
-        if (raw_mode == 1) {
-            raw_byte(0x50);  // push rax  (base)
-            gen_expr(nd.child2);
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC1);  // mov rcx, rax  (index)
-            raw_byte(0x58);  // pop rax
-            raw_byte(0x48); raw_byte(0x01); raw_byte(0xC8);  // add rax, rcx
-            raw_byte(0x50);  // push rax  (computed address)
-            gen_expr(nd.child3);
-            raw_byte(0x5F);  // pop rdi
-            raw_byte(0x88); raw_byte(0x07);  // mov [rdi], al
-        } else {
-            emit("    push rax\n");
-            gen_expr(nd.child2);
-            emit("    pop rcx\n");
-            emit("    add rcx, rax\n");
-            emit("    push rcx\n");
-            gen_expr(nd.child3);
-            emit("    pop rdi\n");
-            emit("    mov byte ptr [rdi], al\n");
-        }
+        emit("    push rax\n");
+        gen_expr(nd.child2);
+        emit("    pop rcx\n");
+        emit("    add rcx, rax\n");
+        emit("    push rcx\n");
+        gen_expr(nd.child3);
+        emit("    pop rdi\n");
+        emit("    mov byte ptr [rdi], al\n");
+    
         return;
     }
     // --- field assignment (k=31, e.field = value) ---
     if (k == 31) {
         gen_expr(nd.child1);  // base
-        if (raw_mode == 1) {
-            raw_byte(0x50);  // push rax
-            gen_expr(nd.child2);  // value
-            raw_byte(0x5F);  // pop rdi
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0x87);  // mov [rdi+disp32], rax
-            raw_int32(nd.ival);
-        } else {
-            emit("    push rax\n");
-            gen_expr(nd.child2);  // value
-            emit("    pop rdi\n");
-            emit("    mov [rdi + "); print_int(nd.ival); emit("], rax\n");
-        }
+        emit("    push rax\n");
+        gen_expr(nd.child2);  // value
+        emit("    pop rdi\n");
+        emit("    mov [rdi + "); print_int(nd.ival); emit("], rax\n");
+    
         return;
     }
     // --- expression statement (k=21) ---
@@ -2518,84 +1993,53 @@ void gen_stmt(int nd) {
         // increment by 1 in raw mode the next statement's .Lelse reuses
         // this statement's .Lend label id, producing jumps to the wrong
         // place.
-        if (raw_mode == 1) { label_count = label_count + 2; }
-        else { label_count = label_count + 1; }
+        label_count = label_count + 1;
         gen_expr(nd.child1);
-        if (raw_mode == 1) {
-            raw_byte(0x48); raw_byte(0x83); raw_byte(0xF8); raw_byte(0x00);  // cmp rax, 0
-            raw_je(l);  // je .Lelse
-            gen_stmt(nd.child2);
-            raw_jmp(l + 1);  // jmp .Lend
-            raw_label(l);    // .Lelse:
-            if (nd.child3 != 0) { gen_stmt(nd.child3); }
-            raw_label(l + 1); // .Lend:
-        } else {
-            emit("    cmp rax, 0\n");
-            emit("    je .Lelse"); print_int(l); emit("\n");
-            gen_stmt(nd.child2);
-            emit("    jmp .Lend"); print_int(l); emit("\n");
-            emit(".Lelse"); print_int(l); emit(":\n");
-            if (nd.child3 != 0) { gen_stmt(nd.child3); }
-            emit(".Lend"); print_int(l); emit(":\n");
-        }
+        emit("    cmp rax, 0\n");
+        emit("    je .Lelse"); print_int(l); emit("\n");
+        gen_stmt(nd.child2);
+        emit("    jmp .Lend"); print_int(l); emit("\n");
+        emit(".Lelse"); print_int(l); emit(":\n");
+        if (nd.child3 != 0) { gen_stmt(nd.child3); }
+        emit(".Lend"); print_int(l); emit(":\n");
+    
         return;
     }
     // --- while (k=19) ---
     if (k == 19) {
         l = label_count;
         // Same two-label issue as if/else above.
-        if (raw_mode == 1) { label_count = label_count + 2; }
-        else { label_count = label_count + 1; }
-        if (raw_mode == 1) {
-            raw_label(l);  // .Lstart:
-            gen_expr(nd.child1);
-            raw_byte(0x48); raw_byte(0x83); raw_byte(0xF8); raw_byte(0x00);  // cmp rax, 0
-            raw_je(l + 1);  // je .Lend
-            if (gen_loop_depth >= 64) { cerr(); }
-            store64(loop_labels + gen_loop_depth * 8, l);
-            gen_loop_depth = gen_loop_depth + 1;
-            gen_stmt(nd.child2);
-            gen_loop_depth = gen_loop_depth - 1;
-            raw_jmp(l);     // jmp .Lstart
-            raw_label(l + 1); // .Lend:
-        } else {
-            emit(".Lstart"); print_int(l); emit(":\n");
-            gen_expr(nd.child1);
-            emit("    cmp rax, 0\n");
-            emit("    je .Lend"); print_int(l); emit("\n");
-            if (gen_loop_depth >= 64) { cerr(); }
-            store64(loop_labels + gen_loop_depth * 8, l);
-            gen_loop_depth = gen_loop_depth + 1;
-            gen_stmt(nd.child2);
-            gen_loop_depth = gen_loop_depth - 1;
-            emit("    jmp .Lstart"); print_int(l); emit("\n");
-            emit(".Lend"); print_int(l); emit(":\n");
-        }
+        label_count = label_count + 1;
+        emit(".Lstart"); print_int(l); emit(":\n");
+        gen_expr(nd.child1);
+        emit("    cmp rax, 0\n");
+        emit("    je .Lend"); print_int(l); emit("\n");
+        if (gen_loop_depth >= 64) { cerr(); }
+        store64(loop_labels + gen_loop_depth * 8, l);
+        gen_loop_depth = gen_loop_depth + 1;
+        gen_stmt(nd.child2);
+        gen_loop_depth = gen_loop_depth - 1;
+        emit("    jmp .Lstart"); print_int(l); emit("\n");
+        emit(".Lend"); print_int(l); emit(":\n");
+    
         return;
     }
     // --- return (k=20) ---
     if (k == 20) {
         if (nd.child1 != 0) { gen_expr(nd.child1); }
-        if (raw_mode == 1) { raw_jmp(current_ret_label); }
-        else { emit("    jmp .Lret"); print_int(current_ret_label); emit("\n"); }
+        emit("    jmp .Lret"); print_int(current_ret_label); emit("\n");
         return;
     }
     // --- break (k=25) ---
     if (k == 25) {
-        if (raw_mode == 1) {
-            raw_jmp(load64(loop_labels + (gen_loop_depth - 1) * 8) + 1);
-        } else {
-            emit("    jmp .Lend"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
-        }
+        emit("    jmp .Lend"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
+    
         return;
     }
     // --- continue (k=26) ---
     if (k == 26) {
-        if (raw_mode == 1) {
-            raw_jmp(load64(loop_labels + (gen_loop_depth - 1) * 8));
-        } else {
-            emit("    jmp .Lstart"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
-        }
+        emit("    jmp .Lstart"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
+    
         return;
     }
     // --- block (k=22) ---
@@ -2614,53 +2058,6 @@ void gen_function(int f) {
     current_ret_label = label_count;
     label_count = label_count + 1;
 
-    if (raw_mode == 1) {
-        // Record this function's position for call patching.
-        raw_func_def(f.name);
-        // Prologue: push rbp; mov rbp, rsp; sub rsp, frame
-        raw_byte(0x55);  // push rbp
-        raw_byte(0x48); raw_byte(0x89); raw_byte(0xE5);  // mov rbp, rsp
-        if (frame > 0) {
-            raw_byte(0x48); raw_byte(0x81); raw_byte(0xEC);  // sub rsp, imm32
-            raw_int32(frame);
-        }
-        // Parameter shadowing: mov [rbp - (i+1)*8], arg_reg(i)
-        while (i < nparams) {
-            if (i < 6) {
-                // mov rax, arg_reg(i) then mov [rbp-off], rax
-                if (i == 0) { raw_byte(0x48); raw_byte(0x89); raw_byte(0xF8); }
-                else if (i == 1) { raw_byte(0x48); raw_byte(0x89); raw_byte(0xF0); }
-                else if (i == 2) { raw_byte(0x48); raw_byte(0x89); raw_byte(0xD0); }
-                else if (i == 3) { raw_byte(0x48); raw_byte(0x89); raw_byte(0xC8); }
-                // r8/r9 are the EXTENDED registers, so the REX prefix that
-                // reaches them differs from the four above: 0x4C sets REX.R
-                // (the reg field, i.e. the SOURCE of a 0x89 store), while 0x49
-                // sets REX.B (the rm field, the destination). Both encode to
-                // the same C0/C8 modrm byte, so getting it backwards assembles
-                // cleanly and silently -- these two lines used to emit
-                // `mov r8, rax` / `mov r9, rax`, writing rax INTO the argument
-                // register instead of reading it out. Parameters 5 and 6 came
-                // out holding parameter 4's value.
-                else if (i == 4) { raw_byte(0x4C); raw_byte(0x89); raw_byte(0xC0); }
-                else { raw_byte(0x4C); raw_byte(0x89); raw_byte(0xC8); }
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0x85);  // mov [rbp+disp32], rax
-                raw_int32(0 - (i + 1) * 8);
-            } else {
-                raw_byte(0x48); raw_byte(0x8B); raw_byte(0x85);  // mov rax, [rbp+disp32]
-                raw_int32(16 + (nparams - 1 - i) * 8);
-                raw_byte(0x48); raw_byte(0x89); raw_byte(0x85);  // mov [rbp+disp32], rax
-                raw_int32(0 - (i + 1) * 8);
-            }
-            i = i + 1;
-        }
-        gen_block(f.body);
-        // Epilogue.
-        raw_label(current_ret_label);
-        raw_byte(0x48); raw_byte(0x89); raw_byte(0xEC);  // mov rsp, rbp
-        raw_byte(0x5D);  // pop rbp
-        raw_byte(0xC3);  // ret
-        return;
-    }
 
     emit(f.name); emit(":\n");
     emit("    push rbp\n");
@@ -2728,19 +2125,14 @@ int main() {
     layout_names = alloc(256 * 8);
     layout_sizes = alloc(256 * 8);
 
-    // CLI: `coff input.c0 output.s` or `coff --raw input.c0 output.bin` or
-    // `coff --elf input.c0 output.elf`.
-    // With no arguments, stdin/stdout works (differential-test harness).
+    // CLI: `coff input.c0 output.s`, or `coff --elf input.c0 output.s` for
+    // the Moonshot ring-3 target (still assembly; smed makes the ELF).
+    // With no arguments, stdin/stdout works (differential-test harness),
+    // and `coff --elf` alone is the same with the Moonshot target.
     int cli_input = 1;
     int cli_output = 2;
-    if (argc() == 4) {
-        if (streq(argv(1), "--raw") == 1) {
-            raw_mode = 1;
-        } else if (streq(argv(1), "--elf") == 1) {
-            raw_mode = 1;
-            elf_mode = 1;
-        } else { cerr(); }
-        raw_init();
+    if (argc() == 4 || argc() == 2) {
+        if (streq(argv(1), "--elf") == 1) { elf_mode = 1; } else { cerr(); }
         cli_input = 2;
         cli_output = 3;
     } else if (argc() == 3) {
@@ -2767,10 +2159,9 @@ int main() {
         n = expand_len;
     } else {
         // 1048576 (1MB), not 65536 -- a real 65536-byte cap silently
-        // truncated the largest source file in my OS kernel (past 72000
-        // bytes and still growing, discovered when switching that build
-        // from coff0 to this self-hosted compiler) mid-file, producing a
-        // confusing
+        // truncated Moonshot's main kernel source (72329 bytes and growing,
+        // discovered when switching Moonshot's build over from coff0 to
+        // this self-hosted compiler) mid-file, producing a confusing
         // "PARSEERROR" with no hint the actual problem was "ran out of
         // buffer," not a real syntax issue. 1MB is generous headroom past
         // any c0 source file size on the horizon. coff0.c has no
@@ -2982,50 +2373,6 @@ int main() {
     }
 
     // Pass D: emit code.
-    if (raw_mode == 1) {
-        // Raw binary entry point (_start).
-        // Find main's name pointer by scanning the function list.
-        int main_name = 0;
-        int sf = fhead;
-        while (sf != 0) {
-            if (streq(sf.name, "main") == 1) {
-                main_name = sf.name;
-                break;
-            }
-            sf = sf.fnext;
-        }
-        if (main_name == 0) { cerr(); }
-        raw_call(main_name);  // call main (forward ref, patched later)
-        if (elf_mode == 1) {
-            // Moonshot SYS_EXIT: edi = exit code, eax = 0
-            raw_byte(0x89); raw_byte(0xC7);  // mov edi, eax
-            raw_byte(0xB8);                  // mov eax, imm32
-            raw_int32(0);                    // SYS_EXIT
-        } else {
-            // Linux exit_group: rdi = code, rax = 60
-            raw_byte(0x48); raw_byte(0x89); raw_byte(0xC7);  // mov rdi, rax
-            raw_byte(0x48); raw_byte(0xC7); raw_byte(0xC0);  // mov rax, 60
-            raw_int32(60);
-        }
-        raw_byte(0x0F); raw_byte(0x05);  // syscall
-
-        f = fhead;
-        while (f != 0) {
-            gen_function(f);
-            f = f.fnext;
-        }
-
-        // Resolve all forward references.
-        raw_patch_all();
-        // Write the ELF header (before the code) when targeting Moonshot.
-        if (elf_mode == 1) {
-            elf_emit_header();
-        }
-        // Write the binary.
-        raw_flush();
-        if (outfd != 1) { close(outfd); }
-        return 0;
-    }
 
     emit(".intel_syntax noprefix\n");
     emit(".global _start\n");
@@ -3033,7 +2380,11 @@ int main() {
     emit("    mov [.Largv0], rsp\n");
     emit("    call main\n");
     emit("    mov rdi, rax\n");
-    emit("    mov rax, 60\n");
+    if (elf_mode == 1) {
+        emit("    mov rax, 0\n");     // Moonshot SYS_EXIT with main's value
+    } else {
+        emit("    mov rax, 60\n");    // Linux exit
+    }
     emit("    syscall\n");
 
     f = fhead;
