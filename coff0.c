@@ -916,6 +916,10 @@ static const Builtin BUILTINS[] = {
   { "argc", 0 }, { "argv", 1 },
   { "outb", 2 }, { "inb", 1 },
   { "outw", 2 }, { "inw", 1 },
+  /* Moonshot ring-3 builtins, --elf only: each is one Moonshot syscall. */
+  { "win_info", 0 }, { "win_max", 0 }, { "fill", 5 }, { "blit", 5 },
+  { "key_poll", 0 }, { "ticks", 0 }, { "readfile", 3 }, { "present", 1 },
+  { "mouse_poll", 0 }, { "glyph", 2 },
 };
 #define NBUILTINS ((int)(sizeof(BUILTINS) / sizeof(BUILTINS[0])))
 
@@ -1226,6 +1230,28 @@ static const char *ARG_REGS[MAX_PARAMS] = { "rdi", "rsi", "rdx", "rcx", "r8", "r
 
 static FILE *out;
 static int label_count;
+/* --elf: target Moonshot's ring-3 ABI instead of Linux. Same backend; the
+ * entry stub and the builtins that reach the operating system emit
+ * Moonshot's syscall numbers. Mirrors elf_mode in coff.c0 so that
+ * `coff0 --elf` and `coff1 --elf` can be diffed like every other output --
+ * that diff is the ring-3 backend's oracle. */
+static int elf_mode = 0;
+
+static int is_moonshot_builtin(const char *name) {
+  return strcmp(name, "win_info") == 0 || strcmp(name, "win_max") == 0
+      || strcmp(name, "key_poll") == 0 || strcmp(name, "ticks") == 0
+      || strcmp(name, "present") == 0 || strcmp(name, "readfile") == 0
+      || strcmp(name, "blit") == 0 || strcmp(name, "fill") == 0
+      || strcmp(name, "mouse_poll") == 0 || strcmp(name, "glyph") == 0;
+}
+static int is_linux_only_builtin(const char *name) {
+  return strcmp(name, "argc") == 0 || strcmp(name, "argv") == 0
+      || strcmp(name, "write") == 0 || strcmp(name, "read") == 0
+      || strcmp(name, "open_read") == 0 || strcmp(name, "open_write") == 0
+      || strcmp(name, "close") == 0 || strcmp(name, "outb") == 0
+      || strcmp(name, "inb") == 0 || strcmp(name, "outw") == 0
+      || strcmp(name, "inw") == 0;
+}
 static int current_ret_label;
 
 #define MAX_LOOP_DEPTH 64
@@ -1276,10 +1302,26 @@ static void gen_expr(Node *n) {
         fprintf(out, "    inc rcx\n");
         fprintf(out, "    jmp .Lstrlen%d\n", l);
         fprintf(out, ".Lstrlend%d:\n", l);
-        fprintf(out, "    mov rdx, rcx\n");
-        fprintf(out, "    mov rsi, rbx\n");
-        fprintf(out, "    mov rdi, 1\n");
-        fprintf(out, "    mov rax, 1\n");
+        if (elf_mode) {
+          /* Moonshot SYS_DEBUG_PRINT(str, len) is 1. */
+          fprintf(out, "    mov rdi, rbx\n");
+          fprintf(out, "    mov rsi, rcx\n");
+          fprintf(out, "    mov rax, 1\n");
+          fprintf(out, "    syscall\n");
+        } else {
+          fprintf(out, "    mov rdx, rcx\n");
+          fprintf(out, "    mov rsi, rbx\n");
+          fprintf(out, "    mov rdi, 1\n");
+          fprintf(out, "    mov rax, 1\n");
+          fprintf(out, "    syscall\n");
+        }
+        return;
+      }
+      if (strcmp(n->name, "alloc") == 0 && elf_mode) {
+        /* SYS_ALLOC(n) (6): bump-allocate from the process's own heap. */
+        gen_expr(n->args);
+        fprintf(out, "    mov rdi, rax\n");
+        fprintf(out, "    mov rax, 6\n");
         fprintf(out, "    syscall\n");
         return;
       }
@@ -1322,8 +1364,46 @@ static void gen_expr(Node *n) {
       if (strcmp(n->name, "exit") == 0) {
         gen_expr(n->args);
         fprintf(out, "    mov rdi, rax\n");
-        fprintf(out, "    mov rax, 60\n");
+        if (elf_mode) fprintf(out, "    mov rax, 0\n");   /* Moonshot SYS_EXIT */
+        else          fprintf(out, "    mov rax, 60\n");  /* Linux exit */
         fprintf(out, "    syscall\n");
+        return;
+      }
+      /* Moonshot ring-3 builtins (--elf only). Arguments follow the SYSCALL
+       * ABI: rdi, rsi, rdx, r10, r8 -- r10 for the fourth, not rcx, because
+       * SYSCALL clobbers rcx with the return RIP. */
+      if (!elf_mode && is_moonshot_builtin(n->name)) error("'%s' exists only for the Moonshot target (--elf)", n->name);
+      if (elf_mode && is_linux_only_builtin(n->name)) error("'%s' has no meaning in ring 3 on Moonshot", n->name);
+      if (strcmp(n->name, "win_info") == 0) { fprintf(out, "    mov rax, 2\n    syscall\n"); return; }
+      if (strcmp(n->name, "win_max") == 0)  { fprintf(out, "    mov rax, 10\n    syscall\n"); return; }
+      if (strcmp(n->name, "key_poll") == 0) { fprintf(out, "    mov rax, 4\n    syscall\n"); return; }
+      if (strcmp(n->name, "ticks") == 0)    { fprintf(out, "    mov rax, 7\n    syscall\n"); return; }
+      if (strcmp(n->name, "mouse_poll") == 0) { fprintf(out, "    mov rax, 11\n    syscall\n"); return; }
+      if (strcmp(n->name, "glyph") == 0) {
+        /* SYS_GLYPH(ch, buf) (12): copies one character's font bitmap into
+         * the caller's memory and returns the cell size packed
+         * width * 65536 + height. buf == 0 returns the size only. */
+        for (Node *a = n->args; a; a = a->next) { gen_expr(a); fprintf(out, "    push rax\n"); }
+        fprintf(out, "    pop rsi\n    pop rdi\n");
+        fprintf(out, "    mov rax, 12\n    syscall\n");
+        return;
+      }
+      if (strcmp(n->name, "present") == 0) {
+        gen_expr(n->args);
+        fprintf(out, "    mov rdi, rax\n");
+        fprintf(out, "    mov rax, 9\n    syscall\n");
+        return;
+      }
+      if (strcmp(n->name, "readfile") == 0) {
+        for (Node *a = n->args; a; a = a->next) { gen_expr(a); fprintf(out, "    push rax\n"); }
+        fprintf(out, "    pop rdx\n    pop rsi\n    pop rdi\n");
+        fprintf(out, "    mov rax, 8\n    syscall\n");
+        return;
+      }
+      if (strcmp(n->name, "blit") == 0 || strcmp(n->name, "fill") == 0) {
+        for (Node *a = n->args; a; a = a->next) { gen_expr(a); fprintf(out, "    push rax\n"); }
+        fprintf(out, "    pop r8\n    pop r10\n    pop rdx\n    pop rsi\n    pop rdi\n");
+        fprintf(out, "    mov rax, %d\n    syscall\n", strcmp(n->name, "blit") == 0 ? 5 : 3);
         return;
       }
       if (strcmp(n->name, "load64") == 0) {
@@ -1991,8 +2071,13 @@ int main(int argc, char **argv) {
     dump_ast();
     return 0;
   }
+  if (argc == 4 && strcmp(argv[1], "--elf") == 0) {
+    elf_mode = 1;
+    argv++;
+    argc--;
+  }
   if (argc != 3) {
-    fprintf(stderr, "usage: coff0 <input.c0> <output.s>  |  coff0 -t <input.c0>\n");
+    fprintf(stderr, "usage: coff0 [--elf] <input.c0> <output.s>  |  coff0 -t <input.c0>\n");
     return 1;
   }
   src_name = argv[1];
@@ -2045,7 +2130,8 @@ int main(int argc, char **argv) {
   fprintf(out, "    mov [.Largv0], rsp\n");
   fprintf(out, "    call main\n");
   fprintf(out, "    mov rdi, rax\n");
-  fprintf(out, "    mov rax, 60\n");
+  if (elf_mode) fprintf(out, "    mov rax, 0\n");   /* Moonshot SYS_EXIT with main's value */
+  else          fprintf(out, "    mov rax, 60\n");  /* Linux exit */
   fprintf(out, "    syscall\n");
 
   for (Function *f = prog_functions; f; f = f->next) gen_function(f);

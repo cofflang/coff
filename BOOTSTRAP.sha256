@@ -1,21 +1,21 @@
 # coff bootstrap manifest -- regenerate with ./verify_bootstrap.sh --write-manifest
 # Recorded so that tampering with a committed binary shows up as a
 # text diff. See TRUST.md.
-date: 2026-09-16T16:36:49Z
+date: 2026-09-22T09:38:52Z
 seed CC: tcc (tcc version 0.9.28rc 2026-09-04 mob@0fb5430 (x86_64 Linux))
-gcc: gcc (GCC) 16.1.1 20260430
-as: GNU assembler (GNU Binutils) 2.46.0
-ld: GNU ld (GNU Binutils) 2.46.0
-diverse: gcc (GCC) 16.1.1 20260430
+gcc: gcc (GCC) 16.2.1 20260810
+as: GNU assembler (GNU Binutils) 2.47
+ld: GNU ld (GNU Binutils) 2.47
+diverse: gcc (GCC) 16.2.1 20260810
 
-df3878b292526bea244583bb706180ed0b72f5a616f2dfc90b3599dff2079ffe  coff0.c
-d49dde828b52389a986c5194666d0862b1d10096daf76cf6d28f0b5aa92b6988  c0/coff.c0
+5bad554a411c3ec680f91e4b0d65e29444a9e6d20228d1c07ad6f11d5b56fc25  coff0.c
+fde92be9387d3ac0547dba29fc9db7faab66d5e5290c4f70ea29d63e8efea47e  c0/coff.c0
 c0588ac10484611a2f7d715086c18cfc0d803d7ce5ab3c86e813c7e70e70871b  c0/lex.c0
 f76fba1bad24a75dacaf77e490823066cd74e9fff369b9db8d420c65a2d5e7f4  c0/parse.c0
-60ad4e8b7fdf52c7bdf10d4b3dcd0d8b4644c42714ce9c69720fd1a35498f718  c0/smed.c0
+fcb6167521902c2cedfbcec779dfba6fa375a2f63021da161ba317f9208fabab  c0/smed.c0
 d95741bcad322fbccf81d927178040f4f21e7a02cd3ceeb8356f2fb01a293a00  run_tests.sh
-29a73720613c1319e90d7412f885a796543b47b79e9fa5c834fa2c1178f32a8d  verify_bootstrap.sh
-014bdec4f33ead1acbdf6eaee780c2c1db41974dbb06276194ddbbe50ea107d8  smed_tests.sh
+620e2381ad8178c9108763ac53720ec8dee80140022bffa0f44f2abc47b6700d  verify_bootstrap.sh
+ce79247433c58531905f0ded9a7cfa565651ff1e8410442bfce3b0aeab5ffa0a  smed_tests.sh
 30013de6c526ff969a6a0ced3626c4b78e7c957279cfaaea552a154daf84c68a  tests/01_return_literal.c0
 05895081d550c7a61a54174317cfc5df3450e128e1cb5f082954afcbb5d7111e  tests/02_variable.c0
 b0fddfd3c026b1d1f1e7f571134c75ff8eb565e22cc8fe2da2d2fa8e57e7d0ed  tests/03_arithmetic_precedence.c0
