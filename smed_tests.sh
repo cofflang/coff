@@ -14,18 +14,16 @@
 # compiler. That only helps if smed itself is right, and an assembler that
 # is subtly wrong does not crash, it produces a program that computes the
 # wrong answer. So smed needs an oracle in the same way coff.c0 needs
-# coff0.c, and for now GNU as is that oracle: it is being removed from the
-# build, not from the test bench. Using the thing you are replacing to check
-# the replacement is the same trick coff0 plays, and it stops working the
-# day GNU as is uninstalled, which is fine, because by then the differential
-# corpus has been run thousands of times.
+# coff0.c, and GNU as is that oracle. It is removed from the build, not
+# from the test bench. Using the thing you are replacing to check the
+# replacement is the same trick coff0 plays.
 #
-# Four checks, in order of how much they prove:
+# Five checks, in order of how much they prove.
 #
 #   1. Differential corpus. Every c0 source in the tree is compiled to
 #      assembly, then assembled twice, once by as+ld and once by smed. The
 #      two binaries must agree on exit code and on stdout. This is the check
-#      that catches encoding bugs, and it does catch them: flipping the
+#      that catches encoding bugs, and it does catch them. Flipping the
 #      direction bit of one sub opcode (0x29 to 0x2B, same length, same
 #      operands, silently wrong answer) makes 13 programs diverge.
 #
@@ -42,22 +40,20 @@
 #      program exercises, so the corpus above says nothing about lgdt,
 #      iretq, control registers or the far jump into long mode. The kernel
 #      is built twice from the very same sources, once by as+ld and once by
-#      smed, and the two are compared where they can be. The linker half:
-#      the fixed hand-off slots, the multiboot header, the entry point and
-#      every linker-script symbol must land at the same addresses. The
-#      assembler half: the hand-written code must disassemble to the same
-#      instruction sequence. Bytes are not compared, because the encodings
+#      smed, and the two are compared where they can be. For the linker
+#      half, the start of the image, the multiboot header and the entry
+#      point must land at the same addresses and the linker-script symbols
+#      at the same distances. For the assembler half, the hand-written code
+#      must disassemble to the same instruction sequence. Bytes are not compared, because the encodings
 #      differ by design -- smed never picks a short form. Only addresses
-#      are normalised, and nothing else is: small immediates such as the
+#      are normalised, and nothing else is. Small immediates such as the
 #      far jump's selector, MSR bits and shift counts have to match
-#      exactly, because an earlier normalisation that erased every
-#      immediate let a wrong selector through. Whether the kernel then
-#      boots is its own test suite's job; six deliberate encoding mutations
-#      were each caught there when this check was written (2026-09-17).
+#      exactly, because a normalisation that erased every immediate would
+#      let a wrong selector through. Whether the kernel then boots is its
+#      own test suite's job.
 #
 # Every program is run under `timeout` because the failure mode of a bad
-# assembler is frequently an infinite loop rather than a crash, which hung
-# this script the first time it was written.
+# assembler is frequently an infinite loop rather than a crash.
 
 set -u
 cd "$(dirname "$0")"
@@ -79,7 +75,7 @@ $COFF c0/smed.c0 "$tmp/smed.s" || { echo "smed.c0 failed to compile"; exit 1; }
 
 # The very first smed has to come from somewhere, and that somewhere is
 # still as+ld. This is the same one-time bootstrap coff0 provides for coff1,
-# and it is bounded the same way: everything after this line can be done by
+# and it is bounded the same way. Everything after this line can be done by
 # smed alone, and check 3 below proves the bootstrapped smed and a
 # smed-built smed behave identically.
 if [ -x ./smed ]; then
@@ -172,12 +168,12 @@ else
   bad "no smed-built compiler to test with"
 fi
 
+echo ""
 echo "5. The kernel: as+ld and smed agree on layout and on boot.s's instructions"
 K=../moonshot
 if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] && [ -x "$K/build.sh" ]; then
-  # The kernel's own C-like source is compiled fresh here, the way its
-  # build script does it, rather than trusting whatever assembly is lying
-  # in the tree.
+  # kmain.s is coff's output for the kernel; regenerate it the way build.sh
+  # does rather than trusting whatever is lying in the tree.
   if "$COFF" "$K/kmain.c0" "$tmp/kmain.s" 2>/dev/null; then
     sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global kernel_post_init\n.global sched_start\n.global sys_dispatch' "$tmp/kmain.s"
     kfail=0
@@ -190,11 +186,10 @@ if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] &
         || { bad "smed rejected the kernel: $(cat "$tmp/e")"; kfail=1; }
     fi
     if [ "$kfail" -eq 0 ]; then
-      # Linker half. Everything before .text is fixed by the linker
-      # script and
+      # Linker half. Everything before .text is fixed by the script and
       # must sit at identical addresses; everything after .text shifts,
       # because smed's wide encodings make .text longer, so there the
-      # comparison is of distances: between the script's reservations
+      # comparison is of distances, between the script's reservations
       # (their sizes), between boot.s's .bss objects (their sizes and
       # .balign padding), and within .data. Alignment is checked on smed's
       # image directly, since ld's is not the point.
@@ -202,11 +197,20 @@ if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] &
       gsym() { nm "$tmp/k_gnu" | awk -v s="$1" '$3==s{print "0x" $1; exit}'; }
       ssym() { awk -v s="$1" '$2==s{print "0x" $1; exit}' "$tmp/k.map"; }
       [ "$(gsym _boot_start)" = "$(ssym _boot_start)" ] || { echo "  _boot_start: as+ld $(gsym _boot_start), smed $(ssym _boot_start)"; lfail=1; }
-      for pair in kscratch_start:idt_start idt_start:dispatch_start dispatch_start:_kernel_end \
+      for pair in serial_scratch:punkt_scratch punkt_scratch:kakel_scratch \
+                  kakel_scratch:skrift_scratch skrift_scratch:jakel_name_scratch \
+                  jakel_name_scratch:jakel_path_scratch jakel_path_scratch:repl_scratch \
+                  repl_scratch:shell_scratch shell_scratch:shell_users shell_users:elf_scratch \
+                  elf_scratch:idt_start idt_start:dispatch_start dispatch_start:_kernel_end \
                   p4_table:p3_table p3_table:p2_table p2_table:stack_bottom stack_bottom:stack_top \
                   stack_top:tss64 tss64:df_stack_bottom df_stack_bottom:df_stack_top \
                   gdt64:gdt64_tss gdt64_tss:gdt64_end gdt64_end:gdt64_pointer; do
         x=${pair%%:*}; y=${pair##*:}
+        # A symbol that is gone is a failure, not an arithmetic error, or
+        # the loop would die on it and the script still report 0 failed.
+        if [ -z "$(gsym "$x")" ] || [ -z "$(gsym "$y")" ] || [ -z "$(ssym "$x")" ] || [ -z "$(ssym "$y")" ]; then
+          echo "  $x or $y is missing from one of the kernels"; lfail=1; continue
+        fi
         dg=$(( $(gsym "$y") - $(gsym "$x") )); ds=$(( $(ssym "$y") - $(ssym "$x") ))
         [ "$dg" -eq "$ds" ] || { echo "  $y - $x: as+ld $dg, smed $ds"; lfail=1; }
       done
@@ -227,7 +231,7 @@ if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] &
         && cmp -s "$tmp/mb_gnu" "$tmp/mb_smed" || { echo "  multiboot header differs or moved"; lfail=1; }
       if [ "$lfail" -eq 0 ]; then ok "kernel layout: entry, multiboot header, reservation sizes and alignments agree"; else bad "kernel layout differs between as+ld and smed"; fi
 
-      # Assembler half: the hand-written code, disassembled from both
+      # Assembler half. The hand-written code, disassembled from both
       # images and compared as instruction sequences. boot.s's 32-bit
       # entry runs up to long_mode_start; its 64-bit part up to _start
       # (where coff's code begins); ring3_handlers.s is .ring3_text.
@@ -252,7 +256,7 @@ if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] &
       dis "$tmp/k_gnu"  "$gadj" "$(gsym long_mode_start)" "$(gsym _start)" i386:x86-64 > "$tmp/d64_gnu"
       dis "$tmp/k_smed" "$sadj" "$(ssym long_mode_start)" "$(ssym _start)" i386:x86-64 > "$tmp/d64_smed"
       cmp -s "$tmp/d64_gnu" "$tmp/d64_smed" || { echo "  64-bit boot code differs:"; diff "$tmp/d64_gnu" "$tmp/d64_smed" | head -10; afail=1; }
-      # ring3_handlers.s: from syscall_entry to the end of enter_ring3's
+      # ring3_handlers.s runs from syscall_entry to the end of enter_ring3's
       # iretq. The end is not a symbol, so both are cut at the first iretq
       # after enter_ring3 by disassembling generously and trimming.
       dis "$tmp/k_gnu"  "$gadj" "$(gsym syscall_entry)" "$(printf '0x%x' $(($(gsym syscall_entry) + 512)))" i386:x86-64 | awk '{print} /^iretq/{exit}' > "$tmp/r3_gnu"

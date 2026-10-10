@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/90_extern_builtin.c0 - an extern may not take a builtin name
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+extern int print;
+int main() { return 0; }

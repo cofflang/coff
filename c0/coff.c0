@@ -14,35 +14,35 @@
 // received a copy of the license along with coff; if not, see
 // <https://www.gnu.org/licenses/>.
 
-// Purpose: this file IS the compiler. Lexer, parser, resolver and code
-// generator in one file; the binary built from it is called coff1.
-// Called as `coff1 input.c0 output.s` it reads and writes real files;
-// with no arguments it reads stdin and writes stdout (the form the
-// differential test harness uses).
+// This file IS the compiler. Lexer, parser, resolver and code generator
+// in one file; the binary built from it is called coff1. Called as
+// `coff1 [--elf] [-I dir]... input.c0 output.s` it reads and writes real
+// files; with no file arguments it reads stdin and writes stdout (the form
+// the differential test harness uses).
 //
 // The output is byte-for-byte identical to what coff0 produces for the
-// same input. On any lex, parse or resolve error it prints an error
-// sentinel and exits 1, same rule as coff0: nothing is emitted until
-// the whole program is known to be valid.
+// same input, and so are the error messages. On any lex, parse or resolve
+// error it prints the same message coff0 would and exits 1, same rule as
+// coff0, so nothing is emitted until the whole program is known to be
+// valid.
 //
-// Verified as a real bootstrap fixpoint: coff0 compiling coff.c0
-// (stage 1) and coff.c0 compiling itself (stage 2) produce identical
-// assembly, and stage 2 compiling coff.c0 again (stage 3) matches
-// stage 2. See the fixpoint checks in run_tests.sh.
-// Token record: 32 bytes — 0 kind, 8 ival, 16 name ptr, 24 len. Same as
-// parse.c0.
-// Token kinds: 1 NUM, 2 IDENT, 3 STR, 4 PLUS, 5 MINUS, 6 STAR, 7 SLASH,
+// coff0 compiling coff.c0 (stage 1) and coff.c0 compiling itself (stage
+// 2) produce identical assembly, and stage 2 compiling coff.c0 again
+// (stage 3) matches stage 2, which makes it a real bootstrap fixpoint. See
+// the fixpoint checks in run_tests.sh.
+//
+// The records the compiler works with (Token, Node, Function, Global,
+// Layout and the rest) are declared as `layout` blocks below, so the
+// feature is exercised by the compiler that implements it.
+// Token kinds are 1 NUM, 2 IDENT, 3 STR, 4 PLUS, 5 MINUS, 6 STAR, 7 SLASH,
 //   8 ASSIGN, 9 EQ, 10 NE, 11 LT, 12 LE, 13 GT, 14 GE, 15 LPAREN,
 //   16 RPAREN, 17 LBRACE, 18 RBRACE, 19 SEMI, 20 COMMA, 21 INT, 22 IF,
 //   23 ELSE, 24 WHILE, 25 RETURN, 26 EOF, 27 AND, 28 OR, 29 BREAK, 30 CONTINUE,
-//   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN.
+//   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN, 35 DOT, 36 LAYOUT,
+//   37 SIZEOF, 38 PERCENT, 39 AMP, 40 PIPE, 41 CARET, 42 TILDE, 43 SHL,
+//   44 SHR.
 //
-// AST node: 72 bytes (parse.c0's 64-byte record plus one more slot) —
-//   0 kind, 8 ival, 16 name/str ptr, 24 str len,
-//   32 child1 (lhs/cond/args/body), 40 child2 (rhs/then), 48 child3 (else),
-//   56 next sibling, 64 extra (VAR/ASSIGN: is_global flag; STR: string
-//   table index, assigned at parse time so numbering matches coff0's).
-// Node kinds: same numbering as parse.c0 (1 NUM .. 22 BLOCK), plus
+// Node kinds use the same numbering as parse.c0 (1 NUM .. 22 BLOCK), plus
 //   23 AND, 24 OR (both short-circuiting; precedence between equality and
 //   the statement grammar, || loosest of the two), 25 BREAK, 26 CONTINUE
 //   (both only valid inside a while loop — resolve() enforces this),
@@ -50,74 +50,86 @@
 //   28 INDEXASSIGN (child1=base, child2=index, child3=value),
 //   29 FUNCREF (a VAR node (kind 3) whose name turned out to be a declared
 //   function rather than a variable/global -- resolve() rewrites its kind
-//   in place; evaluates to the function's address via `lea`). The extra
-//   field (offset 64) is also reused for CALL nodes (kind 6): 1 means this
-//   call's `name` is a variable holding a function-reference value rather
-//   than a declared function, so gen_call must call *through* its value
-//   instead of calling `name` directly (indirect call).
+//   in place; evaluates to the function's address via `lea`). A CALL node
+//   (kind 6) uses its `extra` field to say whether `name` is a variable
+//   holding a function-reference value rather than a declared function, so
+//   gen_call must call *through* its value instead of calling `name`
+//   directly (indirect call). 30 FIELD, 31 FIELDASSIGN and 32 SIZEOF are
+//   as in parse.c0, and 33 MOD is child1 % child2, same shape as DIV.
+//   34 BITAND, 35 BITOR, 36 BITXOR, 37 SHL and 38 SHR are binary like DIV,
+//   39 BITNOT is unary like NEG.
 //
-// Function record: 104 bytes (parse.c0's 96-byte record plus stack_size) —
-//   0 name, 8 nparams, 16+8i param names for the first 6 (register-passed),
-//   64 body, 72 next, 80 stack_size (filled in by resolve_function),
-//   88 is_void (1 if declared "void" instead of "int" -- may not return a
-//   value), 96 extra_params (head of a linked list for the 7th param
-//   onward, stack-passed; max 16 total params). Extra-param node: 16
-//   bytes — 0 name, 8 next.
-// Global record: 24 bytes — 0 name, 8 init, 16 next. Same as parse.c0.
-//
-// Layout/LayoutField records are declared as real `layout` blocks below,
-// not hand-offset comments like the records above -- dogfooding the
-// feature itself into the compiler that implements it, same as every
-// other feature has been dogfooded back in once landed and verified. The
-// field order (name, next, fields) is deliberate, not alphabetical: both
-// layouts declare `name` first and `next` second, so the two agree on
-// `next`'s position (offset 8) despite Layout having a third field
-// LayoutField does not -- the shared-field-offset-table rule (see
+// The field order of Layout and LayoutField (name, next, ...) is
+// deliberate, not alphabetical. Both declare `name` first and `next`
+// second, so the two agree on `next`'s position (offset 8) although their
+// later fields differ -- the shared-field-offset-table rule (see
 // field_declare_or_check below) would otherwise reject two record shapes
 // that disagree on where their own `next` pointer lives.
 
 layout LayoutField {
     int name;
     int next;
+    int lffile;
+    int lfline;
 }
 
 layout Layout {
     int name;
     int next;
     int fields;
+    int lfile;
+    int lline;
 }
 
 // Token's third field is named `sval` rather than `name` -- it holds an
 // identifier's text or a decoded string literal's bytes, a different role
 // than Layout/LayoutField/Global/Function's own first-field `name`, which
 // already claims offset 0 in the shared field table. `kind`/`ival`/`len`
-// were free (no earlier layout used them).
+// are used by no other layout at a different offset.
 layout Token {
     int kind;
     int ival;
     int sval;
     int len;
+    int tfile;  // where the token starts, mapped back through include
+    int tline;  // expansion (see loc_at)
 }
 
-// `next` comes before `init` (not the source order name/init/next you'd
+// `next` comes before `init` (not the order name/init/next one would
 // naively expect) so it lands at offset 8, matching Layout/LayoutField's
 // own `next` -- same field-table-conflict reasoning as those two.
 layout Global {
     int name;
     int next;
     int init;
+    int gfile;  // the name's location, for error messages
+    int gline;
+    int gtype;  // the layout it was declared with (`Point origin;`), or 0 for int
+    int gembed; // name_size of the n-th embed, as n + 1; 0 for an ordinary global
 }
 
-// The inline 6-slot register-param array (originally offset 16, indexed at
-// runtime as f+16+i*8 by param_name_at) has no field names of its own --
-// `layout` has no notion of an array-shaped field, so it cannot be declared
-// here. Reordered to put it LAST (p0..p5) instead of in its original
-// middle position, so every other field can get a real name without
-// leaving an unrepresentable gap; param_name_at's own i<6 case now reads
-// from a fixed base of 56 instead of 16. `fnext` (not `next`) since
-// Function's own list-link naturally falls at offset 24 here, not 8 --
-// forcing it to 8 would mean moving `nparams` (read far more often) out
-// of its natural early position for no real benefit.
+// `embed name "file";` -- mirrors coff0.c's Embed, the file's bytes as data
+// (.incbin), `name` their address, `name_size` their length worked out by
+// the assembler. The compiler never opens the file.
+layout Embed {
+    int name;
+    int epath;      // as written
+    int eresolved;  // joined with the source file's directory
+    int enext;
+    int efile;
+    int eline;
+}
+
+int embhead = 0;
+int embtail = 0;
+
+// The inline 6-slot register-param array is indexed at runtime by
+// param_name_at, and `layout` has no notion of an array-shaped field, so
+// it is spelled out as p0..p5 and read as f+56+i*8. It comes after every
+// field that is read by name. `fnext` (not `next`) since Function's own
+// list-link falls at offset 24 here, not 8 -- forcing it to 8 would mean
+// moving `nparams` (read far more often) out of its natural early position
+// for no real benefit.
 layout Function {
     int name;
     int nparams;
@@ -132,6 +144,9 @@ layout Function {
     int p3;
     int p4;
     int p5;
+    int ffile;  // the name's location, for error messages
+    int fline;
+    int ptypes; // alloc'd 16 * 8, each parameter's layout type, or 0 for int
 }
 
 // The 7th-parameter-onward linked list. Same (name, next) shape as
@@ -144,16 +159,16 @@ layout ExtraParam {
 
 // AST node. `sval`/`len` match Token's own field names (offsets 16/24) on
 // purpose -- both hold "an identifier's or string's text/length," the
-// same role in both records, so there was no reason to invent different
-// names once Token had already claimed them. `child1`/`child2`/`child3`
+// same role in both records, so there is no reason to invent different
+// names for them. `child1`/`child2`/`child3`
 // stay generic (not `lhs`/`rhs`/`cond`/`then`) because a single flat node
 // shape serves every node kind -- child1 means lhs for a binary op, cond
 // for an if, the args-list head for a call, depending on `kind`; a more
 // "specific"-looking name would be accurate for some kinds and misleading
 // for others. `sibling` (not `next`) since offset 56 does not match
-// Layout/LayoutField/Global's `next`=8. `extra` is reused per-kind, same
-// as before (VAR/ASSIGN is_global flag, STR string-table index, CALL's
-// direct/indirect-call marker).
+// Layout/LayoutField/Global's `next`=8. `extra` is reused per-kind (VAR/ASSIGN
+// is_global flag, STR string-table index assigned at parse time so the
+// numbering matches coff0's, CALL's direct/indirect-call marker).
 layout Node {
     int kind;
     int ival;
@@ -164,10 +179,17 @@ layout Node {
     int child3;
     int sibling;
     int extra;
+    int nfile;  // where the node came from, for error messages
+    int nline;
 }
+
+// Field names are one namespace across every layout and a name keeps one
+// offset everywhere, which is why each record above spells its location
+// fields differently (tfile, ffile, gfile ...) instead of sharing `file`.
 
 int toks = 0;
 int tpos = 0;
+int src_name = 0; // the input path, for diagnostics; set in main()
 
 int fhead = 0;
 int ghead = 0;
@@ -178,6 +200,7 @@ int ltail = 0;
 
 int sym_names = 0;
 int sym_offsets = 0;
+int sym_types = 0;   // alloc'd 4096 * 8, a variable's layout type, or 0 for int
 int sym_count = 0;
 int stack_size = 0;
 int loop_depth = 0;
@@ -198,23 +221,17 @@ int gen_loop_depth = 0;
 
 int outfd = 1;
 
-// --- --elf: the Moonshot ring-3 target -------------------------------------
-// The same assembly backend, aimed at Moonshot instead of Linux: the entry
+// --- --elf, the Moonshot ring-3 target -------------------------------------
+// The same assembly backend, aimed at Moonshot instead of Linux. The entry
 // stub and the builtins that reach the operating system (print, exit,
 // alloc, and the ring-3 syscalls win_info/fill/...) emit Moonshot's syscall
 // numbers, everything else is identical. smed assembles the result into the
-// ELF image Moonshot loads and runs (`smed --base 0x80000000`).
+// ELF image Moonshot loads into ring 3 (`smed --base 0x80000000`).
 //
-// Until 2026-09-17 --elf selected a second backend that wrote machine code
-// directly, byte by byte, with its own label patching, call patching,
-// inline string placement and ELF writer, and no globals, no function
-// pointers, no seventh argument. Every one of those hand-encoded
-// instructions was outside the differential test suite (coff0.c only ever
-// had the text backend) and three silent wrong-code bugs were found in it
-// by eye. It is gone: ring-3 programs now go through the one backend that
-// is checked against coff0.c on every test run, and through smed, which is
-// checked against GNU as. What is left of the mode is a handful of emit()
-// lines that differ in a syscall number.
+// There is deliberately no second backend for this. Ring-3 programs go
+// through the one backend that is checked against coff0.c on every test
+// run, and through smed, which is checked against GNU as. The mode is a
+// handful of emit() lines that differ in a syscall number.
 int elf_mode = 0;
 
 // Include-expansion state -- see the "includes" section below (right
@@ -237,8 +254,8 @@ int strlen_(int s) {
 
 // All generated-assembly output goes through emit() rather than the print()
 // builtin, since print() always targets stdout — emit() targets outfd, which
-// main() points at the -o file when one is given (see the CLI handling at
-// the top of main), or stdout otherwise.
+// main() points at the output file when one is given (see the CLI handling
+// at the top of main), or stdout otherwise.
 void emit(int s) {
     write(outfd, s, strlen_(s));
     return;
@@ -282,7 +299,7 @@ void print_int(int v) {
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
         i = i - 1;
-        tmp[i] = '0' + (v - (v / 10) * 10);
+        tmp[i] = '0' + (v % 10);
         v = v / 10;
     }
     if (neg == 1) { i = i - 1; tmp[i] = '-'; }
@@ -337,8 +354,17 @@ int streq(int a, int b) {
 // before real lexing starts -- mirrors coff0.c's resolve_includes exactly
 // (differentially verified against it, and against lex.c0/parse.c0's own
 // identical mirrors), see coff0.c for the full design rationale. This is
-// the load-bearing copy: coff.c0 is what coff1 actually is, the compiler
-// Moonshot is built with.
+// the copy that matters most, since coff.c0 is what coff1 is.
+
+// -I directories, each with a trailing slash so join_path can use it like an
+// including file's own directory. An include is looked for next to the file
+// that includes it first, and only when it is not there, in these, in order.
+// That is what lets programs in different directories (and in different
+// places in the dev and release trees) share one library by name. Mirrors
+// coff0.c's inc_dirs.
+int MAX_INC_DIRS = 8;
+int inc_dirs = 0;
+int n_inc_dirs = 0;
 
 // Directory portion of `path` (a null-terminated string), trailing slash
 // included so callers can concatenate directly, or a fresh empty string
@@ -377,8 +403,12 @@ int join_path(int dir, int rel) {
 
 void expand_putc(int c) {
     if (expand_len >= EXPAND_CAP) {
-        print("PARSEERROR\n");
-        exit(1);
+        // coff0 has no such cap (it grows its buffer), so this message is
+        // coff1's own.
+        eput("include: source with includes expanded is over ");
+        eput_int(EXPAND_CAP);
+        eput(" bytes");
+        efail();
     }
     store8(expand_buf + expand_len, c);
     expand_len = expand_len + 1;
@@ -392,43 +422,50 @@ void expand_putc(int c) {
 // result into the shared expand_buf/expand_len globals. include_stack/
 // include_depth guard against a file including itself, directly or
 // transitively. Char literals get the SAME verbatim-copy treatment as
-// strings deliberately, not as an afterthought: without it, a literal
-// like '"' makes the scanner wrongly enter STRING mode at that bare `"`
-// instead, scanning forward to whatever `"` happens to appear next in the
-// file -- a real bug found building lex.c0's identical mirror of this
-// function (which itself contains `!= '"'`).
+// strings deliberately. Without it, a literal like '"' makes the scanner
+// wrongly enter STRING mode at that bare `"` instead, scanning forward to
+// whatever `"` happens to appear next in the file (this function itself
+// contains `!= '"'`).
+
+// Reads everything fd has into a buffer that doubles whenever it fills, and
+// leaves the length in read_all_len. A fixed buffer would silently cut off
+// a large source file, and coff0.c reads into a growing buffer, so this
+// does too and the two compilers agree on any file.
+int read_all_len = 0;
+int read_all(int fd) {
+    int cap = 1048576;
+    int buf = alloc(cap);
+    int n = 0;
+    int got = read(fd, buf, cap);
+    while (got > 0) {
+        n = n + got;
+        if (n == cap) {
+            int bigger = alloc(cap * 2);
+            int k = 0;
+            while (k < n) { store64(bigger + k, load64(buf + k)); k = k + 8; }
+            buf = bigger;
+            cap = cap * 2;
+        }
+        got = read(fd, buf + n, cap - n);
+    }
+    read_all_len = n;
+    return buf;
+}
+
 void expand_file(int path) {
     int i = 0;
-    while (i < include_depth) {
-        if (streq(load64(include_stack + i * 8), path) == 1) {
-            print("PARSEERROR\n");
-            exit(1);
-        }
-        i = i + 1;
-    }
-    if (include_depth >= INCLUDE_MAX_DEPTH) {
-        print("PARSEERROR\n");
-        exit(1);
-    }
     store64(include_stack + include_depth * 8, path);
     include_depth = include_depth + 1;
 
     int fd = open_read(path);
-    if (fd < 0) {
-        print("PARSEERROR\n");
-        exit(1);
-    }
-    int src = alloc(1048576);
-    int n = 0;
-    int got = read(fd, src, 1048576);
-    while (got > 0) {
-        n = n + got;
-        got = read(fd, src + n, 1048576 - n);
-    }
+    if (fd < 0) { die_open(path, fd); }
+    int src = read_all(fd);
+    int n = read_all_len;
     close(fd);
 
     int dir = dirname_with_slash(path);
     int p = 0;
+    add_seg(expand_len, path, 1);
     while (p < n) {
         int c = load8(src + p);
         if (c == '"') {
@@ -479,23 +516,59 @@ void expand_file(int path) {
             }
             int wlen = p - start;
             if (wlen == 7 && word_is(src, start, 7, "include") == 1) {
+                // Every problem with a directive is reported at the directive.
+                err_file = path;
+                err_line = line_in(src, src + start);
                 int q = p;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
                     q = q + 1;
                 }
-                if (q >= n || load8(src + q) != '"') { print("PARSEERROR\n"); exit(1); }
+                if (q >= n || load8(src + q) != '"') { die("include: expected a string after 'include'"); }
                 q = q + 1;
                 int pstart = q;
                 while (q < n && load8(src + q) != '"') { q = q + 1; }
-                if (q >= n) { print("PARSEERROR\n"); exit(1); }
+                if (q >= n) { die("include: unterminated path string"); }
                 int rel = copy_bytes(src, pstart, q - pstart);
                 q = q + 1;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
                     q = q + 1;
                 }
-                if (q >= n || load8(src + q) != ';') { print("PARSEERROR\n"); exit(1); }
+                if (q >= n || load8(src + q) != ';') { die("include: expected ';' after the include path"); }
                 q = q + 1;
-                expand_file(join_path(dir, rel));
+                int inc_path = join_path(dir, rel);
+                // Not next to the including file, so try each -I directory
+                // in order (see inc_dirs).
+                int found = open_read(inc_path);
+                if (found >= 0) { close(found); }
+                if (found < 0 && load8(rel) != '/') {
+                    int k = 0;
+                    while (k < n_inc_dirs) {
+                        int cand = join_path(load64(inc_dirs + k * 8), rel);
+                        int fd = open_read(cand);
+                        if (fd >= 0) { close(fd); inc_path = cand; k = n_inc_dirs; }
+                        k = k + 1;
+                    }
+                }
+                i = 0;
+                while (i < include_depth) {
+                    if (streq(load64(include_stack + i * 8), inc_path) == 1) {
+                        die3("include: circular include of ", inc_path, "");
+                    }
+                    i = i + 1;
+                }
+                if (include_depth >= INCLUDE_MAX_DEPTH) {
+                    eopen();
+                    eput("include: nested more than ");
+                    eput_int(INCLUDE_MAX_DEPTH);
+                    eput(" files deep");
+                    efail();
+                }
+                int probe = open_read(inc_path);
+                if (probe < 0) { die3("include: cannot open ", inc_path, ""); }
+                close(probe);
+                expand_file(inc_path);
+                // back in this file, at the line the directive ended on
+                add_seg(expand_len, path, line_in(src, src + q));
                 p = q;
             } else {
                 int k = start;
@@ -514,17 +587,169 @@ void expand_file(int path) {
     return;
 }
 
-void perr() {
-    print("PARSEERROR\n");
+// --- diagnostics
+//
+// Every error coff1 can report says the same thing coff0 says for the same
+// input, in the same shape (`coff1: <file>: <message>` on stderr, exit 1).
+// run_tests.sh diffs the two compilers' messages over every compile-error
+// test. Messages are built from pieces because c0 has no printf. eopen()
+// writes the prefix, eput()/eput_int()/eput_char() add to the line and
+// efail() ends it and exits. die()/die3() cover the common shapes.
+
+void eput(int s) {
+    write(2, s, strlen_(s));
+    return;
+}
+
+void eput_int(int v) {
+    int tmp = alloc(32);
+    int neg = 0;
+    int i = 31;
+    if (v == 0) { eput("0"); return; }
+    if (v < 0) { neg = 1; v = 0 - v; }
+    while (v > 0) {
+        i = i - 1;
+        tmp[i] = '0' + (v % 10);
+        v = v / 10;
+    }
+    if (neg == 1) { i = i - 1; tmp[i] = '-'; }
+    eput(tmp + i);
+    return;
+}
+
+void eput_char(int c) {
+    int b = alloc(1);
+    store8(b, c);
+    write(2, b, 1);
+    return;
+}
+
+// Where the next error points, kept current by every phase exactly as in
+// coff0.c. The lexer sets it at each token's start, the parser at the last token
+// read, resolve and codegen at their node, the declaration checks at the
+// declaration's name. Line 0 means the whole file.
+int err_file = 0;
+int err_line = 0;
+
+void eopen() {
+    eput("coff1: ");
+    if (err_line > 0) {
+        eput(err_file);
+        eput(":");
+        eput_int(err_line);
+    } else {
+        eput(src_name);
+    }
+    eput(": ");
+    return;
+}
+
+// Include expansion flattens every file into one buffer. The expander
+// records a segment (buffer offset, file, line) each time it starts copying
+// from a file, and loc_at() walks them forward to turn a buffer offset back
+// into a file and line. Same scheme as coff0.c's add_seg/loc_at.
+int SEG_CAP = 4096;
+int seg_off = 0;
+int seg_file = 0;
+int seg_line = 0;
+int nseg = 0;
+int loc_seg = 0;
+int loc_off = 0;
+int loc_line = 1;
+
+void add_seg(int off, int file, int line) {
+    if (seg_off == 0) {
+        seg_off = alloc(SEG_CAP * 8);
+        seg_file = alloc(SEG_CAP * 8);
+        seg_line = alloc(SEG_CAP * 8);
+    }
+    if (nseg >= SEG_CAP) { die("too many include segments (max 4096)"); }
+    store64(seg_off + nseg * 8, off);
+    store64(seg_file + nseg * 8, file);
+    store64(seg_line + nseg * 8, line);
+    nseg = nseg + 1;
+    return;
+}
+
+// Moves the cursor to byte `off` of buf and leaves the answer in
+// err_file/err_line. Offsets only ever increase, as the lexer moves forward.
+void loc_at(int buf, int off) {
+    while (loc_seg + 1 < nseg && load64(seg_off + (loc_seg + 1) * 8) <= off) {
+        loc_seg = loc_seg + 1;
+        loc_off = load64(seg_off + loc_seg * 8);
+        loc_line = load64(seg_line + loc_seg * 8);
+    }
+    while (loc_off < off) {
+        if (load8(buf + loc_off) == '\n') { loc_line = loc_line + 1; }
+        loc_off = loc_off + 1;
+    }
+    err_file = load64(seg_file + loc_seg * 8);
+    err_line = loc_line;
+    return;
+}
+
+// The line `at` is on, counting from `src`.
+int line_in(int src, int at) {
+    int line = 1;
+    int c = src;
+    while (c < at) {
+        if (load8(c) == '\n') { line = line + 1; }
+        c = c + 1;
+    }
+    return line;
+}
+
+// Points the next error at the last token the parser read.
+void at_prev() {
+    int i = 0;
+    if (tpos > 0) { i = tpos - 1; }
+    err_file = (toks + i * sizeof(Token)).tfile;
+    err_line = (toks + i * sizeof(Token)).tline;
+    return;
+}
+
+void efail() {
+    eput("\n");
     exit(1);
     return;
 }
 
-void cerr() {
-    print("CODEGENERROR\n");
-    exit(1);
+void die(int msg) {
+    eopen();
+    eput(msg);
+    efail();
     return;
 }
+
+void die3(int a, int b, int c) {
+    eopen();
+    eput(a);
+    eput(b);
+    eput(c);
+    efail();
+    return;
+}
+
+void die_char(int msg, int c) {
+    eopen();
+    eput(msg);
+    eput_char(c);
+    eput("'");
+    efail();
+    return;
+}
+
+// A file that will not open. coff0 uses perror(), so the common cases are
+// spelled the way libc spells them; open() hands back -errno.
+void die_open(int path, int err) {
+    eput(path);
+    if (err == 0 - 2) { eput(": No such file or directory"); }
+    else if (err == 0 - 13) { eput(": Permission denied"); }
+    else { eput(": cannot open (error "); eput_int(0 - err); eput(")"); }
+    efail();
+    return;
+}
+
 
 void tok_put(int i, int kind, int ival, int name, int len) {
     int p = toks + i * sizeof(Token);
@@ -532,6 +757,8 @@ void tok_put(int i, int kind, int ival, int name, int len) {
     p.ival = ival;
     p.sval = name;
     p.len = len;
+    p.tfile = err_file;  // lex_all keeps these at the token's start
+    p.tline = err_line;
     return;
 }
 
@@ -561,8 +788,13 @@ void lex_all(int buf, int n) {
     int is_hex = 0;
 
     toks = alloc((n + 2) * sizeof(Token));
+    if (nseg == 0) { add_seg(0, src_name, 1); }
+    loc_seg = 0;
+    loc_off = 0;
+    loc_line = load64(seg_line);
 
     while (pos < n) {
+        loc_at(buf, pos);
         c = load8(buf + pos);
 
         if (c == ' ') { pos = pos + 1; }
@@ -652,21 +884,21 @@ void lex_all(int buf, int n) {
             slen = 0;
             going = 1;
             while (going == 1) {
-                if (pos >= n) { perr(); }
+                if (pos >= n) { die("unterminated string literal"); }
                 s = load8(buf + pos);
                 if (s == '"') {
                     going = 0;
                     pos = pos + 1;
                 } else if (s == '\\') {
                     pos = pos + 1;
-                    if (pos >= n) { perr(); }
+                    if (pos >= n) { die("unterminated string literal"); }
                     e = load8(buf + pos);
                     v = 0 - 1;
                     if (e == 'n') { v = '\n'; }
                     if (e == 't') { v = '\t'; }
                     if (e == '\\') { v = '\\'; }
                     if (e == '"') { v = '"'; }
-                    if (v < 0) { perr(); }
+                    if (v < 0) { die_char("unknown escape sequence '\\", e); }
                     store8(sbuf + slen, v);
                     slen = slen + 1;
                     pos = pos + 1;
@@ -682,12 +914,12 @@ void lex_all(int buf, int n) {
 
         else if (c == '\'') {
             pos = pos + 1;
-            if (pos >= n) { perr(); }
+            if (pos >= n) { die("empty or unterminated character literal"); }
             v = 0 - 1;
             e = load8(buf + pos);
             if (e == '\\') {
                 pos = pos + 1;
-                if (pos >= n) { perr(); }
+                if (pos >= n) { die("unterminated character literal"); }
                 q = load8(buf + pos);
                 if (q == 'n') { v = '\n'; }
                 if (q == 't') { v = '\t'; }
@@ -695,16 +927,16 @@ void lex_all(int buf, int n) {
                 if (q == '\'') { v = '\''; }
                 if (q == '0') { v = 0; }
                 if (v < 0) {
-                    if (q != '0') { perr(); }
+                    if (q != '0') { die_char("unknown escape in character literal '\\", q); }
                 }
                 pos = pos + 1;
             } else {
-                if (e == '\'') { perr(); }
+                if (e == '\'') { die("empty or unterminated character literal"); }
                 v = e;
                 pos = pos + 1;
             }
-            if (pos >= n) { perr(); }
-            if (load8(buf + pos) != '\'') { perr(); }
+            if (pos >= n) { die("unterminated character literal"); }
+            if (load8(buf + pos) != '\'') { die("unterminated character literal"); }
             pos = pos + 1;
             tok_put(t, 1, v, 0, 0);
             t = t + 1;
@@ -721,12 +953,13 @@ void lex_all(int buf, int n) {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { tok_put(t, 10, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { perr(); }
+            else { die_char("unexpected character '", c); }
         }
         else if (c == '<') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos = pos + 2; }
+            else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos = pos + 2; }
             else { tok_put(t, 11, 0, 0, 0); pos = pos + 1; }
             t = t + 1;
         }
@@ -734,12 +967,16 @@ void lex_all(int buf, int n) {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos = pos + 2; }
+            else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos = pos + 2; }
             else { tok_put(t, 13, 0, 0, 0); pos = pos + 1; }
             t = t + 1;
         }
         else if (c == '+') { tok_put(t, 4, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '-') { tok_put(t, 5, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '*') { tok_put(t, 6, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '%') { tok_put(t, 38, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '~') { tok_put(t, 42, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '(') { tok_put(t, 15, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == ')') { tok_put(t, 16, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '{') { tok_put(t, 17, 0, 0, 0); t = t + 1; pos = pos + 1; }
@@ -749,21 +986,24 @@ void lex_all(int buf, int n) {
         else if (c == '&') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { perr(); }
+            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 39, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
         }
         else if (c == '|') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { perr(); }
+            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 40, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
         }
         else if (c == '[') { tok_put(t, 31, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == ']') { tok_put(t, 32, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '.') { tok_put(t, 35, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else { perr(); }
+        else { die_char("unexpected character '", c); }
     }
 
+    loc_at(buf, n);
     tok_put(t, 26, 0, 0, 0);
     return;
 }
@@ -785,16 +1025,28 @@ int param_name_at(int f, int i) {
     return p.name;
 }
 
-// --- parser (builds 72-byte nodes; registers string literals as it goes) --
+// --- parser (builds Node records; registers string literals as it goes) ---
 
+// A node is placed at the last token read when it is made, which is the
+// operator, keyword or name it stands for.
 int new_node(int kind) {
     int p = alloc(sizeof(Node));
+    int i = 0;
     p.kind = kind;
+    if (tpos > 0) { i = tpos - 1; }
+    p.nfile = (toks + i * sizeof(Token)).tfile;
+    p.nline = (toks + i * sizeof(Token)).tline;
     return p;
 }
 
-void expect(int k) {
-    if (tok_kind(tpos) != k) { perr(); }
+// `what` is coff0's wording for the token, so the messages match.
+void want(int k, int what) {
+    if (tok_kind(tpos) != k) { at_prev(); die3("expected ", what, ""); }
+    return;
+}
+
+void expect(int k, int what) {
+    want(k, what);
     tpos = tpos + 1;
     return;
 }
@@ -810,7 +1062,7 @@ int p_primary() {
     if (k == 15) {
         tpos = tpos + 1;
         nd = p_expr();
-        expect(16);
+        expect(16, "')'");
         return nd;
     }
     if (k == 1) {
@@ -823,7 +1075,7 @@ int p_primary() {
         nd = new_node(2);
         nd.sval = tok_name(tpos);
         nd.len = tok_len(tpos);
-        if (string_count >= 4096) { cerr(); }
+        if (string_count >= 4096) { at_prev(); die("too many string literals (max 4096)"); }
         store64(string_ptrs + string_count * 8, tok_name(tpos));
         store64(string_lens + string_count * 8, tok_len(tpos));
         nd.extra = string_count;
@@ -851,7 +1103,7 @@ int p_primary() {
                     tail = a;
                 }
             }
-            expect(16);
+            expect(16, "')'");
             nd.child1 = head;
             return nd;
         }
@@ -861,15 +1113,16 @@ int p_primary() {
     }
     if (k == 37) {
         tpos = tpos + 1;
-        expect(15);
-        if (tok_kind(tpos) != 2) { perr(); }
+        expect(15, "'('");
+        want(2, "a layout name");
         nd = new_node(32);
         nd.sval = tok_name(tpos);
         tpos = tpos + 1;
-        expect(16);
+        expect(16, "')'");
         return nd;
     }
-    perr();
+    at_prev();
+    die("expected an expression");
     return 0;
 }
 
@@ -885,11 +1138,11 @@ int p_postfix() {
             idx = new_node(27);
             idx.child1 = nd;
             idx.child2 = p_expr();
-            expect(32);
+            expect(32, "']'");
             nd = idx;
         } else if (tok_kind(tpos) == 35) {
             tpos = tpos + 1;
-            if (tok_kind(tpos) != 2) { perr(); }
+            want(2, "a field name");
             fld = new_node(30);
             fld.child1 = nd;
             fld.sval = tok_name(tpos);
@@ -905,6 +1158,12 @@ int p_unary() {
     if (tok_kind(tpos) == 5) {
         tpos = tpos + 1;
         nd = new_node(17);
+        nd.child1 = p_unary();
+        return nd;
+    }
+    if (tok_kind(tpos) == 42) {
+        tpos = tpos + 1;
+        nd = new_node(39);
         nd.child1 = p_unary();
         return nd;
     }
@@ -927,6 +1186,12 @@ int p_term() {
         } else if (op == 7) {
             tpos = tpos + 1;
             nd = new_node(10);
+            nd.child1 = left;
+            nd.child2 = p_unary();
+            left = nd;
+        } else if (op == 38) {
+            tpos = tpos + 1;
+            nd = new_node(33);
             nd.child1 = left;
             nd.child2 = p_unary();
             left = nd;
@@ -964,7 +1229,7 @@ int p_rel() {
     int nd = 0;
     int op = 0;
     int kind = 0;
-    left = p_add();
+    left = p_shift();
     while (1) {
         op = tok_kind(tpos);
         kind = 0;
@@ -976,7 +1241,7 @@ int p_rel() {
             tpos = tpos + 1;
             nd = new_node(kind);
             nd.child1 = left;
-            nd.child2 = p_add();
+            nd.child2 = p_shift();
             left = nd;
         } else { break; }
     }
@@ -1005,15 +1270,74 @@ int p_equality() {
     return left;
 }
 
-int p_logic_and() {
+// The bitwise operators sit at C's precedence levels, including & ^ |
+// binding more loosely than == and != (see coff0.c's parse_shift).
+int p_shift() {
+    int left = 0;
+    int nd = 0;
+    left = p_add();
+    while (tok_kind(tpos) == 43 || tok_kind(tpos) == 44) {
+        if (tok_kind(tpos) == 43) { nd = new_node(37); }
+        else { nd = new_node(38); }
+        tpos = tpos + 1;
+        nd.child1 = left;
+        nd.child2 = p_add();
+        left = nd;
+    }
+    return left;
+}
+
+int p_bitand() {
     int left = 0;
     int nd = 0;
     left = p_equality();
+    while (tok_kind(tpos) == 39) {
+        nd = new_node(34);
+        tpos = tpos + 1;
+        nd.child1 = left;
+        nd.child2 = p_equality();
+        left = nd;
+    }
+    return left;
+}
+
+int p_bitxor() {
+    int left = 0;
+    int nd = 0;
+    left = p_bitand();
+    while (tok_kind(tpos) == 41) {
+        nd = new_node(36);
+        tpos = tpos + 1;
+        nd.child1 = left;
+        nd.child2 = p_bitand();
+        left = nd;
+    }
+    return left;
+}
+
+int p_bitor() {
+    int left = 0;
+    int nd = 0;
+    left = p_bitxor();
+    while (tok_kind(tpos) == 40) {
+        nd = new_node(35);
+        tpos = tpos + 1;
+        nd.child1 = left;
+        nd.child2 = p_bitxor();
+        left = nd;
+    }
+    return left;
+}
+
+int p_logic_and() {
+    int left = 0;
+    int nd = 0;
+    left = p_bitor();
     while (tok_kind(tpos) == 27) {
         tpos = tpos + 1;
         nd = new_node(23);
         nd.child1 = left;
-        nd.child2 = p_equality();
+        nd.child2 = p_bitor();
         left = nd;
     }
     return left;
@@ -1037,6 +1361,49 @@ int p_expr() {
     return p_logic_or();
 }
 
+// A global's initializer is folded at compile time, so it may be any
+// constant expression, meaning numbers and character literals joined by unary - and
+// ~ and the arithmetic and bitwise operators. The operators below compile to
+// the same instructions the program's own code would use (idiv, shl, sar),
+// so the folded value is what the expression would compute at run time.
+// Mirrors coff0.c's const_fold, including its messages.
+int const_fold(int nd) {
+    int k = nd.kind;
+    if (k == 1) { return nd.ival; }
+    if (k == 17) { return 0 - const_fold(nd.child1); }
+    if (k == 39) { return ~const_fold(nd.child1); }
+    if (k == 7 || k == 8 || k == 9 || k == 10 || k == 33
+        || k == 34 || k == 35 || k == 36 || k == 37 || k == 38) {
+        int a = const_fold(nd.child1);
+        int b = const_fold(nd.child2);
+        if (k == 7) { return a + b; }
+        if (k == 8) { return a - b; }
+        if (k == 9) { return a * b; }
+        if (k == 10 || k == 33) {
+            if (b == 0) { at_prev(); die("division by zero in a global initializer"); }
+            if (b == 0 - 1 && a == 1 << 63) { at_prev(); die("division overflow in a global initializer"); }
+            if (k == 10) { return a / b; }
+            return a % b;
+        }
+        if (k == 34) { return a & b; }
+        if (k == 35) { return a | b; }
+        if (k == 36) { return a ^ b; }
+        if (k == 37) { return a << (b & 63); }
+        return a >> (b & 63);
+    }
+    at_prev();
+    die("a global initializer must be a constant: numbers, characters and operators");
+    return 0;
+}
+
+
+// A layout name used as a type, as in `Point p`. Two identifiers in a row can
+// only be that, since no expression starts with two names.
+int at_typed_decl() {
+    if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { return 1; }
+    return 0;
+}
+
 int p_stmt() {
     int nd = 0;
     int name = 0;
@@ -1045,26 +1412,29 @@ int p_stmt() {
     int out = 0;
     k = tok_kind(tpos);
     if (k == 17) { return p_block(); }
-    if (k == 21) {
+    if (k == 21 || at_typed_decl() == 1) {
+        int dtype = 0;
+        if (k == 2) { dtype = tok_name(tpos); }
         tpos = tpos + 1;
-        if (tok_kind(tpos) != 2) { perr(); }
+        want(2, "an identifier");
         name = tok_name(tpos);
         tpos = tpos + 1;
         nd = new_node(5);
         nd.sval = name;
+        nd.extra = dtype;
         if (tok_kind(tpos) == 8) {
             tpos = tpos + 1;
             nd.child2 = p_expr();
         }
-        expect(19);
+        expect(19, "';'");
         return nd;
     }
     if (k == 22) {
         tpos = tpos + 1;
-        expect(15);
+        expect(15, "'('");
         nd = new_node(18);
         nd.child1 = p_expr();
-        expect(16);
+        expect(16, "')'");
         nd.child2 = p_stmt();
         if (tok_kind(tpos) == 23) {
             tpos = tpos + 1;
@@ -1074,10 +1444,10 @@ int p_stmt() {
     }
     if (k == 24) {
         tpos = tpos + 1;
-        expect(15);
+        expect(15, "'('");
         nd = new_node(19);
         nd.child1 = p_expr();
-        expect(16);
+        expect(16, "')'");
         nd.child2 = p_stmt();
         return nd;
     }
@@ -1085,20 +1455,20 @@ int p_stmt() {
         tpos = tpos + 1;
         nd = new_node(20);
         if (tok_kind(tpos) != 19) { nd.child1 = p_expr(); }
-        expect(19);
+        expect(19, "';'");
         return nd;
     }
     if (k == 29) {
         tpos = tpos + 1;
-        expect(19);
+        expect(19, "';'");
         return new_node(25);
     }
     if (k == 30) {
         tpos = tpos + 1;
-        expect(19);
+        expect(19, "';'");
         return new_node(26);
     }
-    // Parse a full expression first, then decide: a plain assignment
+    // Parse a full expression first, then decide between a plain assignment
     // (VAR '=' expr), an indexed assignment (buf[i] '=' expr), or -- if
     // not followed by '=' at all -- an expression statement. Needs
     // arbitrary lookahead (buf[i] can be any length), unlike the other
@@ -1111,7 +1481,7 @@ int p_stmt() {
             out = new_node(4);
             out.sval = name;
             out.child2 = p_expr();
-            expect(19);
+            expect(19, "';'");
             return out;
         }
         if (e.kind == 27) {
@@ -1119,7 +1489,7 @@ int p_stmt() {
             out.child1 = e.child1;
             out.child2 = e.child2;
             out.child3 = p_expr();
-            expect(19);
+            expect(19, "';'");
             return out;
         }
         if (e.kind == 30) {
@@ -1127,14 +1497,15 @@ int p_stmt() {
             out.sval = e.sval;
             out.child1 = e.child1;
             out.child2 = p_expr();
-            expect(19);
+            expect(19, "';'");
             return out;
         }
-        perr();
+        at_prev();
+        die("invalid assignment target");
     }
     out = new_node(21);
     out.child1 = e;
-    expect(19);
+    expect(19, "';'");
     return out;
 }
 
@@ -1143,14 +1514,14 @@ int p_block() {
     int head = 0;
     int tail = 0;
     int s = 0;
-    expect(17);
+    expect(17, "'{'");
     nd = new_node(22);
     while (tok_kind(tpos) != 18) {
         s = p_stmt();
         if (head == 0) { head = s; tail = s; }
         else { tail.sibling = s; tail = s; }
     }
-    expect(18);
+    expect(18, "'}'");
     nd.child1 = head;
     return nd;
 }
@@ -1180,6 +1551,10 @@ int builtin_arity(int name) {
     if (streq(name, "present") == 1) { return 1; }
     if (streq(name, "mouse_poll") == 1) { return 0; }
     if (streq(name, "glyph") == 1) { return 2; }
+    if (streq(name, "dealloc") == 1) { return 1; }
+    if (streq(name, "sound") == 1) { return 2; }
+    if (streq(name, "writefile") == 1) { return 3; }
+    if (streq(name, "syscall") == 1) { return 6; }
     if (streq(name, "argc") == 1) { return 0; }
     if (streq(name, "argv") == 1) { return 1; }
     if (streq(name, "outb") == 1) { return 2; }
@@ -1187,6 +1562,33 @@ int builtin_arity(int name) {
     if (streq(name, "outw") == 1) { return 2; }
     if (streq(name, "inw") == 1) { return 1; }
     return 0 - 1;
+}
+
+// Functions, externs and embeds become assembler symbols under their own
+// names, so one named like a register would be read as the register. Same
+// list and message as coff0.c's REGISTER_NAMES / check_symbol_name.
+int is_register_name(int n) {
+    int regs = " rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 eax ebx ecx edx esi edi ebp esp r8d r9d r10d r11d r12d r13d r14d r15d ax bx cx dx si di bp sp r8w r9w r10w r11w r12w r13w r14w r15w al bl cl dl ah bh ch dh sil dil bpl spl r8b r9b r10b r11b r12b r13b r14b r15b rip eip cs ds es fs gs ss cr0 cr2 cr3 cr4 cr8 ";
+    int nl = strlen_(n);
+    int i = 0;
+    while (load8(regs + i) != 0) {
+        if (load8(regs + i) == ' ' && load8(regs + i + nl + 1) == ' ') {
+            int k = 0;
+            while (k < nl && load8(regs + i + 1 + k) == load8(n + k)) { k = k + 1; }
+            if (k == nl) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+void check_symbol_name(int name, int what) {
+    if (is_register_name(name) == 1) {
+        eopen();
+        eput("'"); eput(name); eput("' is a register name and cannot name "); eput(what);
+        efail();
+    }
+    return;
 }
 
 int is_builtin(int name) {
@@ -1203,7 +1605,7 @@ int arg_reg(int i) {
     return "r9";
 }
 
-// --- resolve: assign stack offsets to locals, mark global VAR/ASSIGN uses -
+// --- resolve assigns stack offsets to locals, marks global VAR/ASSIGN uses -
 
 int func_nparams_of(int name) {
     int f = fhead;
@@ -1211,7 +1613,7 @@ int func_nparams_of(int name) {
         if (streq(f.name, name) == 1) { return f.nparams; }
         f = f.fnext;
     }
-    cerr();
+    die3("call to undeclared function '", name, "'");
     return 0;
 }
 
@@ -1242,25 +1644,36 @@ int extern_exists(int name) {
     return 0;
 }
 
-// --- layouts: a single flat field-name -> offset table shared across every
+// --- layouts, a single flat field-name -> offset table shared across every
 // `layout` declaration, plus a layout-name -> size table for sizeof(...).
 // See coff0.c's field_declare_or_check/layout_declare for the full
 // rationale (differentially verified against this).
 int field_names = 0;   // alloc'd 4096 * 8
 int field_offsets = 0; // alloc'd 4096 * 8
+int field_ambiguous = 0; // alloc'd 4096 * 8, layouts disagree on its offset
 int field_count = 0;
 
 int layout_names = 0;  // alloc'd 256 * 8
 int layout_sizes = 0;  // alloc'd 256 * 8
 int layout_count = 0;
 
+// The offset of `name` for a base whose layout is not known (an untyped
+// variable or an expression). Mirrors coff0.c's field_lookup.
 int field_lookup(int name) {
     int i = 0;
     while (i < field_count) {
-        if (streq(load64(field_names + i * 8), name) == 1) { return load64(field_offsets + i * 8); }
+        if (streq(load64(field_names + i * 8), name) == 1) {
+            if (load64(field_ambiguous + i * 8) == 1) {
+                eopen();
+                eput("field '"); eput(name);
+                eput("' is at different offsets in different layouts; declare the variable with its layout, e.g. 'Point p'");
+                efail();
+            }
+            return load64(field_offsets + i * 8);
+        }
         i = i + 1;
     }
-    cerr();
+    die3("unknown field '", name, "' (not declared in any layout)");
     return 0;
 }
 
@@ -1268,16 +1681,72 @@ void field_declare_or_check(int name, int offset) {
     int i = 0;
     while (i < field_count) {
         if (streq(load64(field_names + i * 8), name) == 1) {
-            if (load64(field_offsets + i * 8) != offset) { cerr(); }
+            if (load64(field_offsets + i * 8) != offset) { store64(field_ambiguous + i * 8, 1); }
             return;
         }
         i = i + 1;
     }
-    if (field_count >= 4096) { cerr(); }
+    if (field_count >= 4096) { die("too many distinct field names (max 4096)"); }
     store64(field_names + field_count * 8, name);
     store64(field_offsets + field_count * 8, offset);
+    store64(field_ambiguous + field_count * 8, 0);
     field_count = field_count + 1;
     return;
+}
+
+int layout_exists(int name) {
+    int i = 0;
+    while (i < layout_count) {
+        if (streq(load64(layout_names + i * 8), name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The offset of `field` in layout `lname`, for a base declared with that
+// layout. Mirrors coff0.c's layout_field_offset.
+int layout_field_offset(int lname, int field) {
+    int l = lhead;
+    while (l != 0) {
+        if (streq(l.name, lname) == 1) {
+            int off = 0;
+            int f = l.fields;
+            while (f != 0) {
+                if (streq(f.name, field) == 1) { return off; }
+                off = off + 8;
+                f = f.next;
+            }
+            eopen();
+            eput("layout '"); eput(lname); eput("' has no field '"); eput(field); eput("'");
+            efail();
+        }
+        l = l.next;
+    }
+    die3("unknown layout '", lname, "'");
+    return 0;
+}
+
+void check_type(int type) {
+    if (type != 0 && layout_exists(type) == 0) {
+        die3("unknown type '", type, "' (a type is int or a layout name)");
+    }
+    return;
+}
+
+// The layout a variable was declared with, or 0. Locals are searched
+// innermost first, then globals.
+int var_type(int name) {
+    int i = sym_count - 1;
+    while (i >= 0) {
+        if (streq(load64(sym_names + i * 8), name) == 1) { return load64(sym_types + i * 8); }
+        i = i - 1;
+    }
+    int g = ghead;
+    while (g != 0) {
+        if (streq(g.name, name) == 1) { return g.gtype; }
+        g = g.next;
+    }
+    return 0;
 }
 
 int layout_lookup_size(int name) {
@@ -1286,29 +1755,39 @@ int layout_lookup_size(int name) {
         if (streq(load64(layout_names + i * 8), name) == 1) { return load64(layout_sizes + i * 8); }
         i = i + 1;
     }
-    cerr();
+    die3("unknown layout '", name, "' in sizeof(...)");
     return 0;
 }
 
 // Validates one `layout` declaration (a Layout record, see the layout
-// blocks near the top of this file): duplicate field names within the
-// layout, cross-layout offset conflicts via field_declare_or_check, and
-// records the layout's own size (nfields * 8) for sizeof(...).
+// blocks near the top of this file). It checks for duplicate field names
+// within the layout and for cross-layout offset conflicts via
+// field_declare_or_check, and records the layout's own size (nfields * 8)
+// for sizeof(...).
 void layout_declare(int l) {
     int i = 0;
     int offset = 0;
     int f = 0;
     int g = 0;
+    err_file = l.lfile;
+    err_line = l.lline;
     while (i < layout_count) {
-        if (streq(load64(layout_names + i * 8), l.name) == 1) { cerr(); }
+        if (streq(load64(layout_names + i * 8), l.name) == 1) { die3("redefinition of layout '", l.name, "'"); }
         i = i + 1;
     }
-    if (layout_count >= 256) { cerr(); }
+    if (layout_count >= 256) { die("too many layouts (max 256)"); }
     f = l.fields;
     while (f != 0) {
+        err_file = f.lffile;
+        err_line = f.lfline;
         g = l.fields;
         while (g != f) {
-            if (streq(g.name, f.name) == 1) { cerr(); }
+            if (streq(g.name, f.name) == 1) {
+                eopen();
+                eput("duplicate field '"); eput(f.name);
+                eput("' in layout '"); eput(l.name); eput("'");
+                efail();
+            }
             g = g.next;
         }
         field_declare_or_check(f.name, offset);
@@ -1346,17 +1825,32 @@ int sym_declared_in_scope(int name) {
 
 int sym_declare(int name) {
     int off = 0;
-    if (sym_declared_in_scope(name) == 1) { cerr(); }
-    if (sym_count >= 4096) { cerr(); }
+    if (sym_declared_in_scope(name) == 1) { die3("redeclaration of '", name, "'"); }
+    if (sym_count >= 4096) { die("too many variables (max 4096)"); }
     off = (sym_count + 1) * 8;
     store64(sym_names + sym_count * 8, name);
     store64(sym_offsets + sym_count * 8, off);
+    store64(sym_types + sym_count * 8, 0);
     sym_count = sym_count + 1;
     if (off > stack_size) { stack_size = off; }
     return off;
 }
 
+// Points errors at nd while it is resolved and back at its parent after,
+// so a check the parent makes after resolving a child reports the parent.
 void resolve(int nd) {
+    int saved_file = err_file;
+    int saved_line = err_line;
+    if (nd == 0) { return; }
+    err_file = nd.nfile;
+    err_line = nd.nline;
+    resolve_node(nd);
+    err_file = saved_file;
+    err_line = saved_line;
+    return;
+}
+
+void resolve_node(int nd) {
     int k = 0;
     int name = 0;
     int off = 0;
@@ -1375,7 +1869,7 @@ void resolve(int nd) {
         if (glob_exists(name) == 1) { nd.extra = 1; return; }
         if (extern_exists(name) == 1) { nd.kind = 29; return; }
         if (func_exists(name) == 1) { nd.kind = 29; return; }
-        cerr();
+        die3("undeclared variable '", name, "'");
         return;
     }
     if (k == 29) { return; } // only ever reached already-resolved, via k==3 above
@@ -1385,12 +1879,14 @@ void resolve(int nd) {
         off = sym_try_lookup(name);
         if (off >= 0) { nd.ival = off; return; }
         if (glob_exists(name) == 1) { nd.extra = 1; return; }
-        cerr();
+        die3("undeclared variable '", name, "'");
         return;
     }
     if (k == 5) {
         if (nd.child2 != 0) { resolve(nd.child2); }
+        check_type(nd.extra);
         nd.ival = sym_declare(nd.sval);
+        store64(sym_types + (sym_count - 1) * 8, nd.extra);
         return;
     }
     if (k == 6) {
@@ -1401,9 +1897,21 @@ void resolve(int nd) {
         while (a != 0) { nargs = nargs + 1; a = a.sibling; }
         bar = builtin_arity(name);
         if (bar >= 0) {
-            if (nargs != bar) { cerr(); }
+            if (nargs != bar) {
+                eopen();
+                eput("builtin '"); eput(name);
+                eput("' takes exactly "); eput_int(bar);
+                eput(" argument(s), got "); eput_int(nargs);
+                efail();
+            }
         } else if (func_exists(name) == 1) {
-            if (func_nparams_of(name) != nargs) { cerr(); }
+            if (func_nparams_of(name) != nargs) {
+                eopen();
+                eput("'"); eput(name);
+                eput("' takes "); eput_int(func_nparams_of(name));
+                eput(" argument(s), got "); eput_int(nargs);
+                efail();
+            }
         } else {
             // Not a builtin, not a declared function -- an indirect call
             // through a function-pointer-valued variable, if `name` names
@@ -1415,16 +1923,16 @@ void resolve(int nd) {
             off = sym_try_lookup(name);
             if (off >= 0) { nd.ival = off; nd.extra = 2; }
             else if (glob_exists(name) == 1) { nd.extra = 1; }
-            else { cerr(); }
+            else { die3("call to undeclared function '", name, "'"); }
         }
         a = args;
         while (a != 0) { resolve(a); a = a.sibling; }
         return;
     }
-    if (k >= 7 && k <= 16) { resolve(nd.child1); resolve(nd.child2); return; }
+    if ((k >= 7 && k <= 16) || (k >= 33 && k <= 38)) { resolve(nd.child1); resolve(nd.child2); return; }
     if (k == 23) { resolve(nd.child1); resolve(nd.child2); return; }
     if (k == 24) { resolve(nd.child1); resolve(nd.child2); return; }
-    if (k == 17) { resolve(nd.child1); return; }
+    if (k == 17 || k == 39) { resolve(nd.child1); return; }
     if (k == 18) {
         resolve(nd.child1);
         resolve(nd.child2);
@@ -1439,13 +1947,13 @@ void resolve(int nd) {
         return;
     }
     if (k == 20) {
-        if (current_fn_is_void == 1) { if (nd.child1 != 0) { cerr(); } }
+        if (current_fn_is_void == 1) { if (nd.child1 != 0) { die("'void' function cannot return a value"); } }
         resolve(nd.child1);
         return;
     }
     if (k == 21) { resolve(nd.child1); return; }
     if (k == 22) {
-        if (scope_depth >= 64) { cerr(); }
+        if (scope_depth >= 64) { die("blocks nested too deeply (max 64)"); }
         store64(scope_marks + scope_depth * 8, sym_count);
         scope_depth = scope_depth + 1;
         a = nd.child1;
@@ -1454,8 +1962,8 @@ void resolve(int nd) {
         sym_count = load64(scope_marks + scope_depth * 8);
         return;
     }
-    if (k == 25) { if (loop_depth <= 0) { cerr(); } return; }
-    if (k == 26) { if (loop_depth <= 0) { cerr(); } return; }
+    if (k == 25) { if (loop_depth <= 0) { die("'break' outside of a loop"); } return; }
+    if (k == 26) { if (loop_depth <= 0) { die("'continue' outside of a loop"); } return; }
     if (k == 27) { resolve(nd.child1); resolve(nd.child2); return; }
     if (k == 28) {
         resolve(nd.child1);
@@ -1463,15 +1971,16 @@ void resolve(int nd) {
         resolve(nd.child3);
         return;
     }
-    if (k == 30) {
+    if (k == 30 || k == 31) {
+        // A base that is a variable declared with a layout looks the field
+        // up in that layout; anything else uses the shared table.
+        int ftype = 0;
+        int base = nd.child1;
+        if (base.kind == 3) { ftype = var_type(base.sval); }
         resolve(nd.child1);
-        nd.ival = field_lookup(nd.sval);
-        return;
-    }
-    if (k == 31) {
-        resolve(nd.child1);
-        resolve(nd.child2);
-        nd.ival = field_lookup(nd.sval);
+        if (k == 31) { resolve(nd.child2); }
+        if (ftype != 0) { nd.ival = layout_field_offset(ftype, nd.sval); }
+        else { nd.ival = field_lookup(nd.sval); }
         return;
     }
     if (k == 32) {
@@ -1482,7 +1991,7 @@ void resolve(int nd) {
     return;
 }
 
-// --- codegen: emit assembly byte-identical to coff0's own gen_expr/gen_stmt
+// --- codegen emits assembly byte-identical to coff0's own gen_expr/gen_stmt
 
 void gen_block(int nd) {
     int s = nd.child1;
@@ -1503,6 +2012,14 @@ void gen_binop(int nd, int k) {
     if (k == 8) { emit("    sub rax, rcx\n"); return; }
     if (k == 9) { emit("    imul rax, rcx\n"); return; }
     if (k == 10) { emit("    cqo\n    idiv rcx\n"); return; }
+    // idiv leaves the remainder in rdx, with the sign of the dividend.
+    if (k == 33) { emit("    cqo\n    idiv rcx\n    mov rax, rdx\n"); return; }
+    if (k == 34) { emit("    and rax, rcx\n"); return; }
+    if (k == 35) { emit("    or rax, rcx\n"); return; }
+    if (k == 36) { emit("    xor rax, rcx\n"); return; }
+    // The count is in cl, x86 masks it to its low six bits. >> is arithmetic.
+    if (k == 37) { emit("    shl rax, cl\n"); return; }
+    if (k == 38) { emit("    sar rax, cl\n"); return; }
     if (k == 11) { emit("    cmp rax, rcx\n    sete al\n    movzx rax, al\n"); return; }
     if (k == 12) { emit("    cmp rax, rcx\n    setne al\n    movzx rax, al\n"); return; }
     if (k == 13) { emit("    cmp rax, rcx\n    setl al\n    movzx rax, al\n"); return; }
@@ -1522,27 +2039,29 @@ void gen_call(int nd) {
 
     if (streq(name, "print") == 1) {
         l = label_count;
-        // Uses two labels (l for .Lstrlen, l+1 for .Lstrlend).
+        // One label id serves both .Lstrlen and .Lstrlend, which differ by
+        // name.
         label_count = label_count + 1;
+        // rsi and rcx, not rbx, because the ABI has a function preserve
+        // rbx.
         gen_expr(args);
-        emit("    mov rbx, rax\n");
+        emit("    mov rsi, rax\n");
         emit("    xor rcx, rcx\n");
         emit(".Lstrlen"); print_int(l); emit(":\n");
-        emit("    cmp byte ptr [rbx + rcx], 0\n");
+        emit("    cmp byte ptr [rsi + rcx], 0\n");
         emit("    je .Lstrlend"); print_int(l); emit("\n");
         emit("    inc rcx\n");
         emit("    jmp .Lstrlen"); print_int(l); emit("\n");
         emit(".Lstrlend"); print_int(l); emit(":\n");
         if (elf_mode == 1) {
             // Moonshot SYS_DEBUG_PRINT(str, len) is 1.
-            emit("    mov rdi, rbx\n");
+            emit("    mov rdi, rsi\n");
             emit("    mov rsi, rcx\n");
             emit("    mov rax, 1\n");
             emit("    syscall\n");
         } else {
             // Linux write(1, str, len).
             emit("    mov rdx, rcx\n");
-            emit("    mov rsi, rbx\n");
             emit("    mov rdi, 1\n");
             emit("    mov rax, 1\n");
             emit("    syscall\n");
@@ -1551,10 +2070,9 @@ void gen_call(int nd) {
     }
     if (streq(name, "alloc") == 1) {
         if (elf_mode == 1) {
-            // SYS_ALLOC(n) (6): bump-allocate from this ring-3 process's
-            // own private heap region, which the kernel grants it when
-            // it loads the program. Returns 0 on failure -- no free,
-            // matching SYS_ALLOC's own bump-only design.
+            // SYS_ALLOC(n) (6) returns n zeroed bytes from this ring-3 process's
+            // own heap (Moonshot's lager.c0), which dealloc() can give
+            // back. Returns 0 on failure.
             gen_expr(args);
             emit("    mov rdi, rax\n");
             emit("    mov rax, 6\n");
@@ -1598,13 +2116,9 @@ void gen_call(int nd) {
         gen_expr(args);
         emit("    mov rdi, rax\n");
         if (elf_mode == 1) {
-            // Moonshot's SYS_EXIT is 0. This once fell through to the Linux
-            // number, 60, which Moonshot does not implement -- the kernel
-            // logged "unknown syscall 60", returned -1, and the program
-            // CARRIED ON. Every --elf program's exit() was a no-op, hidden
-            // because `return` from main goes through the entry stub and
-            // nothing exercised exit() itself, until Infecteria printed its
-            // death message 253 times and kept playing.
+            // Moonshot's SYS_EXIT is 0. The Linux number, 60, is not a
+            // Moonshot syscall, so it would return -1 and the program would
+            // carry on after exit().
             emit("    mov rax, 0\n");
         } else {
             emit("    mov rax, 60\n");
@@ -1613,7 +2127,7 @@ void gen_call(int nd) {
         return;
     }
     // --- Moonshot ring-3 builtins (--elf only) ------------------------
-    // Each is one Moonshot syscall. Arguments follow the SYSCALL ABI: rdi,
+    // Each is one Moonshot syscall. Arguments follow the SYSCALL ABI, in rdi,
     // rsi, rdx, r10, r8 -- r10 for the fourth, not rcx, because the
     // SYSCALL instruction clobbers rcx with the return RIP. Every argument
     // is evaluated left to right onto the stack first, then popped into its
@@ -1624,58 +2138,82 @@ void gen_call(int nd) {
             || streq(name, "present") == 1 || streq(name, "readfile") == 1
             || streq(name, "blit") == 1 || streq(name, "fill") == 1
             || streq(name, "mouse_poll") == 1
-            || streq(name, "glyph") == 1) { cerr(); }
+            || streq(name, "glyph") == 1 || streq(name, "dealloc") == 1
+            || streq(name, "sound") == 1 || streq(name, "writefile") == 1
+            || streq(name, "syscall") == 1) {
+            die3("'", name, "' exists only for the Moonshot target (--elf)");
+        }
     } else {
-        // The Linux-only builtins have no meaning in ring 3 on Moonshot:
-        // there is no argv, no file descriptors and no port I/O.
-        if (streq(name, "argc") == 1 || streq(name, "argv") == 1
-            || streq(name, "write") == 1 || streq(name, "read") == 1
+        // The Linux-only builtins have no meaning in ring 3 on Moonshot,
+        // where there are no file descriptors and no port I/O. argc and argv do
+        // exist there, as syscalls (see below).
+        if (streq(name, "write") == 1 || streq(name, "read") == 1
             || streq(name, "open_read") == 1 || streq(name, "open_write") == 1
             || streq(name, "close") == 1 || streq(name, "outb") == 1
             || streq(name, "inb") == 1 || streq(name, "outw") == 1
-            || streq(name, "inw") == 1) { cerr(); }
+            || streq(name, "inw") == 1) {
+            die3("'", name, "' has no meaning in ring 3 on Moonshot");
+        }
     }
     if (streq(name, "win_info") == 1) {
-        // SYS_WIN_INFO (2): returns packed (width<<16)|height in rax.
+        // SYS_WIN_INFO (2) returns packed (width<<16)|height in rax.
         emit("    mov rax, 2\n    syscall\n");
         return;
     }
     if (streq(name, "win_max") == 1) {
-        // SYS_WIN_MAX (10): returns packed (width<<16)|height for the LARGEST
+        // SYS_WIN_MAX (10) returns packed (width<<16)|height for the LARGEST
         // window this machine can ever hand out -- a fixed ceiling, not the
         // current size. A ring-3 program sizes its frame buffer from this once
-        // and never resizes it, because alloc() is bump-only with no free: a
-        // window growing from half the screen to all of it would need a second
-        // buffer the heap has no room for. win_info() is what changes; this is
-        // what you budget for.
+        // and never resizes it, so a window growing from half the screen to
+        // all of it never needs a second buffer. win_info() is what changes;
+        // this is what you budget for.
         emit("    mov rax, 10\n    syscall\n");
         return;
     }
     if (streq(name, "key_poll") == 1) {
-        // SYS_KEY_POLL (4): returns packed key event or -1 in rax.
+        // SYS_KEY_POLL (4) returns a packed key event or -1 in rax.
         emit("    mov rax, 4\n    syscall\n");
         return;
     }
     if (streq(name, "ticks") == 1) {
-        // SYS_TICKS (7): returns the kernel's monotonic ~100Hz tick count.
+        // SYS_TICKS (7) returns the kernel's monotonic ~100Hz tick count.
         emit("    mov rax, 7\n    syscall\n");
         return;
     }
     if (streq(name, "mouse_poll") == 1) {
-        // SYS_MOUSE_POLL (11): the pointer relative to this task's window,
-        // (x * 1024 + y) * 8 + buttons, or -1 when it is not over the window.
+        // SYS_MOUSE_POLL (11) returns the pointer relative to this task's
+        // window as (x * 1024 + y) * 8 + buttons, or -1 when it is not over the window.
         emit("    mov rax, 11\n    syscall\n");
         return;
     }
+    if (streq(name, "dealloc") == 1) {
+        // SYS_DEALLOC(ptr) (13) gives back a block alloc() returned. Returns
+        // 0, or -1 if ptr is not the start of a live block (see lager.c0).
+        gen_expr(args);
+        emit("    mov rdi, rax\n");
+        emit("    mov rax, 13\n");
+        emit("    syscall\n");
+        return;
+    }
+    if (streq(name, "sound") == 1) {
+        // SYS_SOUND(buf, len) (14) queues len bytes of 8-bit mono PCM for
+        // oljud, Moonshot's Sound Blaster 16 driver, and returns how many
+        // fit. buf == 0 returns how many bytes are still waiting to be played.
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop rsi\n    pop rdi\n");
+        emit("    mov rax, 14\n    syscall\n");
+        return;
+    }
     if (streq(name, "glyph") == 1) {
-        // SYS_GLYPH(ch, buf) (12): copies one character's font bitmap -- the
+        // SYS_GLYPH(ch, buf) (12) copies one character's font bitmap -- the
         // kernel's own font, the one kakel draws with -- into the caller's
         // memory, FONT_H bytes, row 0 first, each byte's bit 7 the leftmost
         // pixel. Returns the cell size packed width * 65536 + height, so a
         // program never hardcodes 8x8; with buf == 0 it returns that size and
         // copies nothing, the way readfile()'s buf == 0 returns a file size.
         //
-        // A bitmap rather than a draw call on purpose: ring-3 programs
+        // A bitmap rather than a draw call on purpose. Ring-3 programs
         // composite a whole frame and present() it in one syscall, because a
         // multi-syscall draw sequence gets torn by the scheduler. Text has to
         // go through the same compositing as everything else, so the kernel
@@ -1687,14 +2225,25 @@ void gen_call(int nd) {
         return;
     }
     if (streq(name, "present") == 1) {
-        // SYS_PRESENT(buf) (9): copy a whole window of pixels at once.
+        // SYS_PRESENT(buf) (9) copies a whole window of pixels at once.
         gen_expr(args);
         emit("    mov rdi, rax\n");
         emit("    mov rax, 9\n    syscall\n");
         return;
     }
+    if (streq(name, "writefile") == 1) {
+        // SYS_WRITEFILE(name, buf, len) (15) makes the jakel file hold
+        // exactly those len bytes, creating it (in an existing directory) if
+        // it is not there. Returns len, or -1. readfile()'s counterpart, so
+        // a ring-3 program can save.
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop rdx\n    pop rsi\n    pop rdi\n");
+        emit("    mov rax, 15\n    syscall\n");
+        return;
+    }
     if (streq(name, "readfile") == 1) {
-        // SYS_READFILE(name, buf, max) (8): reads a file from jakel into the
+        // SYS_READFILE(name, buf, max) (8) reads a file from jakel into the
         // process's own memory. With buf == 0 it returns the file's size
         // without copying anything, which is how a program sizes an alloc()
         // before the real read -- there is no separate stat syscall.
@@ -1732,6 +2281,30 @@ void gen_call(int nd) {
         emit("    pop rdi\n");
         emit("    mov [rdi], rax\n");
     
+        return;
+    }
+    if (streq(name, "syscall") == 1) {
+        // syscall(n, a, b, c, d, e) (--elf) makes any Moonshot syscall by number,
+        // so a new one needs a kernel change and a library wrapper, not a
+        // compiler change. Arguments in rdi, rsi, rdx, r10, r8; the number
+        // in rax. Unused arguments are passed as 0.
+        a = args;
+        while (a != 0) { gen_expr(a); emit("    push rax\n"); a = a.sibling; }
+        emit("    pop r8\n    pop r10\n    pop rdx\n    pop rsi\n    pop rdi\n    pop rax\n");
+        emit("    syscall\n");
+        return;
+    }
+    if (elf_mode == 1 && streq(name, "argc") == 1) {
+        // SYS_ARGC (17) returns how many arguments the program was started with,
+        // its own name included, as on Linux.
+        emit("    mov rax, 17\n    syscall\n");
+        return;
+    }
+    if (elf_mode == 1 && streq(name, "argv") == 1) {
+        // SYS_ARGV(i) (18) returns argument i, a NUL-terminated string in the
+        // program's own memory, or 0 past the end.
+        gen_expr(args);
+        emit("    mov rdi, rax\n    mov rax, 18\n    syscall\n");
         return;
     }
     if (streq(name, "argc") == 1) {
@@ -1827,7 +2400,18 @@ void gen_call(int nd) {
     return;
 }
 
+// Codegen errors point at the node, same as resolve().
 void gen_expr(int nd) {
+    int saved_file = err_file;
+    int saved_line = err_line;
+    if (nd != 0) { err_file = nd.nfile; err_line = nd.nline; }
+    gen_expr_node(nd);
+    err_file = saved_file;
+    err_line = saved_line;
+    return;
+}
+
+void gen_expr_node(int nd) {
     int k = nd.kind;
     int l = 0;
     // --- literal ---
@@ -1854,6 +2438,12 @@ void gen_expr(int nd) {
     // --- function reference ---
     if (k == 29) {
         emit("    lea rax, ["); emit(nd.sval); emit("]\n");
+        return;
+    }
+    // --- unary ~ ---
+    if (k == 39) {
+        gen_expr(nd.child1);
+        emit("    not rax\n");
         return;
     }
     // --- unary neg ---
@@ -1884,17 +2474,11 @@ void gen_expr(int nd) {
     // --- function call ---
     if (k == 6) { gen_call(nd); return; }
     // --- binary ops ---
-    if (k >= 7 && k <= 16) { gen_binop(nd, k); return; }
+    if ((k >= 7 && k <= 16) || (k >= 33 && k <= 38)) { gen_binop(nd, k); return; }
     // --- AND short-circuit ---
     if (k == 23) {
-        // Raw mode uses TWO labels (l = .Lfalse, l+1 = .Landend) out of one
-        // flat numeric namespace, so both must be reserved. Text mode needs
-        // only one id because its labels are distinct *names*
-        // (.Lfalse7 / .Landend7 cannot collide). Reserving one here in raw
-        // mode let the next construct reuse l+1 and silently redefine this
-        // AND's own end label -- wrong branches taken, and (since string
-        // literals are emitted inline in the code stream) jumps landing on
-        // the wrong literal. Same two-label reservation print() already does.
+        // One label id serves both .Lfalse and .Landend, since the labels
+        // are distinct names (.Lfalse7 / .Landend7 cannot collide).
         l = label_count;
         label_count = label_count + 1;
         gen_expr(nd.child1);
@@ -1913,8 +2497,7 @@ void gen_expr(int nd) {
     }
     // --- OR short-circuit ---
     if (k == 24) {
-        // Two labels in raw mode (l = .Ltrue, l+1 = .Lorend) -- see the AND
-        // case above for why reserving only one silently corrupts jumps.
+        // One label id for .Ltrue and .Lorend, as in the AND case above.
         l = label_count;
         label_count = label_count + 1;
         gen_expr(nd.child1);
@@ -1931,11 +2514,21 @@ void gen_expr(int nd) {
     
         return;
     }
-    cerr();
+    die("internal error: not an expression node");
     return;
 }
 
 void gen_stmt(int nd) {
+    int saved_file = err_file;
+    int saved_line = err_line;
+    if (nd != 0) { err_file = nd.nfile; err_line = nd.nline; }
+    gen_stmt_node(nd);
+    err_file = saved_file;
+    err_line = saved_line;
+    return;
+}
+
+void gen_stmt_node(int nd) {
     int k = nd.kind;
     int l = 0;
     // --- var decl with init (k=5) ---
@@ -1988,11 +2581,7 @@ void gen_stmt(int nd) {
     // --- if/else (k=18) ---
     if (k == 18) {
         l = label_count;
-        // Raw mode uses two labels (l for .Lelse, l+1 for .Lend); text
-        // mode only uses one (l, with string prefixes).  If we only
-        // increment by 1 in raw mode the next statement's .Lelse reuses
-        // this statement's .Lend label id, producing jumps to the wrong
-        // place.
+        // One label id for .Lelse and .Lend, told apart by name.
         label_count = label_count + 1;
         gen_expr(nd.child1);
         emit("    cmp rax, 0\n");
@@ -2008,13 +2597,13 @@ void gen_stmt(int nd) {
     // --- while (k=19) ---
     if (k == 19) {
         l = label_count;
-        // Same two-label issue as if/else above.
+        // One label id for .Lstart and .Lend, as in if/else above.
         label_count = label_count + 1;
         emit(".Lstart"); print_int(l); emit(":\n");
         gen_expr(nd.child1);
         emit("    cmp rax, 0\n");
         emit("    je .Lend"); print_int(l); emit("\n");
-        if (gen_loop_depth >= 64) { cerr(); }
+        if (gen_loop_depth >= 64) { die("loops nested too deeply (max 64)"); }
         store64(loop_labels + gen_loop_depth * 8, l);
         gen_loop_depth = gen_loop_depth + 1;
         gen_stmt(nd.child2);
@@ -2044,7 +2633,7 @@ void gen_stmt(int nd) {
     }
     // --- block (k=22) ---
     if (k == 22) { gen_block(nd); return; }
-    cerr();
+    die("internal error: not a statement node");
     return;
 }
 
@@ -2052,7 +2641,7 @@ void gen_function(int f) {
     int frame = f.stack_size;
     int nparams = f.nparams;
     int i = 0;
-    int rem = frame - (frame / 16) * 16;
+    int rem = frame % 16;
     if (rem != 0) { frame = frame + (16 - rem); }
 
     current_ret_label = label_count;
@@ -2083,7 +2672,7 @@ void gen_function(int f) {
     return;
 }
 
-// --- main: read stdin, lex, parse, resolve, emit assembly ------------------
+// --- main reads the input, lexes, parses, resolves and emits assembly -----
 
 int main() {
     int buf = 0;
@@ -2098,7 +2687,6 @@ int main() {
     int f = 0;
     int f2 = 0;
     int np = 0;
-    int sign = 0;
     int i = 0;
     int j = 0;
     int found_main = 0;
@@ -2113,44 +2701,76 @@ int main() {
     int fld_head = 0;
     int fld_tail = 0;
     int fld = 0;
+    int decl_file = 0;
+    int decl_line = 0;
 
     sym_names = alloc(4096 * 8);
     sym_offsets = alloc(4096 * 8);
+    sym_types = alloc(4096 * 8);
     string_ptrs = alloc(4096 * 8);
     string_lens = alloc(4096 * 8);
     loop_labels = alloc(64 * 8);
     scope_marks = alloc(64 * 8);
     field_names = alloc(4096 * 8);
     field_offsets = alloc(4096 * 8);
+    field_ambiguous = alloc(4096 * 8);
     layout_names = alloc(256 * 8);
     layout_sizes = alloc(256 * 8);
 
-    // CLI: `coff input.c0 output.s`, or `coff --elf input.c0 output.s` for
+    // The CLI is `coff input.c0 output.s`, or `coff --elf input.c0 output.s` for
     // the Moonshot ring-3 target (still assembly; smed makes the ELF).
     // With no arguments, stdin/stdout works (differential-test harness),
     // and `coff --elf` alone is the same with the Moonshot target.
-    int cli_input = 1;
-    int cli_output = 2;
-    if (argc() == 4 || argc() == 2) {
-        if (streq(argv(1), "--elf") == 1) { elf_mode = 1; } else { cerr(); }
-        cli_input = 2;
-        cli_output = 3;
-    } else if (argc() == 3) {
-        // normal text mode
-    } else if (argc() != 1) {
-        cerr();
+    // Arguments come in any order, --elf, -I <dir> (any number, up to
+    // MAX_INC_DIRS), and either no files (stdin to stdout) or two.
+    int cli_input = 0;
+    int cli_output = 0;
+    int npos = 0;
+    int usage = 0;
+    inc_dirs = alloc(MAX_INC_DIRS * 8);
+    src_name = "<stdin>";
+    int argi = 1;
+    while (argi < argc()) {
+        int a = argv(argi);
+        if (streq(a, "--elf") == 1) {
+            elf_mode = 1;
+        } else if (streq(a, "-I") == 1 && argi + 1 < argc() && n_inc_dirs < MAX_INC_DIRS) {
+            argi = argi + 1;
+            int d = argv(argi);
+            int dl = strlen_(d);
+            int ws = alloc(dl + 2);
+            int j = 0;
+            while (j < dl) { store8(ws + j, load8(d + j)); j = j + 1; }
+            store8(ws + dl, 0);
+            if (dl == 0 || load8(d + dl - 1) != '/') { store8(ws + dl, '/'); store8(ws + dl + 1, 0); }
+            store64(inc_dirs + n_inc_dirs * 8, ws);
+            n_inc_dirs = n_inc_dirs + 1;
+        } else if (npos == 0) {
+            cli_input = argi; npos = 1;
+        } else if (npos == 1) {
+            cli_output = argi; npos = 2;
+        } else {
+            usage = 1;
+        }
+        argi = argi + 1;
     }
-    if (argc() >= 3) {
-        infd = open_read(argv(cli_input));
-        if (infd < 0) { cerr(); }
+    if (npos == 1) { usage = 1; }
+    if (usage == 1) {
+        eput("usage: coff1 [--elf] [-I dir]... <input.c0> <output.s>  |  coff1 [--elf] < input.c0 > output.s");
+        efail();
+    }
+    if (npos == 2) {
+        src_name = argv(cli_input);
+        infd = open_read(src_name);
+        if (infd < 0) { die_open(src_name, infd); }
         outfd = open_write(argv(cli_output));
-        if (outfd < 0) { cerr(); }
+        if (outfd < 0) { die_open(argv(cli_output), outfd); }
     }
 
     // Real path known (the normal CLI form with input/output files) ->
     // expand include directives, resolving relative paths against
     // the input file's own directory.
-    if (argc() >= 3) {
+    if (npos == 2) {
         expand_buf = alloc(EXPAND_CAP);
         expand_len = 0;
         include_stack = alloc(INCLUDE_MAX_DEPTH * 8);
@@ -2158,22 +2778,10 @@ int main() {
         buf = expand_buf;
         n = expand_len;
     } else {
-        // 1048576 (1MB), not 65536 -- a real 65536-byte cap silently
-        // truncated Moonshot's main kernel source (72329 bytes and growing,
-        // discovered when switching Moonshot's build over from coff0 to
-        // this self-hosted compiler) mid-file, producing a confusing
-        // "PARSEERROR" with no hint the actual problem was "ran out of
-        // buffer," not a real syntax issue. 1MB is generous headroom past
-        // any c0 source file size on the horizon. coff0.c has no
-        // equivalent limit (plain C, reads via a realloc'd buffer), which
-        // is exactly why this went unnoticed until a real, large, growing
-        // file (not a small test corpus entry) hit it.
-        buf = alloc(1048576);
-        got = read(infd, buf, 1048576);
-        while (got > 0) {
-            n = n + got;
-            got = read(infd, buf + n, 1048576 - n);
-        }
+        // No include expansion without a path to resolve against, so
+        // stdin is read as it is, into a growing buffer (see read_all).
+        buf = read_all(infd);
+        n = read_all_len;
     }
 
     lex_all(buf, n);
@@ -2181,53 +2789,95 @@ int main() {
 
     while (tok_kind(tpos) != 26) {
         is_void = 0;
+        // `embed` is a word, not a keyword (see coff0.c).
+        if (tok_kind(tpos) == 2 && streq(tok_name(tpos), "embed") == 1
+            && tok_kind(tpos + 1) == 2 && tok_kind(tpos + 2) == 3) {
+            int em = alloc(sizeof(Embed));
+            em.name = tok_name(tpos + 1);
+            int plen = tok_len(tpos + 2);
+            int pstr = alloc(plen + 1);
+            int pi = 0;
+            while (pi < plen) { store8(pstr + pi, load8(tok_name(tpos + 2) + pi)); pi = pi + 1; }
+            store8(pstr + plen, 0);
+            em.epath = pstr;
+            em.efile = (toks + (tpos + 1) * sizeof(Token)).tfile;
+            em.eline = (toks + (tpos + 1) * sizeof(Token)).tline;
+            tpos = tpos + 3;
+            expect(19, "';'");
+            // The whole path the assembler will be given, the source file's
+            // own directory included, since it goes between quotes in .incbin.
+            em.eresolved = join_path(dirname_with_slash(em.efile), pstr);
+            pi = 0;
+            while (load8(em.eresolved + pi) != 0) {
+                int pc = load8(em.eresolved + pi);
+                if (pc == 34 || pc == 92 || pc == 10) { at_prev(); die("embed: the path may not contain quotes, backslashes or newlines"); }
+                pi = pi + 1;
+            }
+            if (embhead == 0) { embhead = em; embtail = em; }
+            else { embtail.enext = em; embtail = em; }
+            continue;
+        }
         if (tok_kind(tpos) == 34) {
             tpos = tpos + 1;
-            expect(21);  // int
-            if (tok_kind(tpos) != 2) { perr(); }
+            expect(21, "'int' after 'extern'");
+            want(2, "a name");
             name = tok_name(tpos);
             tpos = tpos + 1;
-            expect(19);  // ;
-            e = alloc(sizeof(Global));  // externs are Global-shaped: name + (unused) init + next
+            expect(19, "';'");
+            e = alloc(sizeof(Global));  // externs are Global-shaped, name + (unused) init + next
             e.name = name;
             e.init = 0;
+            e.gfile = (toks + (tpos - 2) * sizeof(Token)).tfile;
+            e.gline = (toks + (tpos - 2) * sizeof(Token)).tline;
             if (ehead == 0) { ehead = e; etail = e; }
             else { etail.next = e; etail = e; }
             continue;
         }
         if (tok_kind(tpos) == 36) {
             tpos = tpos + 1;
-            if (tok_kind(tpos) != 2) { perr(); }
+            want(2, "a layout name");
             l = alloc(sizeof(Layout));
             l.name = tok_name(tpos);
+            l.lfile = (toks + tpos * sizeof(Token)).tfile;
+            l.lline = (toks + tpos * sizeof(Token)).tline;
             tpos = tpos + 1;
-            expect(17);
+            expect(17, "'{'");
             fld_head = 0;
             fld_tail = 0;
             while (tok_kind(tpos) != 18) {
-                expect(21);
-                if (tok_kind(tpos) != 2) { perr(); }
+                expect(21, "'int' (every layout field is an int)");
+                want(2, "a field name");
                 fld = alloc(sizeof(LayoutField));
                 fld.name = tok_name(tpos);
+                fld.lffile = (toks + tpos * sizeof(Token)).tfile;
+                fld.lfline = (toks + tpos * sizeof(Token)).tline;
                 tpos = tpos + 1;
-                expect(19);
+                expect(19, "';'");
                 if (fld_head == 0) { fld_head = fld; fld_tail = fld; }
                 else { fld_tail.next = fld; fld_tail = fld; }
             }
-            expect(18);
+            expect(18, "'}'");
             l.fields = fld_head;
             if (lhead == 0) { lhead = l; ltail = l; }
             else { ltail.next = l; ltail = l; }
             continue;
         }
+        int gtype = 0;
         if (tok_kind(tpos) == 33) { is_void = 1; tpos = tpos + 1; }
-        else { expect(21); }
-        if (tok_kind(tpos) != 2) { perr(); }
+        else if (at_typed_decl() == 1) { gtype = tok_name(tpos); tpos = tpos + 1; }
+        else { expect(21, "'int' or 'void'"); }
+        want(2, "a name");
         name = tok_name(tpos);
+        decl_file = (toks + tpos * sizeof(Token)).tfile;
+        decl_line = (toks + tpos * sizeof(Token)).tline;
         tpos = tpos + 1;
+        if (gtype != 0 && tok_kind(tpos) == 15) { at_prev(); die("a function returns int or void, not a layout"); }
         if (tok_kind(tpos) == 15) {
             f = alloc(sizeof(Function));
+            f.ptypes = alloc(16 * 8);
             f.name = name;
+            f.ffile = decl_file;
+            f.fline = decl_line;
             f.is_void = is_void;
             tpos = tpos + 1;
             np = 0;
@@ -2235,9 +2885,12 @@ int main() {
             extra_tail = 0;
             if (tok_kind(tpos) != 16) {
                 while (1) {
-                    expect(21);
-                    if (tok_kind(tpos) != 2) { perr(); }
-                    if (np >= 16) { cerr(); }
+                    int ptype = 0;
+                    if (at_typed_decl() == 1) { ptype = tok_name(tpos); tpos = tpos + 1; }
+                    else { expect(21, "'int' or a layout name"); }
+                    if (np >= 16) { at_prev(); die3("too many parameters for '", f.name, "' (max 16)"); }
+                    want(2, "a parameter name");
+                    if (np < 16) { store64(f.ptypes + np * 8, ptype); }
                     if (np < 6) {
                         store64(f + 56 + np * 8, tok_name(tpos));
                     } else {
@@ -2252,119 +2905,158 @@ int main() {
                     else { break; }
                 }
             }
-            expect(16);
+            expect(16, "')'");
             f.nparams = np;
             f.extra_params = extra_head;
             f.body = p_block();
             if (fhead == 0) { fhead = f; ftail = f; }
             else { ftail.fnext = f; ftail = f; }
         } else {
-            if (is_void == 1) { cerr(); }
+            if (is_void == 1) { at_prev(); die("'void' is not a valid type for a global"); }
             g = alloc(sizeof(Global));
             g.name = name;
+            g.gfile = decl_file;
+            g.gline = decl_line;
+            g.gtype = gtype;
             if (tok_kind(tpos) == 8) {
                 tpos = tpos + 1;
-                sign = 1;
-                if (tok_kind(tpos) == 5) { tpos = tpos + 1; sign = 0 - 1; }
-                if (tok_kind(tpos) != 1) { perr(); }
-                g.init = sign * tok_ival(tpos);
-                tpos = tpos + 1;
+                g.init = const_fold(p_expr());
             }
-            expect(19);
+            expect(19, "';'");
             if (ghead == 0) { ghead = g; gtail = g; }
             else { gtail.next = g; gtail = g; }
         }
     }
 
-    // Pass A: function signatures — no builtin-name clash, exactly one main
+    // Pass A checks function signatures — no builtin-name clash, exactly one main
     // taking no parameters, no duplicate function names.
+    // Same checks in the same order as coff0's main(), each declaration
+    // against builtins, then against the other kind, then against earlier
+    // declarations of its own kind. The order decides which message a file
+    // with several mistakes gets, and the two compilers must agree on it.
     f = fhead;
     while (f != 0) {
-        if (is_builtin(f.name) == 1) { cerr(); }
+        err_file = f.ffile;
+        err_line = f.fline;
+        if (is_builtin(f.name) == 1) { die3("'", f.name, "' is a builtin and cannot be redefined"); }
+        check_symbol_name(f.name, "a function");
+        f2 = fhead;
+        while (f2 != f) {
+            if (streq(f.name, f2.name) == 1) { die3("redefinition of function '", f.name, "'"); }
+            f2 = f2.fnext;
+        }
         if (streq(f.name, "main") == 1) {
-            if (f.nparams != 0) { cerr(); }
-            if (f.is_void == 1) { cerr(); }
+            if (f.nparams != 0) { die("'main' must take no parameters"); }
+            if (f.is_void == 1) { die("'main' must return int, not void"); }
             found_main = 1;
         }
         f = f.fnext;
     }
-    if (found_main == 0) { cerr(); }
-    f = fhead;
-    while (f != 0) {
-        f2 = f.fnext;
-        while (f2 != 0) {
-            if (streq(f.name, f2.name) == 1) { cerr(); }
-            f2 = f2.fnext;
-        }
-        f = f.fnext;
-    }
+    err_line = 0;
+    if (found_main == 0) { die("no 'main' function defined"); }
 
-    // Pass B: globals — no builtin-name clash, no function-name clash, no
-    // duplicate global names.
     g = ghead;
     while (g != 0) {
-        if (is_builtin(g.name) == 1) { cerr(); }
+        err_file = g.gfile;
+        err_line = g.gline;
+        if (is_builtin(g.name) == 1) { die3("'", g.name, "' is a builtin and cannot be redefined"); }
         f = fhead;
         while (f != 0) {
-            if (streq(f.name, g.name) == 1) { cerr(); }
+            if (streq(f.name, g.name) == 1) { die3("'", g.name, "' is both a function and a global"); }
             f = f.fnext;
         }
-        g = g.next;
-    }
-    g = ghead;
-    while (g != 0) {
-        g2 = g.next;
-        while (g2 != 0) {
-            if (streq(g.name, g2.name) == 1) { cerr(); }
+        g2 = ghead;
+        while (g2 != g) {
+            if (streq(g.name, g2.name) == 1) { die3("redefinition of global '", g.name, "'"); }
             g2 = g2.next;
         }
         g = g.next;
     }
 
-    // Pass B2: externs — no builtin-name clash,
-    // no global-name clash, no duplicate extern names.
-    // (Function-name clash is allowed: extern int func; resolves to FUNCREF
-    // same as a bare function reference, which is the intended use.)
     e = ehead;
     while (e != 0) {
-        if (is_builtin(e.name) == 1) { cerr(); }
+        err_file = e.gfile;
+        err_line = e.gline;
+        if (is_builtin(e.name) == 1) { die3("'", e.name, "' is a builtin and cannot be used as extern"); }
+        check_symbol_name(e.name, "an extern");
         g = ghead;
         while (g != 0) {
-            if (streq(g.name, e.name) == 1) { cerr(); }
+            if (streq(g.name, e.name) == 1) { die3("'", e.name, "' is both a global and an extern"); }
             g = g.next;
         }
-        e = e.next;
-    }
-    e = ehead;
-    while (e != 0) {
-        int e2 = e.next;
-        while (e2 != 0) {
-            if (streq(e.name, e2.name) == 1) { cerr(); }
+        int e2 = ehead;
+        while (e2 != e) {
+            if (streq(e.name, e2.name) == 1) { die3("redefinition of extern '", e.name, "'"); }
             e2 = e2.next;
         }
         e = e.next;
     }
 
-    // Pass B3: layouts -- register field offsets (erroring on cross-layout
-    // conflicts) and each layout's size, before any function body gets
-    // resolved (field/sizeof references inside those bodies depend on it).
+    // An embed's name is an address, like an extern; name_size is a global
+    // the assembler fills in. Same checks, order and messages as coff0.c.
+    int emb = embhead;
+    int emb_n = 0;
+    while (emb != 0) {
+        err_file = emb.efile;
+        err_line = emb.eline;
+        if (is_builtin(emb.name) == 1) { die3("'", emb.name, "' is a builtin and cannot be used as embed"); }
+        check_symbol_name(emb.name, "an embed");
+        if (glob_exists(emb.name) == 1 || func_exists(emb.name) == 1 || extern_exists(emb.name) == 1) {
+            die3("'", emb.name, "' is declared twice");
+        }
+        int ex = alloc(sizeof(Global));
+        ex.name = emb.name;
+        ex.gfile = emb.efile;
+        ex.gline = emb.eline;
+        if (ehead == 0) { ehead = ex; etail = ex; } else { etail.next = ex; etail = ex; }
+        int nl = strlen_(emb.name);
+        int sz = alloc(nl + 6);
+        int si = 0;
+        while (si < nl) { store8(sz + si, load8(emb.name + si)); si = si + 1; }
+        store8(sz + nl, '_'); store8(sz + nl + 1, 's'); store8(sz + nl + 2, 'i');
+        store8(sz + nl + 3, 'z'); store8(sz + nl + 4, 'e'); store8(sz + nl + 5, 0);
+        if (glob_exists(sz) == 1 || func_exists(sz) == 1 || extern_exists(sz) == 1) {
+            die3("'", sz, "' is declared twice");
+        }
+        int sg = alloc(sizeof(Global));
+        sg.name = sz;
+        sg.gfile = emb.efile;
+        sg.gline = emb.eline;
+        emb_n = emb_n + 1;
+        sg.gembed = emb_n;
+        sg.init = emb.name;   // what the size is measured from, for codegen
+        if (ghead == 0) { ghead = sg; gtail = sg; } else { gtail.next = sg; gtail = sg; }
+        emb = emb.enext;
+    }
+
     l = lhead;
     while (l != 0) {
         layout_declare(l);
         l = l.next;
     }
+    g = ghead;
+    while (g != 0) {
+        err_file = g.gfile;
+        err_line = g.gline;
+        check_type(g.gtype);
+        g = g.next;
+    }
 
-    // Pass C: resolve every function body, assigning stack offsets.
+    // Pass C resolves every function body, assigning stack offsets.
     f = fhead;
     while (f != 0) {
         sym_count = 0;
         stack_size = 0;
         scope_depth = 0;
         current_fn_is_void = f.is_void;
+        err_file = f.ffile;
+        err_line = f.fline;
         np = f.nparams;
         i = 0;
         while (i < np) {
+            check_type(load64(f.ptypes + i * 8));
             sym_declare(param_name_at(f, i));
+            store64(sym_types + (sym_count - 1) * 8, load64(f.ptypes + i * 8));
             i = i + 1;
         }
         resolve(f.body);
@@ -2372,7 +3064,7 @@ int main() {
         f = f.fnext;
     }
 
-    // Pass D: emit code.
+    // Pass D emits code.
 
     emit(".intel_syntax noprefix\n");
     emit(".global _start\n");
@@ -2411,14 +3103,37 @@ int main() {
         }
     }
 
+    // Embedded files, each followed by a label so their length is a
+    // difference of two addresses (see coff0.c).
+    int ei = 0;
+    int eb = embhead;
+    while (eb != 0) {
+        if (ei == 0) { emit("\n.section .rodata\n"); }
+        emit(".balign 8\n"); emit(eb.name); emit(":\n    .incbin \"");
+        emit(eb.eresolved); emit("\"\n.Lembend"); print_int(ei); emit(":\n");
+        ei = ei + 1;
+        eb = eb.enext;
+    }
+
     emit("\n.section .data\n");
     emit(".Lcurbrk:\n    .quad 0\n");
     emit(".Largv0:\n    .quad 0\n");
     g = ghead;
     while (g != 0) {
-        emit(".G"); emit(g.name); emit(":\n    .quad ");
-        print_int(g.init);
-        emit("\n");
+        if (g.gembed == 0) {
+            emit(".G"); emit(g.name); emit(":\n    .quad ");
+            print_int(g.init);
+            emit("\n");
+        }
+        g = g.next;
+    }
+    g = ghead;
+    while (g != 0) {
+        if (g.gembed != 0) {
+            emit(".G"); emit(g.name); emit(":\n    .quad .Lembend");
+            print_int(g.gembed - 1); emit(" - ");
+            emit(g.init); emit("\n");
+        }
         g = g.next;
     }
 

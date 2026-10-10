@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/99_missing_field_name.c0 - a dot with no field name after it is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+layout A { int x; }
+int main() { int a = alloc(8); return a.; }

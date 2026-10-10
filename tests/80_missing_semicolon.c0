@@ -1,0 +1,8 @@
+// expect: compile-error
+//
+// tests/80_missing_semicolon.c0 - a missing semicolon is reported at the line where it belongs
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int x = 1
+    return x;
+}

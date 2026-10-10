@@ -1,0 +1,30 @@
+// expect: 127
+//
+// tests/105_const_global_init.c0 - global initializers are constant expressions folded at compile time
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A global's initializer is folded at compile time, so it can be any
+// constant expression of numbers, characters and operators, not just a
+// literal. Each check that holds adds its own bit; all of them is 127.
+int MINUS_ONE = 0 - 1;
+int NEG = -7;
+int MB = 4 * 256 * 1024;
+int MASK = (1 << 12) - 1;
+int HIGH = ~0 << 60;
+int QUOT = -7 / 2;
+int REM = -7 % 2;
+int SAR = -16 >> 2;
+int MIX = (0x0F ^ 0xFF) | 1 & 3;
+int CH = 'A' + 1;
+
+int main() {
+    int ok = 0;
+    if (MINUS_ONE == 0 - 1) { ok = ok + 1; }
+    if (NEG == 0 - 7) { ok = ok + 2; }
+    if (MB == 1048576) { ok = ok + 4; }
+    if (MASK == 4095) { ok = ok + 8; }
+    if (HIGH == ~0 << 60) { ok = ok + 16; }
+    // Truncation toward zero and the dividend's sign, as at run time.
+    if (QUOT == 0 - 3 && REM == 0 - 1) { ok = ok + 32; }
+    if (SAR == 0 - 4 && MIX == 241 && CH == 66) { ok = ok + 64; }
+    return ok;
+}

@@ -1,0 +1,8 @@
+// tests/include_fixtures/bad_inner.c0 - fixture for 103_error_in_included_file, uses an undeclared name
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+//
+// The return below uses a name nothing declares, so the error has to name
+// this file and this line.
+int inner() {
+    return nowhere;
+}

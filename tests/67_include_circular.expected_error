@@ -1,0 +1,1 @@
+coff0: tests/include_fixtures/cyc_b.c0:5: include: circular include of tests/include_fixtures/cyc_a.c0

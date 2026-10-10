@@ -1,0 +1,39 @@
+// expect: 20
+//
+// tests/102_bitwise.c0 - the bitwise operators with C precedence, >> arithmetic
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// & | ^ ~ << >> with C's precedence and semantics. >> is arithmetic, so a
+// negative number stays negative. Each check that holds adds one.
+int main() {
+    int ok = 0;
+    if ((12 & 10) == 8) { ok = ok + 1; }
+    if ((12 | 10) == 14) { ok = ok + 1; }
+    if ((12 ^ 10) == 6) { ok = ok + 1; }
+    if (~0 == 0 - 1) { ok = ok + 1; }
+    if (~5 == 0 - 6) { ok = ok + 1; }
+    if (1 << 10 == 1024) { ok = ok + 1; }
+    if (1024 >> 3 == 128) { ok = ok + 1; }
+    if (-16 >> 2 == 0 - 4) { ok = ok + 1; }
+    if (-1 >> 63 == 0 - 1) { ok = ok + 1; }
+    if (1 << 63 < 0) { ok = ok + 1; }
+    // shifts bind looser than + and tighter than <
+    if (1 << 2 + 1 == 8) { ok = ok + 1; }
+    // & binds looser than ==, as in C, so this is 6 & (2 == 2), which is 0
+    if ((6 & 2 == 2) == 0) { ok = ok + 1; }
+    // & over ^ over |
+    if ((1 | 6 ^ 3 & 5) == 7) { ok = ok + 1; }
+    // | still binds tighter than && and ||
+    if (0 | 1 && 2 | 0) { ok = ok + 1; }
+    // left associative
+    if (256 >> 2 >> 1 == 32) { ok = ok + 1; }
+    if ((7 ^ 1 ^ 1) == 7) { ok = ok + 1; }
+    // masks and rotates the way sha256 uses them
+    int x = 0x12345678;
+    int rotr8 = ((x >> 8) | (x << 24)) & 0xFFFFFFFF;
+    if (rotr8 == 0x78123456) { ok = ok + 1; }
+    if ((x & 0xFF) == 0x78) { ok = ok + 1; }
+    int n = 3;
+    if ((1 << n) == 8) { ok = ok + 1; }
+    if ((~x & 0xFFFFFFFF) == 0xEDCBA987) { ok = ok + 1; }
+    return ok;
+}

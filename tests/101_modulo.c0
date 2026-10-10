@@ -1,0 +1,27 @@
+// expect: 10
+//
+// tests/101_modulo.c0 - % has the sign, precedence and associativity it has in C
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// % takes the sign of the dividend, like C (and like x86's idiv), binds as
+// tightly as * and /, and associates left. Each check that holds adds one.
+int main() {
+    int ok = 0;
+    if (17 % 5 == 2) { ok = ok + 1; }
+    if (-17 % 5 == 0 - 2) { ok = ok + 1; }
+    if (17 % -5 == 2) { ok = ok + 1; }
+    if (-17 % -5 == 0 - 2) { ok = ok + 1; }
+    if (10 % 2 == 0) { ok = ok + 1; }
+    if (3 % 7 == 3) { ok = ok + 1; }
+    if (2 + 7 % 4 * 3 == 11) { ok = ok + 1; }
+    if (20 / 6 % 4 == 3) { ok = ok + 1; }
+    int sum = 0;
+    int i = 0;
+    while (i < 10) {
+        sum = sum + i % 3;
+        i = i + 1;
+    }
+    if (sum == 9) { ok = ok + 1; }
+    int n = 1234;
+    if (n % 10 + n / 10 % 10 == 7) { ok = ok + 1; }
+    return ok;
+}

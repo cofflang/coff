@@ -1,0 +1,248 @@
+// sha256.c0 - SHA-256 (FIPS 180-4) written in c0.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0.
+//
+// coff is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your
+// option) any later version. coff is distributed in the hope that it
+// will be useful, but WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+// the GNU General Public License for more details. You should have
+// received a copy of the license along with coff; if not, see
+// <https://www.gnu.org/licenses/>.
+//
+// Usage: sha256 FILE...
+//
+// Prints one line per file in sha256sum's format, the 64 hex digits, two
+// spaces, then the name, so its output can be diffed against sha256sum's
+// or stand in for it. Exit status 0, or 1 if any file could not be read.
+// Unlike sha256sum it does not escape names holding a backslash or a
+// newline, and it does not read stdin.
+//
+// It exists because the audit's inspectors came from the system rather than
+// from anything the audit checks. A hasher written in c0 is compiled by the
+// coff1 the audit verifies, and verify_bootstrap.sh runs it next to
+// sha256sum on every manifest hash, failing if the two ever disagree. See
+// TRUST.md.
+//
+// c0 ints are 64 bits wide and SHA-256 works in 32-bit words, so every
+// word lives in the low half of an int and is masked back to 32 bits
+// after anything that can carry past them. Values stay non-negative, which
+// makes c0's arithmetic >> behave as the logical shift the spec wants.
+
+int M32 = 0xFFFFFFFF;
+
+int K = 0;      // 64 round constants
+int H = 0;      // 8 hash words
+int W = 0;      // 64-word message schedule
+int blk = 0;    // the 64-byte block being filled
+int blen = 0;   // bytes in blk so far
+int total = 0;  // message bytes hashed so far
+
+int strlen_(int s) {
+    int n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+
+void eput(int s) {
+    write(2, s, strlen_(s));
+    return;
+}
+
+int rotr(int x, int n) {
+    return ((x >> n) | (x << (32 - n))) & M32;
+}
+
+void setk(int i, int v) {
+    store64(K + i * 8, v);
+    return;
+}
+
+void init_constants() {
+    K = alloc(64 * 8);
+    H = alloc(8 * 8);
+    W = alloc(64 * 8);
+    blk = alloc(64);
+    setk(0, 0x428a2f98); setk(1, 0x71374491); setk(2, 0xb5c0fbcf); setk(3, 0xe9b5dba5);
+    setk(4, 0x3956c25b); setk(5, 0x59f111f1); setk(6, 0x923f82a4); setk(7, 0xab1c5ed5);
+    setk(8, 0xd807aa98); setk(9, 0x12835b01); setk(10, 0x243185be); setk(11, 0x550c7dc3);
+    setk(12, 0x72be5d74); setk(13, 0x80deb1fe); setk(14, 0x9bdc06a7); setk(15, 0xc19bf174);
+    setk(16, 0xe49b69c1); setk(17, 0xefbe4786); setk(18, 0x0fc19dc6); setk(19, 0x240ca1cc);
+    setk(20, 0x2de92c6f); setk(21, 0x4a7484aa); setk(22, 0x5cb0a9dc); setk(23, 0x76f988da);
+    setk(24, 0x983e5152); setk(25, 0xa831c66d); setk(26, 0xb00327c8); setk(27, 0xbf597fc7);
+    setk(28, 0xc6e00bf3); setk(29, 0xd5a79147); setk(30, 0x06ca6351); setk(31, 0x14292967);
+    setk(32, 0x27b70a85); setk(33, 0x2e1b2138); setk(34, 0x4d2c6dfc); setk(35, 0x53380d13);
+    setk(36, 0x650a7354); setk(37, 0x766a0abb); setk(38, 0x81c2c92e); setk(39, 0x92722c85);
+    setk(40, 0xa2bfe8a1); setk(41, 0xa81a664b); setk(42, 0xc24b8b70); setk(43, 0xc76c51a3);
+    setk(44, 0xd192e819); setk(45, 0xd6990624); setk(46, 0xf40e3585); setk(47, 0x106aa070);
+    setk(48, 0x19a4c116); setk(49, 0x1e376c08); setk(50, 0x2748774c); setk(51, 0x34b0bcb5);
+    setk(52, 0x391c0cb3); setk(53, 0x4ed8aa4a); setk(54, 0x5b9cca4f); setk(55, 0x682e6ff3);
+    setk(56, 0x748f82ee); setk(57, 0x78a5636f); setk(58, 0x84c87814); setk(59, 0x8cc70208);
+    setk(60, 0x90befffa); setk(61, 0xa4506ceb); setk(62, 0xbef9a3f7); setk(63, 0xc67178f2);
+    return;
+}
+
+void sha_init() {
+    store64(H, 0x6a09e667);
+    store64(H + 8, 0xbb67ae85);
+    store64(H + 16, 0x3c6ef372);
+    store64(H + 24, 0xa54ff53a);
+    store64(H + 32, 0x510e527f);
+    store64(H + 40, 0x9b05688c);
+    store64(H + 48, 0x1f83d9ab);
+    store64(H + 56, 0x5be0cd19);
+    blen = 0;
+    total = 0;
+    return;
+}
+
+// One 64-byte block into the hash state.
+void compress() {
+    int i = 0;
+    while (i < 16) {
+        int p = blk + i * 4;
+        store64(W + i * 8, (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3));
+        i = i + 1;
+    }
+    while (i < 64) {
+        int w15 = load64(W + (i - 15) * 8);
+        int w2 = load64(W + (i - 2) * 8);
+        int s0 = rotr(w15, 7) ^ rotr(w15, 18) ^ (w15 >> 3);
+        int s1 = rotr(w2, 17) ^ rotr(w2, 19) ^ (w2 >> 10);
+        store64(W + i * 8, (load64(W + (i - 16) * 8) + s0 + load64(W + (i - 7) * 8) + s1) & M32);
+        i = i + 1;
+    }
+
+    int a = load64(H);
+    int b = load64(H + 8);
+    int c = load64(H + 16);
+    int d = load64(H + 24);
+    int e = load64(H + 32);
+    int f = load64(H + 40);
+    int g = load64(H + 48);
+    int h = load64(H + 56);
+    i = 0;
+    while (i < 64) {
+        int big1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        int choose = (e & f) ^ (~e & g);
+        int t1 = (h + big1 + choose + load64(K + i * 8) + load64(W + i * 8)) & M32;
+        int big0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        int majority = (a & b) ^ (a & c) ^ (b & c);
+        int t2 = (big0 + majority) & M32;
+        h = g;
+        g = f;
+        f = e;
+        e = (d + t1) & M32;
+        d = c;
+        c = b;
+        b = a;
+        a = (t1 + t2) & M32;
+        i = i + 1;
+    }
+    store64(H, (load64(H) + a) & M32);
+    store64(H + 8, (load64(H + 8) + b) & M32);
+    store64(H + 16, (load64(H + 16) + c) & M32);
+    store64(H + 24, (load64(H + 24) + d) & M32);
+    store64(H + 32, (load64(H + 32) + e) & M32);
+    store64(H + 40, (load64(H + 40) + f) & M32);
+    store64(H + 48, (load64(H + 48) + g) & M32);
+    store64(H + 56, (load64(H + 56) + h) & M32);
+    return;
+}
+
+void sha_byte(int v) {
+    store8(blk + blen, v);
+    blen = blen + 1;
+    if (blen == 64) {
+        compress();
+        blen = 0;
+    }
+    return;
+}
+
+// Padding is a 1 bit, zeros up to 56 bytes into a block, then the message
+// length in bits as a big-endian 64-bit number.
+void sha_final() {
+    int bits = total * 8;
+    int i = 7;
+    sha_byte(0x80);
+    while (blen != 56) { sha_byte(0); }
+    while (i >= 0) {
+        sha_byte((bits >> (i * 8)) & 0xFF);
+        i = i - 1;
+    }
+    return;
+}
+
+// Hashes one file and prints its line. Returns 0, or 1 if it could not be
+// read.
+int hash_file(int name, int chunk) {
+    int fd = open_read(name);
+    int got = 0;
+    int i = 0;
+    if (fd < 0) {
+        eput("sha256: "); eput(name); eput(": No such file or directory\n");
+        return 1;
+    }
+    sha_init();
+    got = read(fd, chunk, 65536);
+    while (got > 0) {
+        i = 0;
+        while (i < got) {
+            sha_byte(load8(chunk + i));
+            i = i + 1;
+        }
+        total = total + got;
+        got = read(fd, chunk, 65536);
+    }
+    close(fd);
+    if (got < 0) {
+        eput("sha256: "); eput(name); eput(": read error\n");
+        return 1;
+    }
+    sha_final();
+
+    int nl = strlen_(name);
+    int line = alloc(64 + 2 + nl + 1);
+    int digits = "0123456789abcdef";
+    int w = 0;
+    while (w < 8) {
+        int v = load64(H + w * 8);
+        int k = 0;
+        while (k < 8) {
+            store8(line + w * 8 + k, load8(digits + ((v >> (28 - k * 4)) & 15)));
+            k = k + 1;
+        }
+        w = w + 1;
+    }
+    store8(line + 64, ' ');
+    store8(line + 65, ' ');
+    i = 0;
+    while (i < nl) {
+        store8(line + 66 + i, load8(name + i));
+        i = i + 1;
+    }
+    store8(line + 66 + nl, '\n');
+    write(1, line, 66 + nl + 1);
+    return 0;
+}
+
+int main() {
+    int status = 0;
+    int i = 1;
+    int chunk = alloc(65536);
+    if (argc() < 2) {
+        eput("usage: sha256 FILE...\n");
+        return 2;
+    }
+    init_constants();
+    while (i < argc()) {
+        if (hash_file(argv(i), chunk) != 0) { status = 1; }
+        i = i + 1;
+    }
+    return status;
+}

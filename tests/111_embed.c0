@@ -1,0 +1,15 @@
+// expect: 92
+//
+// tests/111_embed.c0 - embed puts a file in the program and gives its address and size
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// `embed name "file";` puts the file's bytes in the program as data.
+// `greeting` is their address and `greeting_size` their length, measured by
+// the assembler. The file is "moonshot" and a newline, 9 bytes.
+embed greeting "embed_fixtures/greeting.txt";
+
+int main() {
+    int ok = greeting_size * 10;                    // 90
+    if (load8(greeting) == 'm') { ok = ok + 1; }     // 91
+    if (load8(greeting + 8) == 10) { ok = ok + 1; }  // 92
+    return ok;
+}

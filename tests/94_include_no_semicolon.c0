@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/94_include_no_semicolon.c0 - an include directive needs its semicolon
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+include "include_fixtures/adder.c0"
+int main() { return 0; }

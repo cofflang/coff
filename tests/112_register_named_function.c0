@@ -1,0 +1,8 @@
+// expect: compile-error
+//
+// tests/112_register_named_function.c0 - a function named like a register is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A function becomes an assembler symbol under its own name, and `call rax`
+// would call through the register instead. Register names are refused.
+int rax() { return 1; }
+int main() { return rax(); }

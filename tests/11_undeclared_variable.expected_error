@@ -1,0 +1,1 @@
+coff0: tests/11_undeclared_variable.c0:6: undeclared variable 'y'

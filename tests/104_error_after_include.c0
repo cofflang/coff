@@ -1,0 +1,13 @@
+// expect: compile-error
+//
+// tests/104_error_after_include.c0 - line numbers stay right after a multi-line include directive
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// An include directive split over three lines, then an error further down.
+// Line numbers in this file must resume correctly after the included text.
+include
+    "include_fixtures/adder.c0"
+    ;
+int main() {
+    int a = add(1, 2);
+    return a + missing;
+}

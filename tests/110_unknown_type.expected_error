@@ -1,0 +1,1 @@
+coff0: tests/110_unknown_type.c0:6: unknown type 'Pont' (a type is int or a layout name)

@@ -8,7 +8,7 @@ int main() {
     int outer;
     int inner_sum;
 
-    // basic break: loop would run to 10, but breaks at 5
+    // basic break, the loop would run to 10 but breaks at 5
     i = 0;
     sum = 0;
     while (i < 10) {
@@ -18,7 +18,7 @@ int main() {
     }
     if (sum != 5) { return 10; }
 
-    // basic continue: skip even numbers, sum odd 1..9
+    // basic continue, skip even numbers, sum odd 1..9
     i = 0;
     sum = 0;
     while (i < 10) {
@@ -28,7 +28,7 @@ int main() {
     }
     if (sum != 25) { return 11; }
 
-    // nested loops: break/continue only affect the innermost loop
+    // nested loops, break/continue only affect the innermost loop
     outer = 0;
     sum = 0;
     while (outer < 3) {

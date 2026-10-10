@@ -28,7 +28,7 @@ int main() {
     r = add8(1, 2, 3, 4, 5, 6, 7, seven(0, 0, 0, 0, 0, 0, 9) - 1);
     if (r != 12345678) { return 3; }
 
-    // recursion through a >6-arg function: repeated push/cleanup
+    // recursion through a >6-arg function, where repeated push/cleanup
     // cycles must not corrupt anything
     r = nine(1, 0, 0, 0, 0, 0, 0, 0, 3);
     if (r != 30000000) { return 4; }

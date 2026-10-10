@@ -1,0 +1,1 @@
+coff0: tests/81_missing_rparen.c0:6: expected ')'

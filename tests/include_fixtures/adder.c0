@@ -1,4 +1,4 @@
-// tests/include_fixtures/adder.c0 - fixture for 65_include_basic: defines add(), only ever included
+// tests/include_fixtures/adder.c0 - fixture for 65_include_basic, defines add(), only ever included
 // Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
 //
 // Only ever referenced via `include`, never compiled standalone. It

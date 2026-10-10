@@ -1,0 +1,40 @@
+// expect: 63
+//
+// tests/108_typed_layout_decl.c0 - a variable typed with a layout looks fields up in that layout
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A layout name as a variable's type. Fields of a typed variable are looked
+// up in its own layout, so two layouts may give a field name different
+// offsets. Each check that holds adds a bit.
+layout Point { int x; int y; }
+layout Size { int w; int x; }
+
+Point origin;
+
+int area(Size s) { return s.w * s.x; }
+
+int main() {
+    int ok = 0;
+    Point p = alloc(sizeof(Point));
+    Size s = alloc(sizeof(Size));
+    p.x = 3;
+    p.y = 4;
+    s.w = 5;
+    s.x = 6;
+    // Point's x is at offset 0, Size's at offset 8.
+    if (load64(p) == 3 && load64(p + 8) == 4) { ok = ok + 1; }
+    if (load64(s) == 5 && load64(s + 8) == 6) { ok = ok + 2; }
+    // A typed parameter.
+    if (area(s) == 30) { ok = ok + 4; }
+    // A typed global.
+    origin = p;
+    if (origin.y == 4) { ok = ok + 8; }
+    // An untyped variable still reaches a field whose name is unambiguous.
+    int q = p;
+    if (q.y == 4) { ok = ok + 16; }
+    // A typed variable in an inner block shadows nothing it should not.
+    if (1) {
+        Size p2 = s;
+        if (p2.x == 6) { ok = ok + 32; }
+    }
+    return ok;
+}

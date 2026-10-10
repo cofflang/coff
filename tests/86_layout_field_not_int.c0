@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/86_layout_field_not_int.c0 - every layout field is int
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+layout A { void x; }
+int main() { return 0; }

@@ -1,0 +1,5 @@
+// expect: compile-error
+//
+// tests/98_loops_nested_too_deeply.c0 - loops nested past the limit are refused, not overflowed
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() { while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1) while (1)  break; return 0; }

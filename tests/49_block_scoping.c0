@@ -1,6 +1,6 @@
 // expect: 42
 //
-// tests/49_block_scoping.c0 - block scoping: sibling blocks reuse names, inner blocks shadow
+// tests/49_block_scoping.c0 - block scoping, sibling blocks reuse names, inner blocks shadow
 // Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
 int main() {
     int result;
@@ -27,7 +27,7 @@ int main() {
     }
     if (result != 300) { return 2; }
 
-    // shadowing: inner block's x shadows outer x, outer resumes after the block
+    // shadowing, inner block's x shadows outer x, outer resumes after the block
     x = 1;
     if (1) {
         int x;

@@ -14,7 +14,7 @@
 // received a copy of the license along with coff; if not, see
 // <https://www.gnu.org/licenses/>.
 
-// Purpose: the first piece of the self-hosted compiler, kept as a
+// This is the first piece of the self-hosted compiler, kept as a
 // standalone differential test stage. Reads c0 source from stdin (or an
 // optional file argument, see main) and prints one token per line in
 // exactly the format of `coff0 -t` -- that format is the contract the
@@ -22,20 +22,19 @@
 // prints LEXERROR and exits 1; coff0 -t aborts with no stdout at all in
 // that case, so error files are excluded from the diff.
 //
-// Some of the style in here is historical: this file predates c0 having
-// break/continue (hence the loop flags) and predates globals, so most
-// state is threaded through locals. Both features exist now; I have left
-// the old shapes alone where rewriting them buys nothing.
+// It uses only a small part of c0. Loops end through flags rather than
+// break/continue, and most state is threaded through locals; the only
+// globals are the include-expansion state below.
 
 // The chain of currently-open includes, for cycle detection -- see
 // expand_file.
 int INCLUDE_MAX_DEPTH = 32;
 int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
 int include_depth = 0;
-// Output buffer for expand_file's textual substitution. This mirrors
-// coff0.c's resolve_includes (see the comment there for the design) and
-// is differentially verified against it. Fixed generous size instead of
-// real dynamic growth, which is the usual buffer style in this codebase.
+// Growing output buffer for expand_file's textual substitution -- see
+// coff0.c's resolve_includes for the full rationale (this mirrors it
+// exactly, differentially verified). A fixed generous size rather than
+// real dynamic growth.
 int EXPAND_CAP = 4194304; // 4MB
 int expand_buf = 0;
 int expand_len = 0;
@@ -85,7 +84,7 @@ void print_int(int v) {
     int i = 31;
     while (v > 0) {
         i = i - 1;
-        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        store8(tmp + i, '0' + (v % 10));
         v = v / 10;
     }
     if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
@@ -109,13 +108,13 @@ int word_is(int buf, int start, int len, int kw) {
 
 // -------------------------------------------------------------- includes
 //
-// `include "path.c0";` is pure textual substitution, resolved before
-// real lexing starts. This mirrors coff0.c's resolve_includes exactly
-// and is differentially verified against it; see the comment there for
-// the design. One difference worth noting: this tool was stdin-only for
-// most of its life, so main() below takes an optional file argument --
-// a relative include path needs a real file path to resolve against,
-// and piped stdin bytes do not have one.
+// `include "path.c0";` is pure textual substitution, resolved entirely
+// before real lexing starts -- mirrors coff0.c's resolve_includes exactly
+// (differentially verified against it), see that comment for the full
+// design rationale. The one difference is that lex.c0 reads stdin unless
+// main() is given an optional file argument. Includes are only expanded
+// with that argument, since a relative include path has nothing to
+// resolve against otherwise.
 
 int slen(int s) {
     int i = 0;
@@ -139,9 +138,9 @@ int streq_(int a, int b) {
     return result;
 }
 
-// Directory part of `path` (a null-terminated string), trailing slash
-// included so callers can concatenate directly. A fresh empty string
-// when the path has no slash at all.
+// Directory portion of `path` (a null-terminated string), trailing slash
+// included so callers can concatenate directly, or a fresh empty string
+// if `path` has no slash (same-directory relative resolution).
 int dirname_with_slash(int path) {
     int len = slen(path);
     int i = len - 1;
@@ -191,13 +190,12 @@ void expand_putc(int c) {
     return;
 }
 
-// Reads `path` and scans its raw text for `include "X";` directives,
-// copying everything else through unchanged (string literals, char
-// literals and // comments verbatim, so none of them can trigger a
-// false match). Each include is expanded recursively in place, appended
-// into the shared expand_buf/expand_len globals. include_stack and
-// include_depth guard against a file including itself, directly or
-// transitively.
+// Reads `path`, scans its raw text for `include "X";` directives (copying
+// everything else through unchanged, including string literals and //
+// comments verbatim so neither can trigger a false match), and recursively
+// expands each include in place -- appending the result into the shared
+// expand_buf/expand_len globals. include_stack/include_depth guard against
+// a file including itself, directly or transitively.
 void expand_file(int path) {
     int i = 0;
     while (i < include_depth) {
@@ -253,13 +251,13 @@ void expand_file(int path) {
             }
             if (p < n) { expand_putc('"'); p = p + 1; }
         } else if (c == '\'') {
-            // Char literals need the same verbatim-copy treatment as
-            // strings. Without this case the scanner has no notion of
-            // being inside a char literal, so a literal like '"' made it
-            // enter string-skip mode at that bare quote and swallow
-            // everything up to the next `"` in the file. Found the hard
-            // way: this very function's own source contains `!= '"'`,
-            // which broke lexing this file before the fix.
+            // Char literals ('x', including quote characters like '"' or
+            // '\'') need the same verbatim-copy treatment as strings --
+            // without this case, the scanner has no notion of "inside a
+            // char literal" at all, so a literal like '"' would make it
+            // wrongly enter STRING mode at that bare `"` instead, scanning
+            // forward to whatever `"` happens to appear next in the file.
+            // This function's own source contains `!= '"'`.
             expand_putc(c);
             p = p + 1;
             if (p < n && load8(src + p) == '\\' && p + 1 < n) {
@@ -332,11 +330,11 @@ int main() {
     int buf = 0;
     int n = 0;
 
-    // The optional file argument is what makes include resolution
-    // possible at all -- a relative include path needs a real file to
-    // resolve relative to, and piped stdin content cannot provide one.
-    // With no argument (the original stdin-only interface) expansion is
-    // skipped entirely, same behavior as before includes existed.
+    // An optional file argument (`lex1 file.c0`) is what makes include
+    // resolution possible at all -- a relative include path needs a real
+    // file to resolve relative to, which piped stdin content alone cannot
+    // provide. With no argument, stdin is lexed as it is and includes are
+    // not expanded.
     if (argc() == 2) {
         expand_buf = alloc(EXPAND_CAP);
         expand_len = 0;
@@ -345,12 +343,9 @@ int main() {
         buf = expand_buf;
         n = expand_len;
     } else {
-        // 1MB, not 65536. The old 65536-byte cap silently truncated the
-        // first real c0 file that outgrew it (my OS kernel's main
-        // source) and the only symptom was a confusing parse error far
-        // downstream, with no hint that the actual problem was a full
-        // buffer. 1MB is generous headroom past any c0 file I expect to
-        // write.
+        // A fixed 1MB buffer, generous headroom past any c0 source file.
+        // Input beyond 1MB is cut off, which would surface as a confusing
+        // parse error rather than a message about the buffer.
         buf = alloc(1048576);
         int got = read(0, buf, 1048576);
         while (got > 0) {
@@ -540,29 +535,34 @@ int main() {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { print("LE\n"); pos = pos + 2; }
+            else if (nxt == '<') { print("SHL\n"); pos = pos + 2; }
             else { print("LT\n"); pos = pos + 1; }
         }
         else if (c == '>') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { print("GE\n"); pos = pos + 2; }
+            else if (nxt == '>') { print("SHR\n"); pos = pos + 2; }
             else { print("GT\n"); pos = pos + 1; }
         }
         else if (c == '&') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '&') { print("AND\n"); pos = pos + 2; }
-            else { print("LEXERROR\n"); return 1; }
+            else { print("AMP\n"); pos = pos + 1; }
         }
         else if (c == '|') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '|') { print("OR\n"); pos = pos + 2; }
-            else { print("LEXERROR\n"); return 1; }
+            else { print("PIPE\n"); pos = pos + 1; }
         }
         else if (c == '+') { print("PLUS\n"); pos = pos + 1; }
         else if (c == '-') { print("MINUS\n"); pos = pos + 1; }
         else if (c == '*') { print("STAR\n"); pos = pos + 1; }
+        else if (c == '%') { print("PERCENT\n"); pos = pos + 1; }
+        else if (c == '^') { print("CARET\n"); pos = pos + 1; }
+        else if (c == '~') { print("TILDE\n"); pos = pos + 1; }
         else if (c == '(') { print("LPAREN\n"); pos = pos + 1; }
         else if (c == ')') { print("RPAREN\n"); pos = pos + 1; }
         else if (c == '{') { print("LBRACE\n"); pos = pos + 1; }

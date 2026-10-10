@@ -1,0 +1,1 @@
+coff0: tests/104_error_after_include.c0:12: undeclared variable 'missing'

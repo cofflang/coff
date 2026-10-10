@@ -1,0 +1,7 @@
+// expect: compile-error
+//
+// tests/89_extern_redefinition.c0 - an extern declared twice is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+extern int x;
+extern int x;
+int main() { return 0; }

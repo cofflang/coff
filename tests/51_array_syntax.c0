@@ -26,7 +26,7 @@ int main() {
     // sum of 0,2,4,...,30 = 240
     if (sum != 240) { return 1; }
 
-    // cross-check: buf[i] must equal load8(buf+i) exactly
+    // cross-check, buf[i] must equal load8(buf+i) exactly
     i = 0;
     while (i < 16) {
         if (buf[i] != load8(buf + i)) { return 2; }

@@ -1,0 +1,156 @@
+// cmp.c0 - compare two files byte by byte, written in c0.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0.
+//
+// coff is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your
+// option) any later version. coff is distributed in the hope that it
+// will be useful, but WITHOUT ANY WARRANTY; without even the implied
+// warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+// the GNU General Public License for more details. You should have
+// received a copy of the license along with coff; if not, see
+// <https://www.gnu.org/licenses/>.
+//
+// Usage: cmp [-s] FILE1 FILE2
+//
+// Exit status 0 when the files are identical, 1 when they differ, 2 when
+// one could not be read, the same as POSIX cmp. Without -s it reports the
+// first difference in the words GNU cmp uses in the C locale, so the two
+// can be diffed.
+//
+//   a b differ: char 5, line 2
+//   cmp: EOF on 'b' after byte 2, in line 1
+//   cmp: EOF on 'b' which is empty
+//
+// It exists for the same reason as sha256.c0. The audit compares binaries
+// with cmp, and a cmp built by the coff1 the audit has just verified is a
+// tool with known provenance, unlike the system's.
+
+layout Reader {
+    int fd;
+    int buf;
+    int pos;
+    int len;
+}
+
+int strlen_(int s) {
+    int n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+
+int streq(int a, int b) {
+    int i = 0;
+    while (load8(a + i) != 0 && load8(a + i) == load8(b + i)) { i = i + 1; }
+    if (load8(a + i) == load8(b + i)) { return 1; }
+    return 0;
+}
+
+void put(int fd, int s) {
+    write(fd, s, strlen_(s));
+    return;
+}
+
+void put_int(int fd, int v) {
+    int tmp = alloc(32);
+    int i = 31;
+    if (v == 0) { put(fd, "0"); return; }
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + v % 10);
+        v = v / 10;
+    }
+    put(fd, tmp + i);
+    return;
+}
+
+int reader_open(int name) {
+    int r = alloc(sizeof(Reader));
+    r.fd = open_read(name);
+    if (r.fd < 0) { return 0; }
+    r.buf = alloc(65536);
+    r.pos = 0;
+    r.len = 0;
+    return r;
+}
+
+// The next byte, or -1 at end of file, or -2 on a read error.
+int next(int r) {
+    if (r.pos == r.len) {
+        r.len = read(r.fd, r.buf, 65536);
+        r.pos = 0;
+        if (r.len == 0) { return 0 - 1; }
+        if (r.len < 0) { r.len = 0; return 0 - 2; }
+    }
+    int v = load8(r.buf + r.pos);
+    r.pos = r.pos + 1;
+    return v;
+}
+
+int main() {
+    int silent = 0;
+    int first = 1;
+    if (argc() == 4 && streq(argv(1), "-s") == 1) {
+        silent = 1;
+        first = 2;
+    } else if (argc() != 3) {
+        put(2, "usage: cmp [-s] FILE1 FILE2\n");
+        return 2;
+    }
+    int na = argv(first);
+    int nb = argv(first + 1);
+    int ra = reader_open(na);
+    if (ra == 0) {
+        if (silent == 0) { put(2, "cmp: "); put(2, na); put(2, ": No such file or directory\n"); }
+        return 2;
+    }
+    int rb = reader_open(nb);
+    if (rb == 0) {
+        if (silent == 0) { put(2, "cmp: "); put(2, nb); put(2, ": No such file or directory\n"); }
+        return 2;
+    }
+
+    int bytes = 0;      // bytes known equal so far
+    int lines = 0;      // newlines among them
+    int last = 0 - 1;   // the last equal byte
+    while (1) {
+        int a = next(ra);
+        int b = next(rb);
+        if (a == 0 - 2 || b == 0 - 2) {
+            if (silent == 0) { put(2, "cmp: read error\n"); }
+            return 2;
+        }
+        if (a == 0 - 1 && b == 0 - 1) { return 0; }
+        if (a == 0 - 1 || b == 0 - 1) {
+            if (silent == 0) {
+                int shorter = na;
+                if (b == 0 - 1) { shorter = nb; }
+                put(2, "cmp: EOF on '"); put(2, shorter);
+                if (bytes == 0) {
+                    put(2, "' which is empty\n");
+                } else {
+                    put(2, "' after byte "); put_int(2, bytes);
+                    if (last == '\n') { put(2, ", line "); put_int(2, lines); }
+                    else { put(2, ", in line "); put_int(2, lines + 1); }
+                    put(2, "\n");
+                }
+            }
+            return 1;
+        }
+        if (a != b) {
+            if (silent == 0) {
+                put(1, na); put(1, " "); put(1, nb);
+                put(1, " differ: char "); put_int(1, bytes + 1);
+                put(1, ", line "); put_int(1, lines + 1); put(1, "\n");
+            }
+            return 1;
+        }
+        bytes = bytes + 1;
+        if (a == '\n') { lines = lines + 1; }
+        last = a;
+    }
+    return 0;
+}

@@ -1,4 +1,4 @@
-// tests/include_fixtures/deep.c0 - fixture for 66_include_nested: the innermost included file
+// tests/include_fixtures/deep.c0 - fixture for 66_include_nested, the innermost included file
 // Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
 //
 // See adder.c0 for why this lives here instead of directly under

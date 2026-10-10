@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/85_extern_without_int.c0 - extern needs int
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+extern foo;
+int main() { return 0; }

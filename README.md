@@ -27,10 +27,12 @@ program.
 | `c0/lex.c0` | A standalone c0 lexer in c0, kept as a differential test stage. |
 | `c0/parse.c0` | A standalone c0 parser in c0, same purpose. |
 | `c0/smed.c0` | The assembler and linker, in c0. Turns the assembly `coff1` emits into a finished executable, with no GNU tool in between. |
+| `c0/sha256.c0`, `c0/cmp.c0` | `sha256sum` and `cmp` written in c0. The audit builds them with the `coff1` it has just verified and runs them next to the system tools, so every hash and every byte comparison is checked by two inspectors. |
 | `tests/` | The test programs, which double as the input set for the differential checks. |
 | `run_tests.sh` | Builds coff0 and runs the compiler test suite. |
 | `smed_tests.sh` | Checks smed against GNU as and ld over every program in the tree, then runs the suite with no GNU tool in the pipeline. The last check builds my kernel with both and compares them, when it is checked out alongside. |
-| `verify_bootstrap.sh` | The trusting-trust audit: rebuild, fixpoint, determinism, and diverse double-compiling against a second C compiler. |
+| `verify_bootstrap.sh` | The trusting-trust audit: rebuild, fixpoint, determinism, and diverse double-compiling against every other C compiler it finds. |
+| `fetch_ddc_cproc.sh` | Fetches and builds cproc and QBE at pinned commits, as a third C compiler for the audit. |
 | `TRUST.md` | What is trusted, what is checked, and what is not. Read it before changing how anything here is built. |
 | `BOOTSTRAP.sha256` | Hashes of every source, script and test file, so tampering shows up as a text diff. |
 
@@ -119,21 +121,39 @@ script keeps working unchanged; `--base` sets the load address when no
 script says otherwise; `-m` writes a symbol map, which is a plain list of
 addresses and names, useful for checking a layout against another linker's.
 
-The process exit code is whatever `main` returns. With no arguments,
-`coff1` reads c0 source on stdin and writes assembly to stdout instead;
-the test harness uses that form.
+The process exit code is whatever `main` returns. The compiler's full form
+is
+
+```
+coff1 [--elf] [-I dir]... input.c0 output.s
+```
+
+`-I` adds a directory to look in for an include that is not next to the
+file including it, which is how programs in different directories share a
+library. With no file arguments, `coff1` reads c0 source on stdin and
+writes assembly to stdout instead; the test harness uses that form.
+
+A program with a mistake in it gets a real message, with the file and the
+line, such as `coff1: hello.c0:3: expected ';'`. coff1 and coff0 say exactly
+the same thing for every input, and the test suite holds them to it.
 
 ## The language
 
 c0 has `int` variables and globals, functions with up to 16 parameters
 (the first six in registers, the rest on the stack), recursion, `if`/`else`,
 `while` with `break`/`continue`, block scoping with shadowing,
-short-circuiting `&&`/`||`, string literals, char literals, hex literals,
+short-circuiting `&&`/`||`, `%`, the bitwise operators `& | ^ ~ << >>`
+(with C's precedence, warts included, and `>>` arithmetic), string
+literals, char literals, hex literals,
 `buf[i]` indexing (sugar over byte load/store), and function references: a
 bare function name is its address, and calling through a variable holding
 one is an indirect call. `include "file.c0";` splits a program across
 files by plain textual substitution. `extern int name;` declares a global
-that some other object file defines.
+that some other object file defines. A global's initializer may be any
+constant expression, folded at compile time. `embed name "file";` puts a
+file's bytes into the program as data, with `name` as their address and
+`name_size` as their length; the compiler never opens the file, the
+assembler does.
 
 `layout` gives a block of memory named offsets:
 
@@ -150,18 +170,20 @@ e.x = 10;
 
 A layout allocates nothing by itself. It only maps each field name to an
 offset, so `sizeof(Entity)` is a compile-time constant and `e.x` is sugar
-over `load64`/`store64`. Because there is no type system, a field name has
-one offset across the whole program: two layouts may share a name only if
-they agree on its position.
+over `load64`/`store64`. A layout name can also be used as a type, as in
+`Entity e = alloc(sizeof(Entity));`. The variable is still an int, but its
+fields are looked up in that layout, so two layouts may put the same field
+name at different offsets. An untyped variable reaches a field through the
+one offset every layout agrees on, and is refused when they do not agree.
 
-There is no type checking, no `%` operator, no optimizer, and nothing is
-ever freed. Some of that will change, some of it is the design. The full
+There is no type checking, no optimizer, and on Linux nothing is ever
+freed. Some of that will change, some of it is the design. The full
 grammar is in the header comment of `coff0.c`.
 
 I/O and memory are compiler builtins that map directly to syscalls:
 `print`, `write`, `read`, `open_read`, `open_write`, `close`, `alloc`,
 `load8`/`store8`, `load64`/`store64`, `exit`, `argc`/`argv`, and
-`outb`/`inb` for port I/O in freestanding code. They are all listed with
+`outb`/`inb`/`outw`/`inw` for port I/O in freestanding code. They are all listed with
 their signatures in `coff0.c`'s header comment.
 
 ## Output modes
@@ -178,28 +200,27 @@ Either way the output is assembly text that `smed` turns into a finished
 binary. For the Moonshot target, `smed --base 0x80000000` places the image
 where that kernel maps user programs.
 
-Until September 2026 `--elf` selected an entirely separate backend that
-wrote machine code byte by byte, and `--raw` did the same for Linux. Both
-are gone. They were the one code path with no differential oracle, since
-`coff0.c` never had a machine-code backend to be compared against, and
-several silent wrong-code bugs were found in them by eye. Removing them was
-worth more than building an oracle for them: `--elf` is now a handful of
-emit sites that differ in a syscall number, `coff0.c` has the same flag,
-and the two are diffed against each other like everything else.
+There is deliberately no second backend. `--elf` is a handful of emit
+sites that differ in a syscall number, `coff0.c` has the same flag, and the
+two are diffed against each other like everything else.
 
 `--elf` adds builtins that are syscalls on that kernel and exist in no
-other mode: `win_info` and `win_max` for the window a program was given,
-`present` and `blit` and `fill` for drawing, `key_poll` and `mouse_poll`
-for input, `glyph` for the kernel's font, `ticks` for the timer, and
-`readfile`. Calling one outside `--elf` is a compile error, and calling a
-Linux-only builtin such as `argv` or `open_read` under `--elf` is too.
+other mode. `win_info` and `win_max` describe the window a program was
+given, `present` and `blit` and `fill` draw, `key_poll` and `mouse_poll`
+read input, `glyph` hands over the kernel's font, `ticks` reads the timer,
+`readfile` and `writefile` load and save files, `sound` queues audio,
+`dealloc` gives back what `alloc` handed out, and `syscall(n, a, b, c, d,
+e)` reaches any system call by number, so a new one needs no compiler
+change. `argc` and `argv` work there too, as syscalls. Calling an `--elf`
+builtin outside `--elf` is a compile error, and calling a Linux-only
+builtin such as `open_read` or `outb` under `--elf` is too.
 
 The distinction `win_info` versus `win_max` is worth knowing if you write
 against this: `win_info` is the window's size right now and changes
 whenever the window manager reflows, while `win_max` is the largest window
-the machine can ever hand out. Since `alloc` is bump-only and cannot grow
-a buffer, a program sizes its frame buffer once from `win_max` and treats
-`win_info` as the region it is currently allowed to draw into.
+the machine can ever hand out. A program sizes its frame buffer once from
+`win_max`, so it never has to reallocate it, and treats `win_info` as the
+region it is currently allowed to draw into.
 
 ## Testing
 
@@ -211,10 +232,14 @@ a buffer, a program sizes its frame buffer once from `win_max` and treats
 
 Every test program goes through the real pipeline: compile, assemble,
 link, execute, check the exit code (and the exact stdout, where a test has
-an `.expected_stdout` file). Then each c0-written stage is diffed byte for
-byte against coff0 over the whole corpus, and last the bootstrap fixpoint
-is checked: `coff.c0` compiling itself three generations deep, all
-byte-identical. That is 267 checks, and they all have to stay green.
+an `.expected_stdout` file, and the exact error message, file and line,
+where a test has an `.expected_error` file). Then each c0-written stage is
+diffed byte for byte against coff0 over the whole corpus, error messages
+included, the `-I`, `embed` and large-source cases are run through both
+compilers, the c0 `sha256` and `cmp` are held to the system tools, and last
+the bootstrap fixpoint is checked: `coff.c0` compiling itself three
+generations deep, all byte-identical. That is over 400 checks, and they all
+have to stay green.
 `CC=tcc ./run_tests.sh` runs the same suite with gcc absent from the
 machine entirely.
 
@@ -239,13 +264,11 @@ are not compared, because smed never picks a short encoding where a long
 one works, but small immediates are, since an earlier version that
 normalised those away let a wrong segment selector through.
 
-Those byte-for-byte checks are how I trust the compiler at all. The limit
-that used to be stated here, that nothing in the suite said anything about
-the machine-code backends, is gone with the backends themselves: `--elf` is
-now the same code path as the default one and `coff0.c` implements it too,
-so it is diffed byte for byte like everything else. What is still true is
-that the suite cannot tell whether a program behaves correctly *on the
-kernel*, only that both compilers agree about it. That part is covered
+Those byte-for-byte checks are how I trust the compiler at all. `--elf` is
+the same code path as the default one and `coff0.c` implements it too, so
+it is diffed byte for byte like everything else. What the suite cannot tell
+is whether a program behaves correctly *on the kernel*, only that both
+compilers agree about it. That part is covered
 outside this repository, by small programs whose exit code is only correct
 if codegen is correct, run on the kernel itself.
 
@@ -259,11 +282,14 @@ check through `coff0`, passed every test above with no trace in any source
 file. `./verify_bootstrap.sh` is the audit that bears on that question. It
 rebuilds the whole chain from source, checks the fixpoint, checks that the
 compiler's output does not depend on locale, time zone, build directory or
-date, and then does diverse double-compiling: `coff0.c` built by two
+date, and then does diverse double-compiling: `coff0.c` built by
 unrelated C compilers must produce byte-identical assembly over every c0
 source it can find. That last stage is the one that caught the simulated
 attack, and it only did so once the corpus included the code worth
-attacking. It needs a second C compiler installed, tcc by preference.
+attacking. It needs a second C compiler installed, tcc by preference, and
+uses cproc as a third when `./fetch_ddc_cproc.sh` has built it. Every hash
+and byte comparison the audit makes is checked twice, by the system tools
+and by the c0 `sha256` and `cmp` built by the `coff1` it has just verified.
 
 [TRUST.md](TRUST.md) is the full account: what is trusted, what is checked
 by what, what is still open, and what none of it proves.
@@ -276,7 +302,8 @@ request:
 - The language is implemented four times over (`coff0.c`, `c0/lex.c0`,
   `c0/parse.c0`, `c0/coff.c0`). A language change lands in `coff0.c`
   first, then gets mirrored into the c0 implementations, each verified
-  byte-identical against coff0 before moving on.
+  byte-identical against coff0 before moving on. A new error message has to
+  read the same in coff0 and coff1.
 - `./run_tests.sh` must pass, including both fixpoint checks, and so must
   `./smed_tests.sh` and `./verify_bootstrap.sh`.
 - New behavior needs a test in `tests/`. Bugs found the hard way get a

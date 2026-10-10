@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/95_include_no_string.c0 - an include directive needs a quoted path
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+include adder;
+int main() { return 0; }

@@ -1,0 +1,1 @@
+coff0: tests/109_typed_no_such_field.c0:7: layout 'Point' has no field 'w'

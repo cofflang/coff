@@ -14,35 +14,36 @@
 // received a copy of the license along with coff; if not, see
 // <https://www.gnu.org/licenses/>.
 
-// Purpose: turn the assembly text coff emits into a finished executable,
-// with no GNU tool in between. Called as `smed input.s output`. The name
-// is Swedish for smith, the thing that forges raw machine code out of
-// text.
+// smed turns the assembly text coff emits into a finished executable,
+// with no GNU tool in between. Called as `smed [--base addr] [-T script]
+// [-m map] input.s... output`. The name is Swedish for smith, the thing
+// that forges raw machine code out of text.
 //
 // WHY THIS EXISTS
 //
-// Ken Thompson, 1984: "I could have picked on any program-handling program
-// such as an assembler, a loader, or even hardware microcode."  Until now
-// every coff binary and every kernel image of my OS passed through GNU as
-// and GNU ld, which meant that the two components with the most leverage
-// over the final bytes were also the two nothing in this project could
-// check.  They were the largest UNMITIGATED rows in TRUST.md.  smed
-// replaces both.
+// Ken Thompson wrote in 1984 that he "could have picked on any
+// program-handling program such as an assembler, a loader, or even hardware
+// microcode."  Without smed, every coff binary and every kernel image of my
+// OS would pass through GNU as and GNU ld, so the two components with the
+// most leverage over the final bytes would be the two nothing in this
+// project can check.  smed replaces both, and TRUST.md covers what that
+// buys.
 //
 // It is one tool rather than a separate assembler and linker.  The Unix
 // split exists so that many objects from many languages can be combined
-// later, and this project links exactly one translation unit at a time, so
-// the split would buy nothing and cost an object file format, a symbol table
-// format and a relocation record format -- three more things to audit for no
-// benefit.  smed resolves every symbol in one pass and writes the finished
-// executable directly.
+// later, and this project links a handful of files at a time that all live
+// in the same repository, so the split would buy nothing and cost an object
+// file format, a symbol table format and a relocation record format -- three
+// more things to audit for no benefit.  smed resolves every symbol across
+// all of its inputs at once and writes the finished executable directly.
 //
 // HOW IT WORKS
 //
-// Two passes over the source text.  Pass 1 walks every line, adds up the
-// size of each instruction and records the address of every label.  Pass 2
-// walks the same lines again and emits the bytes, now able to resolve any
-// forward reference because pass 1 already placed every label.
+// Two passes over every input.  Pass 1 walks every line, adds up the size
+// of each instruction and records the section and offset of every label.
+// Between the passes the sections are laid out, so every section has a base
+// address.  Pass 2 walks the same lines again and emits the bytes, now able
+// to resolve any reference because pass 1 already placed every label.
 //
 // The pass 1 sizes are exact rather than approximate because smed never
 // picks a short encoding.  A real assembler relaxes -- it starts with a
@@ -50,26 +51,46 @@
 // repeats until the layout stops changing.  smed always emits the wide form
 // (rel32 branches, disp32 memory operands, imm32 immediates), so an
 // instruction's size depends only on the instruction itself and pass 1 and
-// pass 2 agree by construction.  The cost is a slightly larger binary.  The
+// pass 2 agree by construction.  The cost is a somewhat larger binary.  The
 // benefit is that the whole iterate-to-a-fixpoint problem disappears, and
-// with it a class of bug that would be very hard to see.
+// with it a class of bug that would be very hard to see.  Pass 2 checks that
+// every section came out exactly the size pass 1 measured, so if that
+// property is ever broken the tool stops instead of writing a file.
 //
-// LAYOUT
+// SECTIONS AND LAYOUT
 //
-// One PT_LOAD segment, read/write/execute, at 0x400000, with p_offset 0 so
-// file offset 0 maps to the base address and no separate mapping arithmetic
-// is needed.  Code and data are emitted in the order they appear in the
-// source, which works because coff puts .text first, then .rodata, then
-// .data, and never returns to an earlier section.  smed checks that
-// assumption rather than trusting it.
+// Every `.section` directive switches to a named buffer, and a file may
+// return to an earlier section as often as it likes.  Without a linker
+// script the sections are placed in the order they were first named, packed
+// together, in one read/write/execute PT_LOAD segment at 0x400000 with
+// p_offset 0 -- which is what coff's output needs.
+//
+// With `-T script` the layout comes from the script instead.  The script is
+// the same linker.ld GNU ld reads, or rather the small subset of that
+// language my kernel's linker.ld actually uses, which is ENTRY, SECTIONS, a
+// starting `. = 1M`, output sections that either collect the inputs'
+// sections of the same name or carry their own LONG(0) / `. = . + N`
+// reservations, and `name = .` symbols.  Reading the real script rather
+// than inventing a new one means the same sources still go through as+ld
+// unchanged, which keeps binutils available as a differential oracle for
+// the kernel exactly as the corpus does for user programs.  Anything outside
+// that subset is refused loudly.
+//
+// A section that only ever reserves space (`.skip`, `. = . + N`) and never
+// receives a byte of real content is what ld would call NOBITS.  smed does
+// not need a section type for that.  After layout, the file ends at the last
+// section that holds real content and p_memsz covers the rest, so trailing
+// reservations cost no file space while reservations placed before the code
+// are simply written as zeros.
 //
 // SCOPE
 //
-// Milestone one is coff1 itself, so smed accepts the instruction subset coff
-// emits, which is a closed set of 71 shapes over 26 mnemonics.  It refuses
-// anything else loudly instead of guessing.  My OS kernel has a
-// hand-written boot stage on top of this, with mnemonics coff never emits;
-// supporting that is milestone two.
+// smed covers the closed instruction subset coff emits, and my kernel's
+// hand-written boot code, with its 32-bit and 64-bit assembly
+// (`.code32`/`.code64`, control and segment registers,
+// `lgdt`/`lidt`/`ltr`, `rdmsr`/`wrmsr`, `iretq`, a far jump, the multiboot
+// header built from `.set` constants and `.long` expressions) plus the
+// linker script above.  smed still refuses anything it does not know.
 
 int BASE = 0x400000;   // load address when no script says otherwise (--base)
 int HDRS = 120;        // 64-byte ELF header + 56-byte program header
@@ -79,7 +100,7 @@ int pass = 0;          // 1 = measure and place labels, 2 = emit
 int bits = 64;         // .code32 / .code64
 
 // --- inputs ---------------------------------------------------------------
-// src/srclen/cp describe whichever buffer is being parsed right now: an
+// src/srclen/cp describe whichever buffer is being parsed right now, an
 // input file or the linker script.
 
 int src = 0;
@@ -174,7 +195,7 @@ void print_int(int v) {
     buf[i] = 0;
     while (n > 0) {
         i = i - 1;
-        buf[i] = 48 + (n - (n / 10) * 10);
+        buf[i] = 48 + (n % 10);
         n = n / 10;
     }
     print(buf + i);
@@ -199,7 +220,7 @@ void serr(int msg) {
 }
 
 // Failing loudly with the file and line matters more here than anywhere
-// else in the stack: a wrong byte in an assembler is a silently miscompiled
+// else in the stack.  A wrong byte in an assembler is a silently miscompiled
 // program, not a crash, and this tool has no oracle above it.
 void serr_at(int msg) {
     print("smed: ");
@@ -216,12 +237,11 @@ void serr_at(int msg) {
 // In pass 1 nothing is stored, only counted, so the same emit calls drive
 // both passes and the two can never disagree about a size.
 
-// Two's complement narrowing, written out because c0 has no unsigned type
-// and no shift operators, and because division in c0 truncates toward zero
-// rather than flooring.  That last detail caused the first real smed bug:
-// a displacement of -8 was emitted as 000000f8 instead of fffffff8, because
-// -8 / 256 is 0 and not -1, so every negative stack offset addressed the
-// wrong side of rbp and the binary faulted immediately.
+// Two's complement narrowing, written out because c0 has no unsigned type.
+// Division in c0 truncates toward zero rather than flooring, so the byte
+// splitting below has to treat negative values with care.  -8 / 256 is 0
+// and not -1, and a careless split would emit a displacement of -8 as
+// 000000f8 instead of fffffff8.
 int u32(int v) {
     int u = v;
     if (u < 0) { u = u + 4294967296; }
@@ -241,7 +261,7 @@ void emit1(int b) {
     need_section();
     if (u < 0) { u = u + 256; }
     p = load64(sect_pos + cur * 8);
-    if (pass == 2) { store8(load64(sect_buf + cur * 8) + p, u - (u / 256) * 256); }
+    if (pass == 2) { store8(load64(sect_buf + cur * 8) + p, u % 256); }
     store64(sect_pos + cur * 8, p + 1);
     store64(sect_data + cur * 8, 1);
     return;
@@ -249,14 +269,14 @@ void emit1(int b) {
 
 void emit2(int v) {
     int u = u32(v);
-    emit1(u - (u / 256) * 256);
+    emit1(u % 256);
     emit1((u / 256) - (u / 65536) * 256);
     return;
 }
 
 void emit4(int v) {
     int u = u32(v);
-    emit1(u - (u / 256) * 256);
+    emit1(u % 256);
     emit1((u / 256) - (u / 65536) * 256);
     emit1((u / 65536) - (u / 16777216) * 256);
     emit1(u / 16777216);
@@ -264,10 +284,10 @@ void emit4(int v) {
 }
 
 // Splits a 64-bit value into two 32-bit halves.  The adjustment on the
-// negative side matters: c0 divides toward zero, so a plain v/2^32 is one
-// too high for any negative value that is not an exact multiple, which
-// showed up as a wrong movabs for the packed font bitmap in
-// tests/64_large_hex_literal.c0.  It is done by fixing up the remainder
+// negative side matters.  c0 divides toward zero, so a plain v/2^32 is one
+// too high for any negative value that is not an exact multiple (a packed
+// font bitmap such as tests/64_large_hex_literal.c0's is one).  It is done
+// by fixing up the remainder
 // rather than by subtracting first, because the subtraction overflows for
 // the most negative values, and boot.s's trigger_doublefault loads exactly
 // 0x8000000000000000.
@@ -454,7 +474,7 @@ int sym_value(int i) {
     return load64(sect_base + s * 8) + load64(sym_off + i * 8);
 }
 
-// A label: defined once, in pass 1, at the current place.
+// A label is defined once, in pass 1, at the current place.
 void label_here(int p, int n) {
     need_section();
     if (pass == 1) { sym_add(p, n, cur, load64(sect_pos + cur * 8)); }
@@ -496,7 +516,7 @@ int sym_ref(int p, int n) {
 // --- numbers and expressions ----------------------------------------------
 // The kernel's boot.s writes `1 << 5`, `0b11`, `-(MB_MAGIC + MB_FLAGS)` and
 // `gdt64_end - gdt64 - 1`, and the linker script writes `1M`, so operands
-// are expressions rather than bare numbers.  Precedence follows gas: unary
+// are expressions rather than bare numbers.  Precedence follows gas.  Unary
 // minus and parentheses bind tightest, then * / << >>, then + -.
 
 int read_num() {
@@ -682,7 +702,7 @@ void rex(int w, int r, int x, int b) {
 }
 
 void modrm(int mod, int reg, int rm) {
-    emit1(mod * 64 + (reg - (reg / 8) * 8) * 8 + (rm - (rm / 8) * 8));
+    emit1(mod * 64 + (reg % 8) * 8 + (rm % 8));
     return;
 }
 
@@ -693,13 +713,13 @@ void sib(int scale, int index, int base) {
     else if (scale == 4) { s = 2; }
     else if (scale == 8) { s = 3; }
     else { serr_at("bad scale"); }
-    emit1(s * 64 + (index - (index / 8) * 8) * 8 + (base - (base / 8) * 8));
+    emit1(s * 64 + (index % 8) * 8 + (base % 8));
     return;
 }
 
 // The operand-size and REX prefixes for an instruction of the given width
 // whose ModRM will name reg_field and the registers of slot s.  Every
-// encoder goes through here so the width rules live in one place: 16-bit
+// encoder goes through here so the width rules live in one place.  16-bit
 // wants 0x66, 64-bit wants REX.W (and is an error in .code32), and any
 // extended register wants a REX with the matching bit.
 void prefixes(int width, int reg_field, int s) {
@@ -748,15 +768,15 @@ void rm_operand(int reg_field, int s) {
     if (base < 0) {
         if (index >= 0) { serr_at("an index register needs a base register"); }
         if (bits == 64) {
-            // A bare [symbol] or [address] in 64-bit code is RIP-relative:
+            // A bare [symbol] or [address] in 64-bit code is RIP-relative,
             // mod=00 rm=101, disp32 measured from the end of the
             // instruction.  The absolute form (the SIB escape with no base)
             // takes a disp32 that the CPU sign-extends, so it can only
             // reach the low 2GB and the top 2GB of the address space.
-            // Moonshot loads ring-3 programs at exactly 2GB, and the first
-            // program built this way faulted on its first store, at
-            // 0xFFFFFFFF80000338.  RIP-relative reaches anything within
-            // 2GB of the code, which every image here is.
+            // Moonshot loads ring-3 programs at exactly 2GB, where an
+            // absolute address would sign-extend to 0xFFFFFFFF80000000 and
+            // up.  RIP-relative reaches anything within 2GB of the code,
+            // which every image here is.
             modrm(0, reg_field, 5);
             emit4(d - (here() + 4 + trailing));
             trailing = 0;
@@ -777,7 +797,7 @@ void rm_operand(int reg_field, int s) {
         return;
     }
     // rsp (4) and r12 always need a SIB byte, because rm=100 is the escape.
-    if ((base - (base / 8) * 8) == 4) {
+    if ((base % 8) == 4) {
         modrm(2, reg_field, 4);
         sib(1, 4, base);
         emit4(d);
@@ -790,7 +810,7 @@ void rm_operand(int reg_field, int s) {
     return;
 }
 
-// One complete instruction of the shape  prefixes, opcode, ModRM: op2 is
+// One complete instruction of the shape  prefixes, opcode, ModRM.  op2 is
 // the second opcode byte after 0F, or -1 for a one-byte opcode.
 void enc_rm(int width, int op, int op2, int reg_field, int s) {
     prefixes(width, reg_field, s);
@@ -840,9 +860,9 @@ void emit_imm(int width, int v) {
     return;
 }
 
-// mov r, imm.  For 64-bit: REX.W C7 /0 id when it fits, otherwise
+// mov r, imm.  For 64-bit, REX.W C7 /0 id when it fits, otherwise
 // REX.W B8+r io.  Whether it fits must not depend on a symbol, because the
-// symbol is 0 in pass 1: a symbol-valued immediate always takes the imm32
+// symbol is 0 in pass 1.  A symbol-valued immediate always takes the imm32
 // form and is checked to fit in pass 2.  16- and 32-bit take B8+r.
 void enc_mov_reg_imm(int width, int r, int v, int hassym) {
     int short_form = 0;
@@ -856,21 +876,21 @@ void enc_mov_reg_imm(int width, int r, int v, int hassym) {
             return;
         }
         rex(1, 0, 0, r);
-        emit1(0xB8 + (r - (r / 8) * 8));
+        emit1(0xB8 + (r % 8));
         emit8(v);
         return;
     }
     if (width == 16) { emit1(0x66); }
     if (r >= 8) { rex(0, 0, 0, r); }
-    if (width == 8) { emit1(0xB0 + (r - (r / 8) * 8)); }
-    else { emit1(0xB8 + (r - (r / 8) * 8)); }
+    if (width == 8) { emit1(0xB0 + (r % 8)); }
+    else { emit1(0xB8 + (r % 8)); }
     emit_imm(width, v);
     return;
 }
 
 // --- operand parsing ------------------------------------------------------
 
-// The operand width of an instruction: the width of any general register
+// The operand width of an instruction is the width of any general register
 // among its operands, else the `ptr` size given, else 0.
 int op_width(int nops) {
     int w = 0;
@@ -942,7 +962,7 @@ void parse_operand(int s) {
                         cp = cp + 1;
                         if (og(s, F_INDEX) >= 0) { serr_at("two index registers"); }
                         os(s, F_INDEX, r);
-                        // A plain number, not an expression: `rcx*8 + 8`
+                        // A plain number, not an expression, since `rcx*8 + 8`
                         // would otherwise read the displacement as part
                         // of the scale.
                         skip_space();
@@ -986,7 +1006,7 @@ void parse_operand(int s) {
             return;
         }
     }
-    // Not a register: an immediate expression, possibly naming a symbol.
+    // Not a register, so an immediate expression, possibly naming a symbol.
     cp = word_start;
     expr_used_sym = 0;
     os(s, F_IMM, read_expr());
@@ -1023,7 +1043,7 @@ int is_gp(int s) { if (og(s, F_KIND) == 0 && og(s, F_CLASS) == 0) { return 1; } 
 // opcode form so the encoding can be checked against the manual without
 // reverse engineering the arithmetic.
 
-// The reg,reg and reg,mem ALU family: op is the r/m,r opcode (01 for add),
+// The reg,reg and reg,mem ALU family.  op is the r/m,r opcode (01 for add),
 // op8 its byte form, ext the /digit for the immediate form 81 (or 80 for a
 // byte, 83 is never used because that would be a short encoding).
 void enc_alu(int nops, int op, int op8, int ext) {
@@ -1062,7 +1082,7 @@ void enc_alu(int nops, int op, int op8, int ext) {
     return;
 }
 
-// Unary r/m forms: F7 /ext (neg, not, idiv, mul) and FF /ext (inc, dec).
+// Unary r/m forms, F7 /ext (neg, not, idiv, mul) and FF /ext (inc, dec).
 void enc_unary(int nops, int op, int ext) {
     int w = 0;
     if (nops != 1) { serr_at("this instruction wants one operand"); }
@@ -1076,7 +1096,18 @@ void enc_unary(int nops, int op, int ext) {
 
 void enc_shift(int nops, int ext) {
     int w = 0;
-    if (nops != 2 || is_imm(1) == 0) { serr_at("shift wants r/m, imm"); }
+    if (nops == 2 && is_gp(1) == 1 && og(1, F_REG) == 1 && og(1, F_WIDTH) == 8) {
+        // D3 /ext (D2 for a byte) shifts by cl, the only register count
+        // x86 has, and what coff emits for c0's << and >>.
+        w = og(0, F_WIDTH);
+        if (is_reg(0) == 0) { w = op_width(1); }
+        if (w == 0) { serr_at("operand needs a size"); }
+        if (is_reg(0) == 1 && is_gp(0) == 0) { serr_at("only general registers here"); }
+        if (w == 8) { enc_rm(8, 0xD2, 0 - 1, ext, 0); }
+        else { enc_rm(w, 0xD3, 0 - 1, ext, 0); }
+        return;
+    }
+    if (nops != 2 || is_imm(1) == 0) { serr_at("shift wants r/m, imm or r/m, cl"); }
     w = op_width(2);
     if (w == 0) { serr_at("operand needs a size"); }
     // C1 /ext ib
@@ -1091,7 +1122,7 @@ void enc_mov(int nops) {
     int w = 0;
     if (nops != 2) { serr_at("mov wants two operands"); }
 
-    // Control and segment registers first: fixed encodings, no width rules.
+    // Control and segment registers first, with fixed encodings and no width rules.
     if (is_reg(0) == 1 && og(0, F_CLASS) == 2) {
         // mov crN, r  ->  0F 22 /r  (reg = crN, r/m = r)
         if (is_gp(1) == 0 || og(1, F_WIDTH) != bits) { serr_at("mov cr wants a full-width general register"); }
@@ -1201,7 +1232,7 @@ void do_instruction() {
     if (slice_is(m, n, "rdmsr") == 1)   { emit1(0x0F); emit1(0x32); return; }
     if (slice_is(m, n, "wrmsr") == 1)   { emit1(0x0F); emit1(0x30); return; }
 
-    // Conditional branches: 0F 8x rel32.
+    // Conditional branches are 0F 8x rel32.
     cc = 0 - 1;
     if (slice_is(m, n, "je") == 1)  { cc = 0x84; }
     if (slice_is(m, n, "jz") == 1)  { cc = 0x84; }
@@ -1246,7 +1277,7 @@ void do_instruction() {
     if (slice_is(m, n, "call") == 1) { enc_branch(2, 0xE8); return; }
 
     // Port I/O.  Both forms are fixed-register in the encoding, so the
-    // operands are checked rather than parsed: out dx, al is EE and
+    // operands are checked rather than parsed.  out dx, al is EE and
     // in al, dx is EC, with no ModRM byte at all; ax and eax take the
     // ED/EF opcodes, ax with the 16-bit prefix.
     if (slice_is(m, n, "out") == 1 || slice_is(m, n, "in") == 1) {
@@ -1410,7 +1441,7 @@ void do_instruction() {
         serr_at("unsupported imul form");
     }
 
-    // System-table loads: 0F 01 /2 lgdt m, 0F 01 /3 lidt m, 0F 00 /3 ltr r/m16.
+    // System-table loads, 0F 01 /2 lgdt m, 0F 01 /3 lidt m, 0F 00 /3 ltr r/m16.
     if (slice_is(m, n, "lgdt") == 1 || slice_is(m, n, "lidt") == 1) {
         if (nops != 1 || is_mem(0) == 0) { serr_at("lgdt/lidt want a memory operand"); }
         if (slice_is(m, n, "lgdt") == 1) { cc = 2; } else { cc = 3; }
@@ -1484,8 +1515,8 @@ void do_directive() {
         read_word();
         if (word_len == 0) { serr_at("section wants a name"); }
         enter_section(src + word_start, word_len);
-        // Flags such as "a" or "ax" say nothing smed needs: every section
-        // lands in one RWX segment.
+        // Flags such as "a" or "ax" say nothing smed needs, since every
+        // section lands in one RWX segment.
         skip_space();
         if (peek() == 44) { skip_to_eol(); }
         return;
@@ -1532,6 +1563,35 @@ void do_directive() {
         v = read_const();
         if (v < 1 || v > 65536) { serr_at("bad alignment"); }
         align_to(v);
+        return;
+    }
+    if (word_is(".incbin") == 1) {
+        // .incbin "path" puts the file's bytes, as they are, at this point
+        // in the section. It is what c0's `embed name "file";` compiles to, so a
+        // program baked into the kernel is data the assembler copies in
+        // rather than thousands of store64 instructions. The path is
+        // relative to where smed runs, as with GNU as.
+        skip_space();
+        if (peek() != 34) { serr_at(".incbin wants a \"path\""); }
+        cp = cp + 1;
+        int ps = cp;
+        while (cp < srclen && src[cp] != 34 && src[cp] != 10) { cp = cp + 1; }
+        if (cp >= srclen || src[cp] != 34) { serr_at("unterminated .incbin path"); }
+        int path = alloc(cp - ps + 1);
+        int k = 0;
+        while (k < cp - ps) { store8(path + k, load8(src + ps + k)); k = k + 1; }
+        store8(path + k, 0);
+        cp = cp + 1;
+        int fd = open_read(path);
+        if (fd < 0) { serr_at(".incbin: cannot open the file"); }
+        int chunk = alloc(65536);
+        int got = read(fd, chunk, 65536);
+        while (got > 0) {
+            k = 0;
+            while (k < got) { emit1(load8(chunk + k)); k = k + 1; }
+            got = read(fd, chunk, 65536);
+        }
+        close(fd);
         return;
     }
     if (word_is(".set") == 1) {
@@ -1740,7 +1800,7 @@ void run_script() {
                     cur = 0 - 1;
                     continue;
                 }
-                // name = .;  at the top level: the end of everything so far
+                // name = .;  at the top level, the end of everything so far
                 expect_char(61, "expected : or = after a name");
                 skip_space_nl();
                 if (peek() != 46) { serr_at("a top-level symbol can only be set to ."); }
@@ -1798,18 +1858,18 @@ void zero(int buf, int n) {
 // --- ELF ------------------------------------------------------------------
 // One PT_LOAD, read/write/execute because .data shares the single segment
 // with the code.  Without a script p_offset is 0 so the file maps at BASE
-// with no offset arithmetic, the same shape as coff's own --elf writer.
+// with no offset arithmetic.
 // With a script the segment starts one page into the file so that file
 // offsets and addresses stay congruent modulo the page size, the convention
 // every loader expects, and the first section sits exactly at the base
 // address the script asked for.
 //
 // A scripted image also carries a section header table holding only the
-// null entry.  It is not there for information: e_shnum of zero is the
+// null entry.  It is not there for information.  e_shnum of zero is the
 // ELF signal that the true count lives in the first section header, so
 // GRUB reads e_shoff, finds zero and refuses the kernel ("invalid section
 // header table offset in e_shoff") -- with no serial output and no other
-// hint, which is how this was found.  One all-zero 64-byte entry in the
+// hint.  One all-zero 64-byte entry in the
 // otherwise empty page after the program header satisfies it, and since
 // that entry has no address and no size GRUB loads nothing from it.
 int SHOFF = 128;
@@ -1817,14 +1877,14 @@ int SHOFF = 128;
 void hdr_b(int buf, int pos, int b) { store8(buf + pos, b); return; }
 
 void hdr_16(int buf, int pos, int v) {
-    hdr_b(buf, pos, v - (v / 256) * 256);
+    hdr_b(buf, pos, v % 256);
     hdr_b(buf, pos + 1, (v / 256) - (v / 65536) * 256);
     return;
 }
 
 void hdr_32(int buf, int pos, int v) {
     int u = u32(v);
-    hdr_b(buf, pos,     u - (u / 256) * 256);
+    hdr_b(buf, pos,     u % 256);
     hdr_b(buf, pos + 1, (u / 256) - (u / 65536) * 256);
     hdr_b(buf, pos + 2, (u / 65536) - (u / 16777216) * 256);
     hdr_b(buf, pos + 3, (u / 16777216) - (u / 16777216 / 256) * 256);
@@ -1894,7 +1954,7 @@ void write_elf(int fd) {
     hdr_16(hdr, 56, 1);      // e_phnum
     if (script != 0) {
         hdr_16(hdr, 58, 64);     // e_shentsize
-        hdr_16(hdr, 60, 1);      // e_shnum: the null entry only
+        hdr_16(hdr, 60, 1);      // e_shnum, the null entry only
     } else {
         hdr_16(hdr, 58, 0);
         hdr_16(hdr, 60, 0);
@@ -1942,9 +2002,9 @@ void write_map(int name) {
         j = 16;
         while (j > 0) {
             j = j - 1;
-            // Floor division by hand: an absolute symbol can be negative
+            // Floor division by hand, since an absolute symbol can be negative
             // (MB_CHECKSUM), and truncating division would print it wrong.
-            d = v - (v / 16) * 16;
+            d = v % 16;
             v = v / 16;
             if (d < 0) { d = d + 16; v = v - 1; }
             if (d < 10) { line[j] = 48 + d; } else { line[j] = 87 + d; }
@@ -1974,10 +2034,19 @@ int read_file(int name) {
     got = read(fd, buf, cap);
     while (got > 0) {
         len = len + got;
+        // A full buffer doubles rather than failing, so no input is too
+        // large. The old copy is not given back; smed lives for one run and
+        // alloc() here has no free.
+        if (len == cap) {
+            int bigger = alloc(cap * 2);
+            int k = 0;
+            while (k < len) { store64(bigger + k, load64(buf + k)); k = k + 8; }
+            buf = bigger;
+            cap = cap * 2;
+        }
         got = read(fd, buf + len, cap - len);
     }
     close(fd);
-    if (len >= cap) { serr("input larger than the read buffer"); }
     strip_comments(buf, len);
     file_len = len;
     return buf;
@@ -2023,7 +2092,7 @@ int main() {
         } else if (slice_is(a, 6, "--base") == 1 && i + 1 < argc()) {
             // Where the single segment loads when no script says.  Moonshot
             // ring-3 programs are built with --base 0x80000000, the address
-            // my kernel maps user images at; the default is what Linux
+            // the kernel maps user images at; the default is what Linux
             // executables use.
             src = argv(i + 1);
             srclen = 0;

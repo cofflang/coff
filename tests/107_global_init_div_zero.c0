@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/107_global_init_div_zero.c0 - division by zero in a global initializer is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int x = 10 / (3 - 3);
+int main() { return x; }

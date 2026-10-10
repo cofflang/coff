@@ -14,7 +14,7 @@
 // received a copy of the license along with coff; if not, see
 // <https://www.gnu.org/licenses/>.
 
-// Purpose: the second piece of the self-hosted compiler, kept as a
+// This is the second piece of the self-hosted compiler, kept as a
 // standalone differential test stage. Reads c0 source from stdin (or an
 // optional file argument, see main -- include directives need a real
 // path to resolve against) and prints the parse tree to stdout in
@@ -24,21 +24,22 @@
 //
 // Phase 1 lexes the whole input into a token array in alloc'd memory,
 // mirroring coff0's own structure. That also gives the parser free
-// arbitrary lookahead, which the assign-vs-exprstmt split needs: the
+// arbitrary lookahead, which the assign-vs-exprstmt split needs, since the
 // left side of an assignment can be an arbitrarily long `buf[i]`
 // postfix chain, not just one IDENT token.
 // Phase 2 is recursive descent, building AST nodes with alloc/store64.
 //
-// Token record: 32 bytes — 0 kind, 8 ival, 16 name ptr, 24 len.
-// Token kinds: 1 NUM, 2 IDENT, 3 STR, 4 PLUS, 5 MINUS, 6 STAR, 7 SLASH,
+// A token record is 32 bytes — 0 kind, 8 ival, 16 name ptr, 24 len.
+// Token kinds are 1 NUM, 2 IDENT, 3 STR, 4 PLUS, 5 MINUS, 6 STAR, 7 SLASH,
 //   8 ASSIGN, 9 EQ, 10 NE, 11 LT, 12 LE, 13 GT, 14 GE, 15 LPAREN,
 //   16 RPAREN, 17 LBRACE, 18 RBRACE, 19 SEMI, 20 COMMA, 21 INT, 22 IF,
 //   23 ELSE, 24 WHILE, 25 RETURN, 26 EOF, 27 AND, 28 OR, 29 BREAK, 30 CONTINUE,
-//   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN, 35 DOT, 36 LAYOUT, 37 SIZEOF.
-// AST node: 64 bytes — 0 kind, 8 ival, 16 name/str ptr, 24 str len,
+//   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN, 35 DOT, 36 LAYOUT, 37 SIZEOF,
+//   38 PERCENT, 39 AMP, 40 PIPE, 41 CARET, 42 TILDE, 43 SHL, 44 SHR.
+// An AST node is 64 bytes — 0 kind, 8 ival, 16 name/str ptr, 24 str len,
 //   32 child1 (lhs/cond/args/body), 40 child2 (rhs/then), 48 child3 (else),
 //   56 next sibling.
-// Node kinds: 1 NUM, 2 STR, 3 VAR, 4 ASSIGN, 5 DECL, 6 CALL, 7 ADD, 8 SUB,
+// Node kinds are 1 NUM, 2 STR, 3 VAR, 4 ASSIGN, 5 DECL, 6 CALL, 7 ADD, 8 SUB,
 //   9 MUL, 10 DIV, 11 EQ, 12 NE, 13 LT, 14 LE, 15 GT, 16 GE, 17 NEG,
 //   18 IF, 19 WHILE, 20 RETURN, 21 EXPRSTMT, 22 BLOCK, 23 AND, 24 OR,
 //   25 BREAK, 26 CONTINUE, 27 INDEX (child1=base, child2=index),
@@ -46,12 +47,15 @@
 //   30 FIELD (name=field, child1=base; e.field, sugar over load64(base+offset)),
 //   31 FIELDASSIGN (name=field, child1=base, child2=value),
 //   32 SIZEOF (name=layout name; sizeof(Name), a compile-time constant --
-//   parse.c0 only dumps the raw form, coff0's resolve pass is what would
-//   rewrite it to a NUM, so -a output shows it as-is here).
-// Layout record: 24 bytes — 0 name, 8 fields (head of a linked list),
-//   16 next. Layout field record: 16 bytes — 0 name, 8 next.
-// Precedence (low to high): logic_or, logic_and, equality, relational,
-// additive, term, unary, postfix. && and || are both short-circuiting.
+//   parse.c0 only dumps the raw form, coff0's resolve pass is what
+//   rewrites it to a NUM, so -a output shows it as-is here),
+//   33 MOD (child1 % child2, same shape as DIV), 34 BITAND, 35 BITOR,
+//   36 BITXOR, 37 SHL, 38 SHR (binary, same shape), 39 BITNOT (unary, like NEG).
+// A layout record is 24 bytes — 0 name, 8 fields (head of a linked list),
+//   16 next. A layout field record is 16 bytes — 0 name, 8 next.
+// Precedence, low to high, is logic_or, logic_and, | ^ &, equality,
+// relational, shift, additive, term, unary, postfix. && and || are both
+// short-circuiting.
 // postfix := primary (("[" expr "]") | ("." IDENT))*  -- buf[i] is sugar
 // over load8(buf+i)/store8; e.field is sugar over load64(e+offset)/store64.
 
@@ -106,7 +110,7 @@ void print_int(int v) {
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
         i = i - 1;
-        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        store8(tmp + i, '0' + (v % 10));
         v = v / 10;
     }
     if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
@@ -218,11 +222,10 @@ void expand_putc(int c) {
 // result into the shared expand_buf/expand_len globals. include_stack/
 // include_depth guard against a file including itself, directly or
 // transitively. Char literals get the SAME verbatim-copy treatment as
-// strings deliberately, not as an afterthought: without it, a literal
-// like '"' makes the scanner wrongly enter STRING mode at that bare `"`
-// instead, scanning forward to whatever `"` happens to appear next in the
-// file -- a real bug found building lex.c0's identical mirror of this
-// function (which itself contains `!= '"'`).
+// strings deliberately. Without it, a literal like '"' makes the scanner
+// wrongly enter STRING mode at that bare `"` instead, scanning forward to
+// whatever `"` happens to appear next in the file (this function itself
+// contains `!= '"'`).
 void expand_file(int path) {
     int i = 0;
     while (i < include_depth) {
@@ -547,6 +550,7 @@ void lex_all(int buf, int n) {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos = pos + 2; }
+            else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos = pos + 2; }
             else { tok_put(t, 11, 0, 0, 0); pos = pos + 1; }
             t = t + 1;
         }
@@ -554,12 +558,16 @@ void lex_all(int buf, int n) {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos = pos + 2; }
+            else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos = pos + 2; }
             else { tok_put(t, 13, 0, 0, 0); pos = pos + 1; }
             t = t + 1;
         }
         else if (c == '+') { tok_put(t, 4, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '-') { tok_put(t, 5, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '*') { tok_put(t, 6, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '%') { tok_put(t, 38, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '~') { tok_put(t, 42, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '(') { tok_put(t, 15, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == ')') { tok_put(t, 16, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == '{') { tok_put(t, 17, 0, 0, 0); t = t + 1; pos = pos + 1; }
@@ -569,14 +577,16 @@ void lex_all(int buf, int n) {
         else if (c == '&') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { perr(); }
+            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 39, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
         }
         else if (c == '|') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { perr(); }
+            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; }
+            else { tok_put(t, 40, 0, 0, 0); pos = pos + 1; }
+            t = t + 1;
         }
         else if (c == '[') { tok_put(t, 31, 0, 0, 0); t = t + 1; pos = pos + 1; }
         else if (c == ']') { tok_put(t, 32, 0, 0, 0); t = t + 1; pos = pos + 1; }
@@ -721,6 +731,12 @@ int p_unary() {
         store64(nd + 32, p_unary());
         return nd;
     }
+    if (tok_kind(tpos) == 42) {
+        tpos = tpos + 1;
+        nd = new_node(39);
+        store64(nd + 32, p_unary());
+        return nd;
+    }
     return p_postfix();
 }
 
@@ -741,6 +757,12 @@ int p_term() {
         } else if (op == 7) {
             tpos = tpos + 1;
             nd = new_node(10);
+            store64(nd + 32, left);
+            store64(nd + 40, p_unary());
+            left = nd;
+        } else if (op == 38) {
+            tpos = tpos + 1;
+            nd = new_node(33);
             store64(nd + 32, left);
             store64(nd + 40, p_unary());
             left = nd;
@@ -780,7 +802,7 @@ int p_rel() {
     int op = 0;
     int kind = 0;
     int going = 1;
-    left = p_add();
+    left = p_shift();
     while (going == 1) {
         op = tok_kind(tpos);
         kind = 0;
@@ -792,7 +814,7 @@ int p_rel() {
             tpos = tpos + 1;
             nd = new_node(kind);
             store64(nd + 32, left);
-            store64(nd + 40, p_add());
+            store64(nd + 40, p_shift());
             left = nd;
         } else { going = 0; }
     }
@@ -822,15 +844,74 @@ int p_equality() {
     return left;
 }
 
-int p_logic_and() {
+// The bitwise operators sit at C's precedence levels, including & ^ |
+// binding more loosely than == and != (see coff0.c's parse_shift).
+int p_shift() {
+    int left = 0;
+    int nd = 0;
+    left = p_add();
+    while (tok_kind(tpos) == 43 || tok_kind(tpos) == 44) {
+        if (tok_kind(tpos) == 43) { nd = new_node(37); }
+        else { nd = new_node(38); }
+        tpos = tpos + 1;
+        store64(nd + 32, left);
+        store64(nd + 40, p_add());
+        left = nd;
+    }
+    return left;
+}
+
+int p_bitand() {
     int left = 0;
     int nd = 0;
     left = p_equality();
+    while (tok_kind(tpos) == 39) {
+        nd = new_node(34);
+        tpos = tpos + 1;
+        store64(nd + 32, left);
+        store64(nd + 40, p_equality());
+        left = nd;
+    }
+    return left;
+}
+
+int p_bitxor() {
+    int left = 0;
+    int nd = 0;
+    left = p_bitand();
+    while (tok_kind(tpos) == 41) {
+        nd = new_node(36);
+        tpos = tpos + 1;
+        store64(nd + 32, left);
+        store64(nd + 40, p_bitand());
+        left = nd;
+    }
+    return left;
+}
+
+int p_bitor() {
+    int left = 0;
+    int nd = 0;
+    left = p_bitxor();
+    while (tok_kind(tpos) == 40) {
+        nd = new_node(35);
+        tpos = tpos + 1;
+        store64(nd + 32, left);
+        store64(nd + 40, p_bitxor());
+        left = nd;
+    }
+    return left;
+}
+
+int p_logic_and() {
+    int left = 0;
+    int nd = 0;
+    left = p_bitor();
     while (tok_kind(tpos) == 27) {
         tpos = tpos + 1;
         nd = new_node(23);
         store64(nd + 32, left);
-        store64(nd + 40, p_equality());
+        store64(nd + 40, p_bitor());
         left = nd;
     }
     return left;
@@ -854,6 +935,41 @@ int p_expr() {
     return p_logic_or();
 }
 
+// Folds a global's constant initializer, the same way coff0.c and coff.c0
+// do, so -a shows the same value. Anything that is not a constant is a parse
+// error here (perr), where the compilers say why.
+int const_fold(int nd) {
+    int k = load64(nd);
+    if (k == 1) { return load64(nd + 8); }
+    if (k == 17) { return 0 - const_fold(load64(nd + 32)); }
+    if (k == 39) { return ~const_fold(load64(nd + 32)); }
+    if (k == 7 || k == 8 || k == 9 || k == 10 || k == 33
+        || k == 34 || k == 35 || k == 36 || k == 37 || k == 38) {
+        int a = const_fold(load64(nd + 32));
+        int b = const_fold(load64(nd + 40));
+        if (k == 7) { return a + b; }
+        if (k == 8) { return a - b; }
+        if (k == 9) { return a * b; }
+        if (k == 10 || k == 33) {
+            if (b == 0) { perr(); }
+            if (b == 0 - 1 && a == 1 << 63) { perr(); }
+            if (k == 10) { return a / b; }
+            return a % b;
+        }
+        if (k == 34) { return a & b; }
+        if (k == 35) { return a | b; }
+        if (k == 36) { return a ^ b; }
+        if (k == 37) { return a << (b & 63); }
+        return a >> (b & 63);
+    }
+    perr();
+    return 0;
+}
+
+
+int embhead = 0;
+int embtail = 0;
+
 int p_stmt() {
     int nd = 0;
     int name = 0;
@@ -862,7 +978,8 @@ int p_stmt() {
     int out = 0;
     k = tok_kind(tpos);
     if (k == 17) { return p_block(); }
-    if (k == 21) {
+    // `int x` or `Layout x` (two identifiers in a row); -a shows no types.
+    if (k == 21 || (k == 2 && tok_kind(tpos + 1) == 2)) {
         tpos = tpos + 1;
         if (tok_kind(tpos) != 2) { perr(); }
         name = tok_name(tpos);
@@ -915,7 +1032,7 @@ int p_stmt() {
         expect(19);
         return new_node(26);
     }
-    // Parse a full expression first, then decide: a plain assignment
+    // Parse a full expression first, then decide between a plain assignment
     // (VAR '=' expr), an indexed assignment (buf[i] '=' expr), or -- if
     // not followed by '=' at all -- an expression statement. Needs
     // arbitrary lookahead (buf[i] can be any length), unlike the other
@@ -1042,6 +1159,17 @@ void dump_node(int nd, int depth) {
     if (k == 8) { print("SUB\n"); dump_bin(nd, depth); return; }
     if (k == 9) { print("MUL\n"); dump_bin(nd, depth); return; }
     if (k == 10) { print("DIV\n"); dump_bin(nd, depth); return; }
+    if (k == 33) { print("MOD\n"); dump_bin(nd, depth); return; }
+    if (k == 34) { print("BITAND\n"); dump_bin(nd, depth); return; }
+    if (k == 35) { print("BITOR\n"); dump_bin(nd, depth); return; }
+    if (k == 36) { print("BITXOR\n"); dump_bin(nd, depth); return; }
+    if (k == 37) { print("SHL\n"); dump_bin(nd, depth); return; }
+    if (k == 38) { print("SHR\n"); dump_bin(nd, depth); return; }
+    if (k == 39) {
+        print("BITNOT\n");
+        dump_node(load64(nd + 32), depth + 1);
+        return;
+    }
     if (k == 11) { print("EQ\n"); dump_bin(nd, depth); return; }
     if (k == 12) { print("NE\n"); dump_bin(nd, depth); return; }
     if (k == 13) { print("LT\n"); dump_bin(nd, depth); return; }
@@ -1130,13 +1258,13 @@ void dump_node(int nd, int depth) {
     return;
 }
 
-// --- main: read stdin, lex, parse the program, dump -----------------------
-// Function record: 96 bytes — 0 name, 8 nparams, 16+8i param names for the
+// --- main reads the input, lexes, parses the program and dumps it -------
+// A function record is 96 bytes — 0 name, 8 nparams, 16+8i param names for the
 // first 6 (register-passed), 64 body, 72 next, 80 is_void (1 if declared
 // "void" instead of "int"), 88 extra_params (head of a linked list for the
-// 7th param onward, stack-passed; max 16 total params). Extra-param node:
-// 16 bytes — 0 name, 8 next. Global record: 24 bytes — 0 name, 8 init,
-// 16 next.
+// 7th param onward, stack-passed; max 16 total params). An extra-param
+// node is 16 bytes — 0 name, 8 next. A global record is 24 bytes — 0 name,
+// 8 init, 16 next.
 
 int main() {
     int buf = 0;
@@ -1150,7 +1278,6 @@ int main() {
     int g = 0;
     int f = 0;
     int np = 0;
-    int sign = 0;
     int i = 0;
     int going = 0;
     int is_void = 0;
@@ -1166,8 +1293,8 @@ int main() {
 
     // An optional file argument (`parse1 file.c0`) is what makes include
     // resolution possible at all -- see lex.c0's main() for why piped
-    // stdin content alone cannot support it. No argument falls back to the
-    // original stdin-only interface, unchanged.
+    // stdin content alone cannot support it. With no argument, stdin is
+    // parsed as it is and includes are not expanded.
     if (argc() == 2) {
         expand_buf = alloc(EXPAND_CAP);
         expand_len = 0;
@@ -1176,7 +1303,7 @@ int main() {
         buf = expand_buf;
         n = expand_len;
     } else {
-        // 1048576 (1MB), not 65536 -- see lex.c0's identical fix for why.
+        // A fixed 1MB buffer, the same as lex.c0's.
         buf = alloc(1048576);
         got = read(0, buf, 1048576);
         while (got > 0) {
@@ -1189,6 +1316,35 @@ int main() {
     tpos = 0;
 
     while (tok_kind(tpos) != 26) {
+        // `embed name "file";` -- -a shows it as EMBED name file, first,
+        // the way coff0 -a does. `embed` is a word, not a keyword.
+        if (tok_kind(tpos) == 2 && streq_(tok_name(tpos), "embed") == 1
+            && tok_kind(tpos + 1) == 2 && tok_kind(tpos + 2) == 3) {
+            int em = alloc(24);
+            store64(em, tok_name(tpos + 1));
+            int plen = tok_len(tpos + 2);
+            int pstr = alloc(plen + 1);
+            int pi = 0;
+            while (pi < plen) { store8(pstr + pi, load8(tok_name(tpos + 2) + pi)); pi = pi + 1; }
+            store8(pstr + plen, 0);
+            store64(em + 8, pstr);
+            store64(em + 16, 0);
+            tpos = tpos + 3;
+            expect(19);
+            if (embhead == 0) { embhead = em; embtail = em; }
+            else { store64(embtail + 16, em); embtail = em; }
+            continue;
+        }
+        // `extern int name;` declares no AST of its own, and coff0 -a
+        // prints nothing for it, so it is parsed and dropped.
+        if (tok_kind(tpos) == 34) {
+            tpos = tpos + 1;
+            expect(21);
+            if (tok_kind(tpos) != 2) { perr(); }
+            tpos = tpos + 1;
+            expect(19);
+            continue;
+        }
         if (tok_kind(tpos) == 36) {
             tpos = tpos + 1;
             if (tok_kind(tpos) != 2) { perr(); }
@@ -1216,6 +1372,7 @@ int main() {
         }
         is_void = 0;
         if (tok_kind(tpos) == 33) { is_void = 1; tpos = tpos + 1; }
+        else if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { tpos = tpos + 1; }
         else { expect(21); }
         if (tok_kind(tpos) != 2) { perr(); }
         name = tok_name(tpos);
@@ -1231,7 +1388,8 @@ int main() {
             if (tok_kind(tpos) != 16) {
                 going = 1;
                 while (going == 1) {
-                    expect(21);
+                    if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { tpos = tpos + 1; }
+                    else { expect(21); }
                     if (tok_kind(tpos) != 2) { perr(); }
                     if (np >= 16) { perr(); }
                     if (np < 6) {
@@ -1260,11 +1418,7 @@ int main() {
             store64(g, name);
             if (tok_kind(tpos) == 8) {
                 tpos = tpos + 1;
-                sign = 1;
-                if (tok_kind(tpos) == 5) { tpos = tpos + 1; sign = 0 - 1; }
-                if (tok_kind(tpos) != 1) { perr(); }
-                store64(g + 8, sign * tok_ival(tpos));
-                tpos = tpos + 1;
+                store64(g + 8, const_fold(p_expr()));
             }
             expect(19);
             if (ghead == 0) { ghead = g; gtail = g; }
@@ -1272,6 +1426,15 @@ int main() {
         }
     }
 
+    int emp = embhead;
+    while (emp != 0) {
+        print("EMBED ");
+        print(load64(emp));
+        print(" ");
+        print(load64(emp + 8));
+        print("\n");
+        emp = load64(emp + 16);
+    }
     g = ghead;
     while (g != 0) {
         print("GLOBAL ");

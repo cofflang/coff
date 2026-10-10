@@ -1,0 +1,11 @@
+// tests/include_search/main.c0 - compiled by the -I section of run_tests.sh, finds its library only through -I
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+//
+// Not a test on its own (run_tests.sh's "-I" section compiles it). The
+// include below is not next to this file, so it is only found through
+// `-I tests/include_search/lib`.
+include "searchlib.c0";
+
+int main() {
+    return lib_value();
+}

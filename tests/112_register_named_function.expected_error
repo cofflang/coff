@@ -1,0 +1,1 @@
+coff0: tests/112_register_named_function.c0:7: 'rax' is a register name and cannot name a function

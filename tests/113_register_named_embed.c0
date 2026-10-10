@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/113_register_named_embed.c0 - an embed named like a register is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+embed cl "embed_fixtures/greeting.txt";
+int main() { return 0; }

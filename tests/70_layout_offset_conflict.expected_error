@@ -1,0 +1,1 @@
+coff0: tests/70_layout_offset_conflict.c0:10: field 'y' is at different offsets in different layouts; declare the variable with its layout, e.g. 'Point p'

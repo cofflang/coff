@@ -1,0 +1,8 @@
+// expect: compile-error
+//
+// tests/81_missing_rparen.c0 - a missing closing parenthesis is reported
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    if (1 { return 1; }
+    return 0;
+}

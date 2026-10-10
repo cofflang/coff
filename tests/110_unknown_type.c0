@@ -1,0 +1,6 @@
+// expect: compile-error
+//
+// tests/110_unknown_type.c0 - a type name that is not a layout is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+layout Point { int x; int y; }
+int main() { Pont p = alloc(16); return 0; }
