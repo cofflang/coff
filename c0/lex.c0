@@ -31,6 +31,9 @@
 int INCLUDE_MAX_DEPTH = 32;
 int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
 int include_depth = 0;
+int MAX_INCLUDED = 256;
+int included = 0; // alloc'd once, every file ever spliced (include-once)
+int n_included = 0;
 // Growing output buffer for expand_file's textual substitution -- see
 // coff0.c's resolve_includes for the full rationale (this mirrors it
 // exactly, differentially verified). A fixed generous size rather than
@@ -78,16 +81,16 @@ void print_char(int c) {
 
 void print_int(int v) {
     int tmp = alloc(32);
-    if (v == 0) { print("0"); return; }
+    if (!v) { print("0"); return; }
     int neg = 0;
     if (v < 0) { neg = 1; v = 0 - v; }
     int i = 31;
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         store8(tmp + i, '0' + (v % 10));
-        v = v / 10;
+        v /= 10;
     }
-    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    if (neg == 1) { i -= 1; store8(tmp + i, '-'); }
     print(tmp + i);
     return;
 }
@@ -96,11 +99,10 @@ void print_int(int v) {
 // keyword at kw?
 int word_is(int buf, int start, int len, int kw) {
     int i = 0;
-    while (i < len) {
+    for (i = 0; i < len; i += 1) {
         int k = load8(kw + i);
-        if (k == 0) { return 0; }
+        if (!k) { return 0; }
         if (load8(buf + start + i) != k) { return 0; }
-        i = i + 1;
     }
     if (load8(kw + len) != 0) { return 0; }
     return 1;
@@ -119,7 +121,7 @@ int word_is(int buf, int start, int len, int kw) {
 int slen(int s) {
     int i = 0;
     while (load8(s + i) != 0) {
-        i = i + 1;
+        i += 1;
     }
     return i;
 }
@@ -132,8 +134,8 @@ int streq_(int a, int b) {
         int ca = load8(a + i);
         int cb = load8(b + i);
         if (ca != cb) { going = 0; }
-        else if (ca == 0) { going = 0; result = 1; }
-        else { i = i + 1; }
+        else if (!ca) { going = 0; result = 1; }
+        else { i += 1; }
     }
     return result;
 }
@@ -143,19 +145,17 @@ int streq_(int a, int b) {
 // if `path` has no slash (same-directory relative resolution).
 int dirname_with_slash(int path) {
     int len = slen(path);
-    int i = len - 1;
-    while (i >= 0) {
+    int i = 0;
+    for (i = len - 1; i >= 0; i -= 1) {
         if (load8(path + i) == '/') {
             int out = alloc(i + 2);
             int k = 0;
-            while (k <= i) {
+            for (k = 0; k <= i; k += 1) {
                 store8(out + k, load8(path + k));
-                k = k + 1;
             }
             store8(out + i + 1, 0);
             return out;
         }
-        i = i - 1;
     }
     int empty = alloc(1);
     store8(empty, 0);
@@ -167,14 +167,12 @@ int join_path(int dir, int rel) {
     int rl = slen(rel);
     int out = alloc(dl + rl + 1);
     int i = 0;
-    while (i < dl) {
+    for (i = 0; i < dl; i += 1) {
         store8(out + i, load8(dir + i));
-        i = i + 1;
     }
     int j = 0;
-    while (j < rl) {
+    for (j = 0; j < rl; j += 1) {
         store8(out + dl + j, load8(rel + j));
-        j = j + 1;
     }
     store8(out + dl + rl, 0);
     return out;
@@ -186,7 +184,7 @@ void expand_putc(int c) {
         exit(1);
     }
     store8(expand_buf + expand_len, c);
-    expand_len = expand_len + 1;
+    expand_len += 1;
     return;
 }
 
@@ -198,19 +196,29 @@ void expand_putc(int c) {
 // a file including itself, directly or transitively.
 void expand_file(int path) {
     int i = 0;
-    while (i < include_depth) {
+    for (i = 0; i < include_depth; i += 1) {
         if (streq_(load64(include_stack + i * 8), path) == 1) {
             print("LEXERROR\n");
             exit(1);
         }
-        i = i + 1;
     }
     if (include_depth >= INCLUDE_MAX_DEPTH) {
         print("LEXERROR\n");
         exit(1);
     }
+    // Include-once, so a file reached a second time (a diamond) is skipped.
+    i = 0;
+    for (i = 0; i < n_included; i += 1) {
+        if (streq_(load64(included + i * 8), path) == 1) { return; }
+    }
+    if (n_included >= MAX_INCLUDED) {
+        print("LEXERROR\n");
+        exit(1);
+    }
+    store64(included + n_included * 8, path);
+    n_included += 1;
     store64(include_stack + include_depth * 8, path);
-    include_depth = include_depth + 1;
+    include_depth += 1;
 
     int fd = open_read(path);
     if (fd < 0) {
@@ -221,7 +229,7 @@ void expand_file(int path) {
     int n = 0;
     int got = read(fd, src, 1048576);
     while (got > 0) {
-        n = n + got;
+        n += got;
         got = read(fd, src + n, 1048576 - n);
     }
     close(fd);
@@ -232,7 +240,7 @@ void expand_file(int path) {
         int c = load8(src + p);
         if (c == '"') {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
             int scanning = 1;
             while (scanning == 1) {
                 if (p >= n || load8(src + p) == '"') { scanning = 0; }
@@ -240,16 +248,16 @@ void expand_file(int path) {
                     int sc = load8(src + p);
                     if (sc == '\\' && p + 1 < n) {
                         expand_putc(sc);
-                        p = p + 1;
+                        p += 1;
                         expand_putc(load8(src + p));
-                        p = p + 1;
+                        p += 1;
                     } else {
                         expand_putc(sc);
-                        p = p + 1;
+                        p += 1;
                     }
                 }
             }
-            if (p < n) { expand_putc('"'); p = p + 1; }
+            if (p < n) { expand_putc('"'); p += 1; }
         } else if (c == '\'') {
             // Char literals ('x', including quote characters like '"' or
             // '\'') need the same verbatim-copy treatment as strings --
@@ -259,70 +267,68 @@ void expand_file(int path) {
             // forward to whatever `"` happens to appear next in the file.
             // This function's own source contains `!= '"'`.
             expand_putc(c);
-            p = p + 1;
+            p += 1;
             if (p < n && load8(src + p) == '\\' && p + 1 < n) {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             } else if (p < n) {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             }
             if (p < n && load8(src + p) == '\'') {
                 expand_putc('\'');
-                p = p + 1;
+                p += 1;
             }
         } else if (c == '/' && p + 1 < n && load8(src + p + 1) == '/') {
             while (p < n && load8(src + p) != '\n') {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             }
         } else if (is_ident_start(c) == 1) {
             int start = p;
             while (p < n && is_ident_char(load8(src + p)) == 1) {
-                p = p + 1;
+                p += 1;
             }
             int wlen = p - start;
             if (wlen == 7 && word_is(src, start, 7, "include") == 1) {
                 int q = p;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
-                    q = q + 1;
+                    q += 1;
                 }
                 if (q >= n || load8(src + q) != '"') { print("LEXERROR\n"); exit(1); }
-                q = q + 1;
+                q += 1;
                 int pstart = q;
-                while (q < n && load8(src + q) != '"') { q = q + 1; }
+                while (q < n && load8(src + q) != '"') { q += 1; }
                 if (q >= n) { print("LEXERROR\n"); exit(1); }
                 int rel = alloc(q - pstart + 1);
                 int ri = 0;
-                while (ri < q - pstart) {
+                for (ri = 0; ri < q - pstart; ri += 1) {
                     store8(rel + ri, load8(src + pstart + ri));
-                    ri = ri + 1;
                 }
                 store8(rel + (q - pstart), 0);
-                q = q + 1;
+                q += 1;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
-                    q = q + 1;
+                    q += 1;
                 }
                 if (q >= n || load8(src + q) != ';') { print("LEXERROR\n"); exit(1); }
-                q = q + 1;
+                q += 1;
                 expand_file(join_path(dir, rel));
                 p = q;
             } else {
-                int k = start;
-                while (k < p) {
+                int k = 0;
+                for (k = start; k < p; k += 1) {
                     expand_putc(load8(src + k));
-                    k = k + 1;
                 }
             }
         } else {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
         }
     }
 
-    include_depth = include_depth - 1;
+    include_depth -= 1;
     return;
 }
 
@@ -339,6 +345,7 @@ int main() {
         expand_buf = alloc(EXPAND_CAP);
         expand_len = 0;
         include_stack = alloc(INCLUDE_MAX_DEPTH * 8);
+        included = alloc(MAX_INCLUDED * 8);
         expand_file(argv(1));
         buf = expand_buf;
         n = expand_len;
@@ -349,7 +356,7 @@ int main() {
         buf = alloc(1048576);
         int got = read(0, buf, 1048576);
         while (got > 0) {
-            n = n + got;
+            n += got;
             got = read(0, buf + n, 1048576 - n);
         }
     }
@@ -371,10 +378,10 @@ int main() {
     while (pos < n) {
         c = load8(buf + pos);
 
-        if (c == ' ') { pos = pos + 1; }
-        else if (c == '\n') { pos = pos + 1; }
-        else if (c == '\t') { pos = pos + 1; }
-        else if (c == 13) { pos = pos + 1; }
+        if (c == ' ') { pos += 1; }
+        else if (c == '\n') { pos += 1; }
+        else if (c == '\t') { pos += 1; }
+        else if (c == 13) { pos += 1; }
 
         else if (c == '/') {
             nxt = 0;
@@ -383,13 +390,16 @@ int main() {
                 going = 1;
                 while (going == 1) {
                     if (pos < n) {
-                        if (load8(buf + pos) != '\n') { pos = pos + 1; }
+                        if (load8(buf + pos) != '\n') { pos += 1; }
                         else { going = 0; }
                     } else { going = 0; }
                 }
+            } else if (nxt == '=') {
+                print("SLASHEQ\n");
+                pos += 2;
             } else {
                 print("SLASH\n");
-                pos = pos + 1;
+                pos += 1;
             }
         }
 
@@ -403,7 +413,7 @@ int main() {
                     is_hex = 1;
                 }
             }
-            if (is_hex == 1) { pos = pos + 2; base = 16; }
+            if (is_hex == 1) { pos += 2; base = 16; }
             going = 1;
             while (going == 1) {
                 if (pos < n) {
@@ -411,11 +421,11 @@ int main() {
                     if (base == 16) {
                         if (is_hex_digit(d) == 1) {
                             v = v * 16 + hex_value(d);
-                            pos = pos + 1;
+                            pos += 1;
                         } else { going = 0; }
                     } else if (is_digit(d) == 1) {
                         v = v * 10 + (d - '0');
-                        pos = pos + 1;
+                        pos += 1;
                     } else { going = 0; }
                 } else { going = 0; }
             }
@@ -429,7 +439,7 @@ int main() {
             going = 1;
             while (going == 1) {
                 if (pos < n) {
-                    if (is_ident_char(load8(buf + pos)) == 1) { pos = pos + 1; }
+                    if (is_ident_char(load8(buf + pos)) == 1) { pos += 1; }
                     else { going = 0; }
                 } else { going = 0; }
             }
@@ -438,6 +448,8 @@ int main() {
             else if (word_is(buf, start, len, "if") == 1) { print("IF\n"); }
             else if (word_is(buf, start, len, "else") == 1) { print("ELSE\n"); }
             else if (word_is(buf, start, len, "while") == 1) { print("WHILE\n"); }
+            else if (word_is(buf, start, len, "for") == 1) { print("FOR\n"); }
+            else if (word_is(buf, start, len, "defer") == 1) { print("DEFER\n"); }
             else if (word_is(buf, start, len, "return") == 1) { print("RETURN\n"); }
             else if (word_is(buf, start, len, "break") == 1) { print("BREAK\n"); }
             else if (word_is(buf, start, len, "continue") == 1) { print("CONTINUE\n"); }
@@ -447,17 +459,15 @@ int main() {
             else if (word_is(buf, start, len, "sizeof") == 1) { print("SIZEOF\n"); }
             else {
                 print("IDENT ");
-                i = start;
-                while (i < pos) {
+                for (i = start; i < pos; i += 1) {
                     print_char(load8(buf + i));
-                    i = i + 1;
                 }
                 print("\n");
             }
         }
 
         else if (c == '"') {
-            pos = pos + 1;
+            pos += 1;
             print("STR");
             going = 1;
             while (going == 1) {
@@ -465,9 +475,9 @@ int main() {
                 s = load8(buf + pos);
                 if (s == '"') {
                     going = 0;
-                    pos = pos + 1;
+                    pos += 1;
                 } else if (s == '\\') {
-                    pos = pos + 1;
+                    pos += 1;
                     if (pos >= n) { print("\nLEXERROR\n"); return 1; }
                     e = load8(buf + pos);
                     v = 0 - 1;
@@ -478,23 +488,23 @@ int main() {
                     if (v < 0) { print("\nLEXERROR\n"); return 1; }
                     print(" ");
                     print_int(v);
-                    pos = pos + 1;
+                    pos += 1;
                 } else {
                     print(" ");
                     print_int(s);
-                    pos = pos + 1;
+                    pos += 1;
                 }
             }
             print("\n");
         }
 
         else if (c == '\'') {
-            pos = pos + 1;
+            pos += 1;
             if (pos >= n) { print("LEXERROR\n"); return 1; }
             v = 0 - 1;
             e = load8(buf + pos);
             if (e == '\\') {
-                pos = pos + 1;
+                pos += 1;
                 if (pos >= n) { print("LEXERROR\n"); return 1; }
                 q = load8(buf + pos);
                 if (q == 'n') { v = '\n'; }
@@ -505,15 +515,15 @@ int main() {
                 if (v < 0) {
                     if (q != '0') { print("LEXERROR\n"); return 1; }
                 }
-                pos = pos + 1;
+                pos += 1;
             } else {
                 if (e == '\'') { print("LEXERROR\n"); return 1; }
                 v = e;
-                pos = pos + 1;
+                pos += 1;
             }
             if (pos >= n) { print("LEXERROR\n"); return 1; }
             if (load8(buf + pos) != '\'') { print("LEXERROR\n"); return 1; }
-            pos = pos + 1;
+            pos += 1;
             print("NUM ");
             print_int(v);
             print("\n");
@@ -522,56 +532,76 @@ int main() {
         else if (c == '=') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { print("EQ\n"); pos = pos + 2; }
-            else { print("ASSIGN\n"); pos = pos + 1; }
+            if (nxt == '=') { print("EQ\n"); pos += 2; }
+            else { print("ASSIGN\n"); pos += 1; }
         }
         else if (c == '!') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { print("NE\n"); pos = pos + 2; }
-            else { print("LEXERROR\n"); return 1; }
+            if (nxt == '=') { print("NE\n"); pos += 2; }
+            else { print("NOT\n"); pos += 1; }
         }
         else if (c == '<') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { print("LE\n"); pos = pos + 2; }
-            else if (nxt == '<') { print("SHL\n"); pos = pos + 2; }
-            else { print("LT\n"); pos = pos + 1; }
+            if (nxt == '=') { print("LE\n"); pos += 2; }
+            else if (nxt == '<') { print("SHL\n"); pos += 2; }
+            else { print("LT\n"); pos += 1; }
         }
         else if (c == '>') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { print("GE\n"); pos = pos + 2; }
-            else if (nxt == '>') { print("SHR\n"); pos = pos + 2; }
-            else { print("GT\n"); pos = pos + 1; }
+            if (nxt == '=') { print("GE\n"); pos += 2; }
+            else if (nxt == '>') { print("SHR\n"); pos += 2; }
+            else { print("GT\n"); pos += 1; }
         }
         else if (c == '&') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '&') { print("AND\n"); pos = pos + 2; }
-            else { print("AMP\n"); pos = pos + 1; }
+            if (nxt == '&') { print("AND\n"); pos += 2; }
+            else { print("AMP\n"); pos += 1; }
         }
         else if (c == '|') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '|') { print("OR\n"); pos = pos + 2; }
-            else { print("PIPE\n"); pos = pos + 1; }
+            if (nxt == '|') { print("OR\n"); pos += 2; }
+            else { print("PIPE\n"); pos += 1; }
         }
-        else if (c == '+') { print("PLUS\n"); pos = pos + 1; }
-        else if (c == '-') { print("MINUS\n"); pos = pos + 1; }
-        else if (c == '*') { print("STAR\n"); pos = pos + 1; }
-        else if (c == '%') { print("PERCENT\n"); pos = pos + 1; }
-        else if (c == '^') { print("CARET\n"); pos = pos + 1; }
-        else if (c == '~') { print("TILDE\n"); pos = pos + 1; }
-        else if (c == '(') { print("LPAREN\n"); pos = pos + 1; }
-        else if (c == ')') { print("RPAREN\n"); pos = pos + 1; }
-        else if (c == '{') { print("LBRACE\n"); pos = pos + 1; }
-        else if (c == '}') { print("RBRACE\n"); pos = pos + 1; }
-        else if (c == ';') { print("SEMI\n"); pos = pos + 1; }
-        else if (c == ',') { print("COMMA\n"); pos = pos + 1; }
-        else if (c == '[') { print("LBRACKET\n"); pos = pos + 1; }
-        else if (c == ']') { print("RBRACKET\n"); pos = pos + 1; }
-        else if (c == '.') { print("DOT\n"); pos = pos + 1; }
+        else if (c == '+') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("PLUSEQ\n"); pos += 2; }
+            else { print("PLUS\n"); pos += 1; }
+        }
+        else if (c == '-') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("MINUSEQ\n"); pos += 2; }
+            else { print("MINUS\n"); pos += 1; }
+        }
+        else if (c == '*') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("STAREQ\n"); pos += 2; }
+            else { print("STAR\n"); pos += 1; }
+        }
+        else if (c == '%') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { print("PERCENTEQ\n"); pos += 2; }
+            else { print("PERCENT\n"); pos += 1; }
+        }
+        else if (c == '^') { print("CARET\n"); pos += 1; }
+        else if (c == '~') { print("TILDE\n"); pos += 1; }
+        else if (c == '(') { print("LPAREN\n"); pos += 1; }
+        else if (c == ')') { print("RPAREN\n"); pos += 1; }
+        else if (c == '{') { print("LBRACE\n"); pos += 1; }
+        else if (c == '}') { print("RBRACE\n"); pos += 1; }
+        else if (c == ';') { print("SEMI\n"); pos += 1; }
+        else if (c == ',') { print("COMMA\n"); pos += 1; }
+        else if (c == '[') { print("LBRACKET\n"); pos += 1; }
+        else if (c == ']') { print("RBRACKET\n"); pos += 1; }
+        else if (c == '.') { print("DOT\n"); pos += 1; }
         else { print("LEXERROR\n"); return 1; }
     }
 

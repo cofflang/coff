@@ -40,12 +40,13 @@
 //   23 ELSE, 24 WHILE, 25 RETURN, 26 EOF, 27 AND, 28 OR, 29 BREAK, 30 CONTINUE,
 //   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN, 35 DOT, 36 LAYOUT,
 //   37 SIZEOF, 38 PERCENT, 39 AMP, 40 PIPE, 41 CARET, 42 TILDE, 43 SHL,
-//   44 SHR.
+//   44 SHR, 45 NOT, 46 PLUSEQ, 47 MINUSEQ, 48 STAREQ, 49 SLASHEQ,
+//   50 PERCENTEQ, 51 FOR, 52 DEFER.
 //
 // Node kinds use the same numbering as parse.c0 (1 NUM .. 22 BLOCK), plus
 //   23 AND, 24 OR (both short-circuiting; precedence between equality and
 //   the statement grammar, || loosest of the two), 25 BREAK, 26 CONTINUE
-//   (both only valid inside a while loop — resolve() enforces this),
+//   (both only valid inside a loop, which resolve() enforces),
 //   27 INDEX (child1=base, child2=index; buf[i] sugar over load8(buf+i)),
 //   28 INDEXASSIGN (child1=base, child2=index, child3=value),
 //   29 FUNCREF (a VAR node (kind 3) whose name turned out to be a declared
@@ -58,6 +59,15 @@
 //   as in parse.c0, and 33 MOD is child1 % child2, same shape as DIV.
 //   34 BITAND, 35 BITOR, 36 BITXOR, 37 SHL and 38 SHR are binary like DIV,
 //   39 BITNOT is unary like NEG.
+//   40 FORLOOP is child1=cond, child2=body, child3=step. `for` parses to a
+//   BLOCK holding the init statement then a FORLOOP, so `continue` runs the
+//   step (it jumps to .Lstep, not the condition).
+//   41 MULTIASSIGN is `a, b = f(...)`, with child1=the two-value call,
+//   child2=target1 VAR, child3=target2 VAR. The call leaves value1 in rax
+//   and value2 in rdx.
+//   42 DEFER is `defer <stmt>;` with child1=the statement. It emits nothing
+//   where it stands, and gen_function runs every collected child1 at .Lret
+//   in reverse order.
 //
 // The field order of Layout and LayoutField (name, next, ...) is
 // deliberate, not alphabetical. Both declare `name` first and `next`
@@ -147,6 +157,7 @@ layout Function {
     int ffile;  // the name's location, for error messages
     int fline;
     int ptypes; // alloc'd 16 * 8, each parameter's layout type, or 0 for int
+    int two_ret; // declared "(int, int)" -- returns two values, in rax and rdx
 }
 
 // The 7th-parameter-onward linked list. Same (name, next) shape as
@@ -205,6 +216,9 @@ int sym_count = 0;
 int stack_size = 0;
 int loop_depth = 0;
 int current_fn_is_void = 0;
+int current_fn_two_ret = 0;
+int resolving_multi_call = 0;
+int in_defer = 0;   // set while resolving a deferred statement; it may not return, break, continue or defer
 
 int scope_marks = 0;
 int scope_depth = 0;
@@ -217,7 +231,11 @@ int label_count = 0;
 int current_ret_label = 0;
 
 int loop_labels = 0;
+int loop_is_for = 0;
 int gen_loop_depth = 0;
+
+int defers = 0;     // alloc'd 64 * 8, deferred statements collected while generating a function body
+int n_defers = 0;   // reset per function; emitted in reverse at .Lret
 
 int outfd = 1;
 
@@ -240,6 +258,12 @@ int elf_mode = 0;
 int INCLUDE_MAX_DEPTH = 32;
 int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
 int include_depth = 0;
+// Every file ever spliced, by resolved path, so a diamond (two files both
+// including a third) splices it once and skips it after. A true cycle is
+// still caught by include_stack before this. Mirrors coff0.c's `included`.
+int MAX_INCLUDED = 256;
+int included = 0; // alloc'd once, MAX_INCLUDED * 8 bytes
+int n_included = 0;
 int EXPAND_CAP = 4194304; // 4MB
 int expand_buf = 0;
 int expand_len = 0;
@@ -248,7 +272,7 @@ int expand_len = 0;
 
 int strlen_(int s) {
     int i = 0;
-    while (s[i] != 0) { i = i + 1; }
+    while (s[i] != 0) { i += 1; }
     return i;
 }
 
@@ -295,26 +319,25 @@ void print_int(int v) {
     int tmp = alloc(32);
     int neg = 0;
     int i = 31;
-    if (v == 0) { emit("0"); return; }
+    if (!v) { emit("0"); return; }
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         tmp[i] = '0' + (v % 10);
-        v = v / 10;
+        v /= 10;
     }
-    if (neg == 1) { i = i - 1; tmp[i] = '-'; }
+    if (neg == 1) { i -= 1; tmp[i] = '-'; }
     emit(tmp + i);
     return;
 }
 
 int word_is(int buf, int start, int len, int kw) {
-    int i = 0;
     int k = 0;
-    while (i < len) {
+    int i = 0;
+    for (i = 0; i < len; i += 1) {
         k = kw[i];
-        if (k == 0) { return 0; }
+        if (!k) { return 0; }
         if (buf[start + i] != k) { return 0; }
-        i = i + 1;
     }
     if (kw[len] != 0) { return 0; }
     return 1;
@@ -323,9 +346,8 @@ int word_is(int buf, int start, int len, int kw) {
 int copy_bytes(int buf, int start, int len) {
     int p = alloc(len + 1);
     int i = 0;
-    while (i < len) {
+    for (i = 0; i < len; i += 1) {
         p[i] = buf[start + i];
-        i = i + 1;
     }
     return p;
 }
@@ -342,8 +364,8 @@ int streq(int a, int b) {
         ca = a[i];
         cb = b[i];
         if (ca != cb) { going = 0; }
-        else if (ca == 0) { going = 0; result = 1; }
-        else { i = i + 1; }
+        else if (!ca) { going = 0; result = 1; }
+        else { i += 1; }
     }
     return result;
 }
@@ -371,12 +393,11 @@ int n_inc_dirs = 0;
 // if `path` has no slash (same-directory relative resolution).
 int dirname_with_slash(int path) {
     int len = strlen_(path);
-    int i = len - 1;
-    while (i >= 0) {
+    int i = 0;
+    for (i = len - 1; i >= 0; i -= 1) {
         if (load8(path + i) == '/') {
             return copy_bytes(path, 0, i + 1);
         }
-        i = i - 1;
     }
     int empty = alloc(1);
     store8(empty, 0);
@@ -388,14 +409,12 @@ int join_path(int dir, int rel) {
     int rl = strlen_(rel);
     int out = alloc(dl + rl + 1);
     int i = 0;
-    while (i < dl) {
+    for (i = 0; i < dl; i += 1) {
         store8(out + i, load8(dir + i));
-        i = i + 1;
     }
     int j = 0;
-    while (j < rl) {
+    for (j = 0; j < rl; j += 1) {
         store8(out + dl + j, load8(rel + j));
-        j = j + 1;
     }
     store8(out + dl + rl, 0);
     return out;
@@ -411,7 +430,7 @@ void expand_putc(int c) {
         efail();
     }
     store8(expand_buf + expand_len, c);
-    expand_len = expand_len + 1;
+    expand_len += 1;
     return;
 }
 
@@ -438,13 +457,13 @@ int read_all(int fd) {
     int n = 0;
     int got = read(fd, buf, cap);
     while (got > 0) {
-        n = n + got;
+        n += got;
         if (n == cap) {
             int bigger = alloc(cap * 2);
             int k = 0;
-            while (k < n) { store64(bigger + k, load64(buf + k)); k = k + 8; }
+            for (k = 0; k < n; k += 8) { store64(bigger + k, load64(buf + k)); }
             buf = bigger;
-            cap = cap * 2;
+            cap *= 2;
         }
         got = read(fd, buf + n, cap - n);
     }
@@ -454,8 +473,14 @@ int read_all(int fd) {
 
 void expand_file(int path) {
     int i = 0;
+    for (i = 0; i < n_included; i += 1) {
+        if (streq(load64(included + i * 8), path) == 1) { return; }
+    }
+    if (n_included >= MAX_INCLUDED) { die("include: too many distinct files"); }
+    store64(included + n_included * 8, path);
+    n_included += 1;
     store64(include_stack + include_depth * 8, path);
-    include_depth = include_depth + 1;
+    include_depth += 1;
 
     int fd = open_read(path);
     if (fd < 0) { die_open(path, fd); }
@@ -470,7 +495,7 @@ void expand_file(int path) {
         int c = load8(src + p);
         if (c == '"') {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
             int scanning = 1;
             while (scanning == 1) {
                 if (p >= n || load8(src + p) == '"') { scanning = 0; }
@@ -478,41 +503,41 @@ void expand_file(int path) {
                     int sc = load8(src + p);
                     if (sc == '\\' && p + 1 < n) {
                         expand_putc(sc);
-                        p = p + 1;
+                        p += 1;
                         expand_putc(load8(src + p));
-                        p = p + 1;
+                        p += 1;
                     } else {
                         expand_putc(sc);
-                        p = p + 1;
+                        p += 1;
                     }
                 }
             }
-            if (p < n) { expand_putc('"'); p = p + 1; }
+            if (p < n) { expand_putc('"'); p += 1; }
         } else if (c == '\'') {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
             if (p < n && load8(src + p) == '\\' && p + 1 < n) {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             } else if (p < n) {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             }
             if (p < n && load8(src + p) == '\'') {
                 expand_putc('\'');
-                p = p + 1;
+                p += 1;
             }
         } else if (c == '/' && p + 1 < n && load8(src + p + 1) == '/') {
             while (p < n && load8(src + p) != '\n') {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             }
         } else if (is_ident_start(c) == 1) {
             int start = p;
             while (p < n && is_ident_char(load8(src + p)) == 1) {
-                p = p + 1;
+                p += 1;
             }
             int wlen = p - start;
             if (wlen == 7 && word_is(src, start, 7, "include") == 1) {
@@ -521,20 +546,20 @@ void expand_file(int path) {
                 err_line = line_in(src, src + start);
                 int q = p;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
-                    q = q + 1;
+                    q += 1;
                 }
                 if (q >= n || load8(src + q) != '"') { die("include: expected a string after 'include'"); }
-                q = q + 1;
+                q += 1;
                 int pstart = q;
-                while (q < n && load8(src + q) != '"') { q = q + 1; }
+                while (q < n && load8(src + q) != '"') { q += 1; }
                 if (q >= n) { die("include: unterminated path string"); }
                 int rel = copy_bytes(src, pstart, q - pstart);
-                q = q + 1;
+                q += 1;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
-                    q = q + 1;
+                    q += 1;
                 }
                 if (q >= n || load8(src + q) != ';') { die("include: expected ';' after the include path"); }
-                q = q + 1;
+                q += 1;
                 int inc_path = join_path(dir, rel);
                 // Not next to the including file, so try each -I directory
                 // in order (see inc_dirs).
@@ -546,15 +571,14 @@ void expand_file(int path) {
                         int cand = join_path(load64(inc_dirs + k * 8), rel);
                         int fd = open_read(cand);
                         if (fd >= 0) { close(fd); inc_path = cand; k = n_inc_dirs; }
-                        k = k + 1;
+                        k += 1;
                     }
                 }
                 i = 0;
-                while (i < include_depth) {
+                for (i = 0; i < include_depth; i += 1) {
                     if (streq(load64(include_stack + i * 8), inc_path) == 1) {
                         die3("include: circular include of ", inc_path, "");
                     }
-                    i = i + 1;
                 }
                 if (include_depth >= INCLUDE_MAX_DEPTH) {
                     eopen();
@@ -571,19 +595,18 @@ void expand_file(int path) {
                 add_seg(expand_len, path, line_in(src, src + q));
                 p = q;
             } else {
-                int k = start;
-                while (k < p) {
+                int k = 0;
+                for (k = start; k < p; k += 1) {
                     expand_putc(load8(src + k));
-                    k = k + 1;
                 }
             }
         } else {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
         }
     }
 
-    include_depth = include_depth - 1;
+    include_depth -= 1;
     return;
 }
 
@@ -605,14 +628,14 @@ void eput_int(int v) {
     int tmp = alloc(32);
     int neg = 0;
     int i = 31;
-    if (v == 0) { eput("0"); return; }
+    if (!v) { eput("0"); return; }
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         tmp[i] = '0' + (v % 10);
-        v = v / 10;
+        v /= 10;
     }
-    if (neg == 1) { i = i - 1; tmp[i] = '-'; }
+    if (neg == 1) { i -= 1; tmp[i] = '-'; }
     eput(tmp + i);
     return;
 }
@@ -658,7 +681,7 @@ int loc_off = 0;
 int loc_line = 1;
 
 void add_seg(int off, int file, int line) {
-    if (seg_off == 0) {
+    if (!seg_off) {
         seg_off = alloc(SEG_CAP * 8);
         seg_file = alloc(SEG_CAP * 8);
         seg_line = alloc(SEG_CAP * 8);
@@ -667,7 +690,7 @@ void add_seg(int off, int file, int line) {
     store64(seg_off + nseg * 8, off);
     store64(seg_file + nseg * 8, file);
     store64(seg_line + nseg * 8, line);
-    nseg = nseg + 1;
+    nseg += 1;
     return;
 }
 
@@ -675,13 +698,13 @@ void add_seg(int off, int file, int line) {
 // err_file/err_line. Offsets only ever increase, as the lexer moves forward.
 void loc_at(int buf, int off) {
     while (loc_seg + 1 < nseg && load64(seg_off + (loc_seg + 1) * 8) <= off) {
-        loc_seg = loc_seg + 1;
+        loc_seg += 1;
         loc_off = load64(seg_off + loc_seg * 8);
         loc_line = load64(seg_line + loc_seg * 8);
     }
     while (loc_off < off) {
-        if (load8(buf + loc_off) == '\n') { loc_line = loc_line + 1; }
-        loc_off = loc_off + 1;
+        if (load8(buf + loc_off) == '\n') { loc_line += 1; }
+        loc_off += 1;
     }
     err_file = load64(seg_file + loc_seg * 8);
     err_line = loc_line;
@@ -691,10 +714,9 @@ void loc_at(int buf, int off) {
 // The line `at` is on, counting from `src`.
 int line_in(int src, int at) {
     int line = 1;
-    int c = src;
-    while (c < at) {
-        if (load8(c) == '\n') { line = line + 1; }
-        c = c + 1;
+    int c = 0;
+    for (c = src; c < at; c += 1) {
+        if (load8(c) == '\n') { line += 1; }
     }
     return line;
 }
@@ -788,7 +810,7 @@ void lex_all(int buf, int n) {
     int is_hex = 0;
 
     toks = alloc((n + 2) * sizeof(Token));
-    if (nseg == 0) { add_seg(0, src_name, 1); }
+    if (!nseg) { add_seg(0, src_name, 1); }
     loc_seg = 0;
     loc_off = 0;
     loc_line = load64(seg_line);
@@ -797,10 +819,10 @@ void lex_all(int buf, int n) {
         loc_at(buf, pos);
         c = load8(buf + pos);
 
-        if (c == ' ') { pos = pos + 1; }
-        else if (c == '\n') { pos = pos + 1; }
-        else if (c == '\t') { pos = pos + 1; }
-        else if (c == 13) { pos = pos + 1; }
+        if (c == ' ') { pos += 1; }
+        else if (c == '\n') { pos += 1; }
+        else if (c == '\t') { pos += 1; }
+        else if (c == 13) { pos += 1; }
 
         else if (c == '/') {
             nxt = 0;
@@ -809,14 +831,18 @@ void lex_all(int buf, int n) {
                 going = 1;
                 while (going == 1) {
                     if (pos < n) {
-                        if (load8(buf + pos) != '\n') { pos = pos + 1; }
+                        if (load8(buf + pos) != '\n') { pos += 1; }
                         else { going = 0; }
                     } else { going = 0; }
                 }
+            } else if (nxt == '=') {
+                tok_put(t, 49, 0, 0, 0);
+                t += 1;
+                pos += 2;
             } else {
                 tok_put(t, 7, 0, 0, 0);
-                t = t + 1;
-                pos = pos + 1;
+                t += 1;
+                pos += 1;
             }
         }
 
@@ -830,7 +856,7 @@ void lex_all(int buf, int n) {
                     is_hex = 1;
                 }
             }
-            if (is_hex == 1) { pos = pos + 2; base = 16; }
+            if (is_hex == 1) { pos += 2; base = 16; }
             going = 1;
             while (going == 1) {
                 if (pos < n) {
@@ -838,16 +864,16 @@ void lex_all(int buf, int n) {
                     if (base == 16) {
                         if (is_hex_digit(d) == 1) {
                             v = v * 16 + hex_value(d);
-                            pos = pos + 1;
+                            pos += 1;
                         } else { going = 0; }
                     } else if (is_digit(d) == 1) {
                         v = v * 10 + (d - '0');
-                        pos = pos + 1;
+                        pos += 1;
                     } else { going = 0; }
                 } else { going = 0; }
             }
             tok_put(t, 1, v, 0, 0);
-            t = t + 1;
+            t += 1;
         }
 
         else if (is_ident_start(c) == 1) {
@@ -855,7 +881,7 @@ void lex_all(int buf, int n) {
             going = 1;
             while (going == 1) {
                 if (pos < n) {
-                    if (is_ident_char(load8(buf + pos)) == 1) { pos = pos + 1; }
+                    if (is_ident_char(load8(buf + pos)) == 1) { pos += 1; }
                     else { going = 0; }
                 } else { going = 0; }
             }
@@ -864,6 +890,8 @@ void lex_all(int buf, int n) {
             else if (word_is(buf, start, len, "if") == 1) { tok_put(t, 22, 0, 0, 0); }
             else if (word_is(buf, start, len, "else") == 1) { tok_put(t, 23, 0, 0, 0); }
             else if (word_is(buf, start, len, "while") == 1) { tok_put(t, 24, 0, 0, 0); }
+            else if (word_is(buf, start, len, "for") == 1) { tok_put(t, 51, 0, 0, 0); }
+            else if (word_is(buf, start, len, "defer") == 1) { tok_put(t, 52, 0, 0, 0); }
             else if (word_is(buf, start, len, "return") == 1) { tok_put(t, 25, 0, 0, 0); }
             else if (word_is(buf, start, len, "break") == 1) { tok_put(t, 29, 0, 0, 0); }
             else if (word_is(buf, start, len, "continue") == 1) { tok_put(t, 30, 0, 0, 0); }
@@ -875,11 +903,11 @@ void lex_all(int buf, int n) {
                 name = copy_bytes(buf, start, len);
                 tok_put(t, 2, 0, name, len);
             }
-            t = t + 1;
+            t += 1;
         }
 
         else if (c == '"') {
-            pos = pos + 1;
+            pos += 1;
             sbuf = alloc(n + 1);
             slen = 0;
             going = 1;
@@ -888,9 +916,9 @@ void lex_all(int buf, int n) {
                 s = load8(buf + pos);
                 if (s == '"') {
                     going = 0;
-                    pos = pos + 1;
+                    pos += 1;
                 } else if (s == '\\') {
-                    pos = pos + 1;
+                    pos += 1;
                     if (pos >= n) { die("unterminated string literal"); }
                     e = load8(buf + pos);
                     v = 0 - 1;
@@ -900,25 +928,25 @@ void lex_all(int buf, int n) {
                     if (e == '"') { v = '"'; }
                     if (v < 0) { die_char("unknown escape sequence '\\", e); }
                     store8(sbuf + slen, v);
-                    slen = slen + 1;
-                    pos = pos + 1;
+                    slen += 1;
+                    pos += 1;
                 } else {
                     store8(sbuf + slen, s);
-                    slen = slen + 1;
-                    pos = pos + 1;
+                    slen += 1;
+                    pos += 1;
                 }
             }
             tok_put(t, 3, 0, sbuf, slen);
-            t = t + 1;
+            t += 1;
         }
 
         else if (c == '\'') {
-            pos = pos + 1;
+            pos += 1;
             if (pos >= n) { die("empty or unterminated character literal"); }
             v = 0 - 1;
             e = load8(buf + pos);
             if (e == '\\') {
-                pos = pos + 1;
+                pos += 1;
                 if (pos >= n) { die("unterminated character literal"); }
                 q = load8(buf + pos);
                 if (q == 'n') { v = '\n'; }
@@ -929,77 +957,101 @@ void lex_all(int buf, int n) {
                 if (v < 0) {
                     if (q != '0') { die_char("unknown escape in character literal '\\", q); }
                 }
-                pos = pos + 1;
+                pos += 1;
             } else {
                 if (e == '\'') { die("empty or unterminated character literal"); }
                 v = e;
-                pos = pos + 1;
+                pos += 1;
             }
             if (pos >= n) { die("unterminated character literal"); }
             if (load8(buf + pos) != '\'') { die("unterminated character literal"); }
-            pos = pos + 1;
+            pos += 1;
             tok_put(t, 1, v, 0, 0);
-            t = t + 1;
+            t += 1;
         }
 
         else if (c == '=') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 9, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 8, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '=') { tok_put(t, 9, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 8, 0, 0, 0); pos += 1; }
+            t += 1;
         }
         else if (c == '!') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 10, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { die_char("unexpected character '", c); }
+            if (nxt == '=') { tok_put(t, 10, 0, 0, 0); pos += 2; t += 1; }
+            else { tok_put(t, 45, 0, 0, 0); pos += 1; t += 1; }
         }
         else if (c == '<') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos = pos + 2; }
-            else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 11, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos += 2; }
+            else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 11, 0, 0, 0); pos += 1; }
+            t += 1;
         }
         else if (c == '>') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos = pos + 2; }
-            else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 13, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos += 2; }
+            else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 13, 0, 0, 0); pos += 1; }
+            t += 1;
         }
-        else if (c == '+') { tok_put(t, 4, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '-') { tok_put(t, 5, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '*') { tok_put(t, 6, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '%') { tok_put(t, 38, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '~') { tok_put(t, 42, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '(') { tok_put(t, 15, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ')') { tok_put(t, 16, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '{') { tok_put(t, 17, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '}') { tok_put(t, 18, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ';') { tok_put(t, 19, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ',') { tok_put(t, 20, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '+') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 46, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 4, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '-') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 47, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 5, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '*') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 48, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 6, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '%') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 50, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 38, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '~') { tok_put(t, 42, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '(') { tok_put(t, 15, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ')') { tok_put(t, 16, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '{') { tok_put(t, 17, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '}') { tok_put(t, 18, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ';') { tok_put(t, 19, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ',') { tok_put(t, 20, 0, 0, 0); t += 1; pos += 1; }
         else if (c == '&') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 39, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 39, 0, 0, 0); pos += 1; }
+            t += 1;
         }
         else if (c == '|') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 40, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 40, 0, 0, 0); pos += 1; }
+            t += 1;
         }
-        else if (c == '[') { tok_put(t, 31, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ']') { tok_put(t, 32, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '.') { tok_put(t, 35, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '[') { tok_put(t, 31, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ']') { tok_put(t, 32, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '.') { tok_put(t, 35, 0, 0, 0); t += 1; pos += 1; }
         else { die_char("unexpected character '", c); }
     }
 
@@ -1017,10 +1069,8 @@ int param_name_at(int f, int i) {
     int k = 0;
     if (i < 6) { return load64(f + 56 + i * 8); }
     p = f.extra_params;
-    k = i - 6;
-    while (k > 0) {
+    for (k = i - 6; k > 0; k -= 1) {
         p = p.next;
-        k = k - 1;
     }
     return p.name;
 }
@@ -1047,7 +1097,7 @@ void want(int k, int what) {
 
 void expect(int k, int what) {
     want(k, what);
-    tpos = tpos + 1;
+    tpos += 1;
     return;
 }
 
@@ -1060,7 +1110,7 @@ int p_primary() {
     int a = 0;
     k = tok_kind(tpos);
     if (k == 15) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = p_expr();
         expect(16, "')'");
         return nd;
@@ -1068,7 +1118,7 @@ int p_primary() {
     if (k == 1) {
         nd = new_node(1);
         nd.ival = tok_ival(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         return nd;
     }
     if (k == 3) {
@@ -1079,15 +1129,15 @@ int p_primary() {
         store64(string_ptrs + string_count * 8, tok_name(tpos));
         store64(string_lens + string_count * 8, tok_len(tpos));
         nd.extra = string_count;
-        string_count = string_count + 1;
-        tpos = tpos + 1;
+        string_count += 1;
+        tpos += 1;
         return nd;
     }
     if (k == 2) {
         name = tok_name(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         if (tok_kind(tpos) == 15) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(6);
             nd.sval = name;
             head = 0;
@@ -1097,7 +1147,7 @@ int p_primary() {
                 head = a;
                 tail = a;
                 while (tok_kind(tpos) == 20) {
-                    tpos = tpos + 1;
+                    tpos += 1;
                     a = p_expr();
                     tail.sibling = a;
                     tail = a;
@@ -1112,12 +1162,12 @@ int p_primary() {
         return nd;
     }
     if (k == 37) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(15, "'('");
         want(2, "a layout name");
         nd = new_node(32);
         nd.sval = tok_name(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         expect(16, "')'");
         return nd;
     }
@@ -1134,19 +1184,19 @@ int p_postfix() {
     nd = p_primary();
     while (going == 1) {
         if (tok_kind(tpos) == 31) {
-            tpos = tpos + 1;
+            tpos += 1;
             idx = new_node(27);
             idx.child1 = nd;
             idx.child2 = p_expr();
             expect(32, "']'");
             nd = idx;
         } else if (tok_kind(tpos) == 35) {
-            tpos = tpos + 1;
+            tpos += 1;
             want(2, "a field name");
             fld = new_node(30);
             fld.child1 = nd;
             fld.sval = tok_name(tpos);
-            tpos = tpos + 1;
+            tpos += 1;
             nd = fld;
         } else { going = 0; }
     }
@@ -1155,16 +1205,27 @@ int p_postfix() {
 
 int p_unary() {
     int nd = 0;
+    int zero = 0;
     if (tok_kind(tpos) == 5) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(17);
         nd.child1 = p_unary();
         return nd;
     }
     if (tok_kind(tpos) == 42) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(39);
         nd.child1 = p_unary();
+        return nd;
+    }
+    // !E is sugar for (E == 0), so no new node kind or codegen is needed.
+    if (tok_kind(tpos) == 45) {
+        tpos += 1;
+        nd = new_node(11);
+        nd.child1 = p_unary();
+        zero = new_node(1);
+        zero.ival = 0;
+        nd.child2 = zero;
         return nd;
     }
     return p_postfix();
@@ -1178,19 +1239,19 @@ int p_term() {
     while (1) {
         op = tok_kind(tpos);
         if (op == 6) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(9);
             nd.child1 = left;
             nd.child2 = p_unary();
             left = nd;
         } else if (op == 7) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(10);
             nd.child1 = left;
             nd.child2 = p_unary();
             left = nd;
         } else if (op == 38) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(33);
             nd.child1 = left;
             nd.child2 = p_unary();
@@ -1208,13 +1269,13 @@ int p_add() {
     while (1) {
         op = tok_kind(tpos);
         if (op == 4) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(7);
             nd.child1 = left;
             nd.child2 = p_term();
             left = nd;
         } else if (op == 5) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(8);
             nd.child1 = left;
             nd.child2 = p_term();
@@ -1238,7 +1299,7 @@ int p_rel() {
         if (op == 13) { kind = 15; }
         if (op == 14) { kind = 16; }
         if (kind > 0) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(kind);
             nd.child1 = left;
             nd.child2 = p_shift();
@@ -1260,7 +1321,7 @@ int p_equality() {
         if (op == 9) { kind = 11; }
         if (op == 10) { kind = 12; }
         if (kind > 0) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(kind);
             nd.child1 = left;
             nd.child2 = p_rel();
@@ -1279,7 +1340,7 @@ int p_shift() {
     while (tok_kind(tpos) == 43 || tok_kind(tpos) == 44) {
         if (tok_kind(tpos) == 43) { nd = new_node(37); }
         else { nd = new_node(38); }
-        tpos = tpos + 1;
+        tpos += 1;
         nd.child1 = left;
         nd.child2 = p_add();
         left = nd;
@@ -1293,7 +1354,7 @@ int p_bitand() {
     left = p_equality();
     while (tok_kind(tpos) == 39) {
         nd = new_node(34);
-        tpos = tpos + 1;
+        tpos += 1;
         nd.child1 = left;
         nd.child2 = p_equality();
         left = nd;
@@ -1307,7 +1368,7 @@ int p_bitxor() {
     left = p_bitand();
     while (tok_kind(tpos) == 41) {
         nd = new_node(36);
-        tpos = tpos + 1;
+        tpos += 1;
         nd.child1 = left;
         nd.child2 = p_bitand();
         left = nd;
@@ -1321,7 +1382,7 @@ int p_bitor() {
     left = p_bitxor();
     while (tok_kind(tpos) == 40) {
         nd = new_node(35);
-        tpos = tpos + 1;
+        tpos += 1;
         nd.child1 = left;
         nd.child2 = p_bitxor();
         left = nd;
@@ -1334,7 +1395,7 @@ int p_logic_and() {
     int nd = 0;
     left = p_bitor();
     while (tok_kind(tpos) == 27) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(23);
         nd.child1 = left;
         nd.child2 = p_bitor();
@@ -1348,7 +1409,7 @@ int p_logic_or() {
     int nd = 0;
     left = p_logic_and();
     while (tok_kind(tpos) == 28) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(24);
         nd.child1 = left;
         nd.child2 = p_logic_and();
@@ -1380,7 +1441,7 @@ int const_fold(int nd) {
         if (k == 8) { return a - b; }
         if (k == 9) { return a * b; }
         if (k == 10 || k == 33) {
-            if (b == 0) { at_prev(); die("division by zero in a global initializer"); }
+            if (!b) { at_prev(); die("division by zero in a global initializer"); }
             if (b == 0 - 1 && a == 1 << 63) { at_prev(); die("division overflow in a global initializer"); }
             if (k == 10) { return a / b; }
             return a % b;
@@ -1404,46 +1465,144 @@ int at_typed_decl() {
     return 0;
 }
 
+// A plain assignment (VAR '=' expr), an indexed assignment (buf[i] '=' expr),
+// a field assignment (p.f '=' expr), a compound assignment (lhs OP= expr), or
+// -- if no assignment follows -- an expression statement. Needs arbitrary
+// lookahead (buf[i] can be any length). want_semi is 0 for a for-loop step,
+// which has ')' after it instead of ';'.
+int p_simple(int want_semi) {
+    int e = 0;
+    int out = 0;
+    int name = 0;
+    int ck = 0;
+    int bk = 0;
+    int bin = 0;
+    e = p_expr();
+    // q, r = f(...) -- a two-value assignment from a call that returns two.
+    if (tok_kind(tpos) == 20) {
+        int t2 = 0;
+        int call = 0;
+        if (e.kind != 3) { at_prev(); die("left of ',' in a two-value assignment must be a variable"); }
+        tpos += 1;
+        t2 = p_expr();
+        if (t2.kind != 3) { at_prev(); die("both targets of a two-value assignment must be variables"); }
+        expect(8, "'='");
+        call = p_expr();
+        if (call.kind != 6) { at_prev(); die("a two-value assignment needs a function call on the right"); }
+        out = new_node(41);
+        out.child1 = call;
+        out.child2 = e;
+        out.child3 = t2;
+        if (want_semi == 1) { expect(19, "';'"); }
+        return out;
+    }
+    if (tok_kind(tpos) == 8) {
+        tpos += 1;
+        if (e.kind == 3) {
+            name = e.sval;
+            out = new_node(4);
+            out.sval = name;
+            out.child2 = p_expr();
+            if (want_semi == 1) { expect(19, "';'"); }
+            return out;
+        }
+        if (e.kind == 27) {
+            out = new_node(28);
+            out.child1 = e.child1;
+            out.child2 = e.child2;
+            out.child3 = p_expr();
+            if (want_semi == 1) { expect(19, "';'"); }
+            return out;
+        }
+        if (e.kind == 30) {
+            out = new_node(31);
+            out.sval = e.sval;
+            out.child1 = e.child1;
+            out.child2 = p_expr();
+            if (want_semi == 1) { expect(19, "';'"); }
+            return out;
+        }
+        at_prev();
+        die("invalid assignment target");
+    }
+    // A compound assignment lhs OP= rhs is sugar for lhs = (lhs OP rhs), which
+    // builds the same AST a hand-written lhs = lhs OP rhs would.
+    if (tok_kind(tpos) >= 46 && tok_kind(tpos) <= 50) {
+        ck = tok_kind(tpos);
+        bk = 7;
+        if (ck == 47) { bk = 8; }
+        if (ck == 48) { bk = 9; }
+        if (ck == 49) { bk = 10; }
+        if (ck == 50) { bk = 33; }
+        tpos += 1;
+        bin = new_node(bk);
+        bin.child1 = e;
+        bin.child2 = p_expr();
+        if (e.kind == 3) {
+            out = new_node(4);
+            out.sval = e.sval;
+            out.child2 = bin;
+        } else if (e.kind == 27) {
+            out = new_node(28);
+            out.child1 = e.child1;
+            out.child2 = e.child2;
+            out.child3 = bin;
+        } else if (e.kind == 30) {
+            out = new_node(31);
+            out.sval = e.sval;
+            out.child1 = e.child1;
+            out.child2 = bin;
+        } else {
+            at_prev();
+            die("invalid assignment target");
+        }
+        if (want_semi == 1) { expect(19, "';'"); }
+        return out;
+    }
+    out = new_node(21);
+    out.child1 = e;
+    if (want_semi == 1) { expect(19, "';'"); }
+    return out;
+}
+
 int p_stmt() {
     int nd = 0;
     int name = 0;
     int k = 0;
-    int e = 0;
-    int out = 0;
     k = tok_kind(tpos);
     if (k == 17) { return p_block(); }
     if (k == 21 || at_typed_decl() == 1) {
         int dtype = 0;
         if (k == 2) { dtype = tok_name(tpos); }
-        tpos = tpos + 1;
+        tpos += 1;
         want(2, "an identifier");
         name = tok_name(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(5);
         nd.sval = name;
         nd.extra = dtype;
         if (tok_kind(tpos) == 8) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd.child2 = p_expr();
         }
         expect(19, "';'");
         return nd;
     }
     if (k == 22) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(15, "'('");
         nd = new_node(18);
         nd.child1 = p_expr();
         expect(16, "')'");
         nd.child2 = p_stmt();
         if (tok_kind(tpos) == 23) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd.child3 = p_stmt();
         }
         return nd;
     }
     if (k == 24) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(15, "'('");
         nd = new_node(19);
         nd.child1 = p_expr();
@@ -1452,61 +1611,60 @@ int p_stmt() {
         return nd;
     }
     if (k == 25) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(20);
-        if (tok_kind(tpos) != 19) { nd.child1 = p_expr(); }
+        if (tok_kind(tpos) != 19) {
+            nd.child1 = p_expr();
+            // return a, b; -- two-value return (child2 set marks it)
+            if (tok_kind(tpos) == 20) { tpos += 1; nd.child2 = p_expr(); }
+        }
         expect(19, "';'");
         return nd;
     }
     if (k == 29) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(19, "';'");
         return new_node(25);
     }
     if (k == 30) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(19, "';'");
         return new_node(26);
     }
-    // Parse a full expression first, then decide between a plain assignment
-    // (VAR '=' expr), an indexed assignment (buf[i] '=' expr), or -- if
-    // not followed by '=' at all -- an expression statement. Needs
-    // arbitrary lookahead (buf[i] can be any length), unlike the other
-    // statement forms above which dispatch on a fixed token peek.
-    e = p_expr();
-    if (tok_kind(tpos) == 8) {
-        tpos = tpos + 1;
-        if (e.kind == 3) {
-            name = e.sval;
-            out = new_node(4);
-            out.sval = name;
-            out.child2 = p_expr();
-            expect(19, "';'");
-            return out;
-        }
-        if (e.kind == 27) {
-            out = new_node(28);
-            out.child1 = e.child1;
-            out.child2 = e.child2;
-            out.child3 = p_expr();
-            expect(19, "';'");
-            return out;
-        }
-        if (e.kind == 30) {
-            out = new_node(31);
-            out.sval = e.sval;
-            out.child1 = e.child1;
-            out.child2 = p_expr();
-            expect(19, "';'");
-            return out;
-        }
-        at_prev();
-        die("invalid assignment target");
+    // for (init; cond; step) body parses to a BLOCK holding the init statement
+    // then a FORLOOP node, so init's declarations are scoped to the loop and
+    // `continue` runs the step. The step reuses p_simple with no trailing ';'.
+    if (k == 51) {
+        int finit = 0;
+        int fcond = 0;
+        int fstep = 0;
+        int fbody = 0;
+        int floop = 0;
+        int fblk = 0;
+        tpos += 1;
+        expect(15, "'('");
+        finit = p_stmt();
+        fcond = p_expr();
+        expect(19, "';'");
+        fstep = p_simple(0);
+        expect(16, "')'");
+        fbody = p_stmt();
+        floop = new_node(40);
+        floop.child1 = fcond;
+        floop.child2 = fbody;
+        floop.child3 = fstep;
+        fblk = new_node(22);
+        finit.sibling = floop;
+        fblk.child1 = finit;
+        return fblk;
     }
-    out = new_node(21);
-    out.child1 = e;
-    expect(19, "';'");
-    return out;
+    if (k == 52) {
+        tpos += 1;
+        nd = new_node(42);
+        nd.child1 = p_stmt();
+        return nd;
+    }
+    return p_simple(1);
 }
 
 int p_block() {
@@ -1518,7 +1676,7 @@ int p_block() {
     nd = new_node(22);
     while (tok_kind(tpos) != 18) {
         s = p_stmt();
-        if (head == 0) { head = s; tail = s; }
+        if (!head) { head = s; tail = s; }
         else { tail.sibling = s; tail = s; }
     }
     expect(18, "'}'");
@@ -1538,6 +1696,8 @@ int builtin_arity(int name) {
     if (streq(name, "alloc") == 1) { return 1; }
     if (streq(name, "load8") == 1) { return 1; }
     if (streq(name, "store8") == 1) { return 2; }
+    if (streq(name, "load32") == 1) { return 1; }
+    if (streq(name, "store32") == 1) { return 2; }
     if (streq(name, "load64") == 1) { return 1; }
     if (streq(name, "store64") == 1) { return 2; }
     if (streq(name, "exit") == 1) { return 1; }
@@ -1571,13 +1731,12 @@ int is_register_name(int n) {
     int regs = " rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 eax ebx ecx edx esi edi ebp esp r8d r9d r10d r11d r12d r13d r14d r15d ax bx cx dx si di bp sp r8w r9w r10w r11w r12w r13w r14w r15w al bl cl dl ah bh ch dh sil dil bpl spl r8b r9b r10b r11b r12b r13b r14b r15b rip eip cs ds es fs gs ss cr0 cr2 cr3 cr4 cr8 ";
     int nl = strlen_(n);
     int i = 0;
-    while (load8(regs + i) != 0) {
+    for (i = 0; load8(regs + i) != 0; i += 1) {
         if (load8(regs + i) == ' ' && load8(regs + i + nl + 1) == ' ') {
             int k = 0;
-            while (k < nl && load8(regs + i + 1 + k) == load8(n + k)) { k = k + 1; }
+            while (k < nl && load8(regs + i + 1 + k) == load8(n + k)) { k += 1; }
             if (k == nl) { return 1; }
         }
-        i = i + 1;
     }
     return 0;
 }
@@ -1597,7 +1756,7 @@ int is_builtin(int name) {
 }
 
 int arg_reg(int i) {
-    if (i == 0) { return "rdi"; }
+    if (!i) { return "rdi"; }
     if (i == 1) { return "rsi"; }
     if (i == 2) { return "rdx"; }
     if (i == 3) { return "rcx"; }
@@ -1614,6 +1773,15 @@ int func_nparams_of(int name) {
         f = f.fnext;
     }
     die3("call to undeclared function '", name, "'");
+    return 0;
+}
+
+int func_two_ret_of(int name) {
+    int f = fhead;
+    while (f != 0) {
+        if (streq(f.name, name) == 1) { return f.two_ret; }
+        f = f.fnext;
+    }
     return 0;
 }
 
@@ -1661,7 +1829,7 @@ int layout_count = 0;
 // variable or an expression). Mirrors coff0.c's field_lookup.
 int field_lookup(int name) {
     int i = 0;
-    while (i < field_count) {
+    for (i = 0; i < field_count; i += 1) {
         if (streq(load64(field_names + i * 8), name) == 1) {
             if (load64(field_ambiguous + i * 8) == 1) {
                 eopen();
@@ -1671,7 +1839,6 @@ int field_lookup(int name) {
             }
             return load64(field_offsets + i * 8);
         }
-        i = i + 1;
     }
     die3("unknown field '", name, "' (not declared in any layout)");
     return 0;
@@ -1679,26 +1846,24 @@ int field_lookup(int name) {
 
 void field_declare_or_check(int name, int offset) {
     int i = 0;
-    while (i < field_count) {
+    for (i = 0; i < field_count; i += 1) {
         if (streq(load64(field_names + i * 8), name) == 1) {
             if (load64(field_offsets + i * 8) != offset) { store64(field_ambiguous + i * 8, 1); }
             return;
         }
-        i = i + 1;
     }
     if (field_count >= 4096) { die("too many distinct field names (max 4096)"); }
     store64(field_names + field_count * 8, name);
     store64(field_offsets + field_count * 8, offset);
     store64(field_ambiguous + field_count * 8, 0);
-    field_count = field_count + 1;
+    field_count += 1;
     return;
 }
 
 int layout_exists(int name) {
     int i = 0;
-    while (i < layout_count) {
+    for (i = 0; i < layout_count; i += 1) {
         if (streq(load64(layout_names + i * 8), name) == 1) { return 1; }
-        i = i + 1;
     }
     return 0;
 }
@@ -1713,7 +1878,7 @@ int layout_field_offset(int lname, int field) {
             int f = l.fields;
             while (f != 0) {
                 if (streq(f.name, field) == 1) { return off; }
-                off = off + 8;
+                off += 8;
                 f = f.next;
             }
             eopen();
@@ -1736,10 +1901,9 @@ void check_type(int type) {
 // The layout a variable was declared with, or 0. Locals are searched
 // innermost first, then globals.
 int var_type(int name) {
-    int i = sym_count - 1;
-    while (i >= 0) {
+    int i = 0;
+    for (i = sym_count - 1; i >= 0; i -= 1) {
         if (streq(load64(sym_names + i * 8), name) == 1) { return load64(sym_types + i * 8); }
-        i = i - 1;
     }
     int g = ghead;
     while (g != 0) {
@@ -1751,9 +1915,8 @@ int var_type(int name) {
 
 int layout_lookup_size(int name) {
     int i = 0;
-    while (i < layout_count) {
+    for (i = 0; i < layout_count; i += 1) {
         if (streq(load64(layout_names + i * 8), name) == 1) { return load64(layout_sizes + i * 8); }
-        i = i + 1;
     }
     die3("unknown layout '", name, "' in sizeof(...)");
     return 0;
@@ -1773,7 +1936,7 @@ void layout_declare(int l) {
     err_line = l.lline;
     while (i < layout_count) {
         if (streq(load64(layout_names + i * 8), l.name) == 1) { die3("redefinition of layout '", l.name, "'"); }
-        i = i + 1;
+        i += 1;
     }
     if (layout_count >= 256) { die("too many layouts (max 256)"); }
     f = l.fields;
@@ -1791,22 +1954,21 @@ void layout_declare(int l) {
             g = g.next;
         }
         field_declare_or_check(f.name, offset);
-        offset = offset + 8;
+        offset += 8;
         f = f.next;
     }
     store64(layout_names + layout_count * 8, l.name);
     store64(layout_sizes + layout_count * 8, offset);
-    layout_count = layout_count + 1;
+    layout_count += 1;
     return;
 }
 
 // Scans innermost-declared-first (highest index first) so an inner scope's
 // variable correctly shadows an outer one of the same name.
 int sym_try_lookup(int name) {
-    int i = sym_count - 1;
-    while (i >= 0) {
+    int i = 0;
+    for (i = sym_count - 1; i >= 0; i -= 1) {
         if (streq(load64(sym_names + i * 8), name) == 1) { return load64(sym_offsets + i * 8); }
-        i = i - 1;
     }
     return 0 - 1;
 }
@@ -1815,10 +1977,8 @@ int sym_declared_in_scope(int name) {
     int scope_start = 0;
     int i = 0;
     if (scope_depth > 0) { scope_start = load64(scope_marks + (scope_depth - 1) * 8); }
-    i = scope_start;
-    while (i < sym_count) {
+    for (i = scope_start; i < sym_count; i += 1) {
         if (streq(load64(sym_names + i * 8), name) == 1) { return 1; }
-        i = i + 1;
     }
     return 0;
 }
@@ -1831,7 +1991,7 @@ int sym_declare(int name) {
     store64(sym_names + sym_count * 8, name);
     store64(sym_offsets + sym_count * 8, off);
     store64(sym_types + sym_count * 8, 0);
-    sym_count = sym_count + 1;
+    sym_count += 1;
     if (off > stack_size) { stack_size = off; }
     return off;
 }
@@ -1841,7 +2001,7 @@ int sym_declare(int name) {
 void resolve(int nd) {
     int saved_file = err_file;
     int saved_line = err_line;
-    if (nd == 0) { return; }
+    if (!nd) { return; }
     err_file = nd.nfile;
     err_line = nd.nline;
     resolve_node(nd);
@@ -1858,7 +2018,8 @@ void resolve_node(int nd) {
     int a = 0;
     int nargs = 0;
     int bar = 0;
-    if (nd == 0) { return; }
+    int saved = 0;
+    if (!nd) { return; }
     k = nd.kind;
     if (k == 1) { return; }
     if (k == 2) { return; }
@@ -1894,7 +2055,7 @@ void resolve_node(int nd) {
         args = nd.child1;
         nargs = 0;
         a = args;
-        while (a != 0) { nargs = nargs + 1; a = a.sibling; }
+        while (a != 0) { nargs += 1; a = a.sibling; }
         bar = builtin_arity(name);
         if (bar >= 0) {
             if (nargs != bar) {
@@ -1910,6 +2071,12 @@ void resolve_node(int nd) {
                 eput("'"); eput(name);
                 eput("' takes "); eput_int(func_nparams_of(name));
                 eput(" argument(s), got "); eput_int(nargs);
+                efail();
+            }
+            if (func_two_ret_of(name) == 1 && resolving_multi_call == 0) {
+                eopen();
+                eput("'"); eput(name);
+                eput("' returns two values; call it as 'a, b = "); eput(name); eput("(...)'");
                 efail();
             }
         } else {
@@ -1941,29 +2108,75 @@ void resolve_node(int nd) {
     }
     if (k == 19) {
         resolve(nd.child1);
-        loop_depth = loop_depth + 1;
+        loop_depth += 1;
         resolve(nd.child2);
-        loop_depth = loop_depth - 1;
+        loop_depth -= 1;
+        return;
+    }
+    if (k == 40) {
+        resolve(nd.child1);
+        loop_depth += 1;
+        resolve(nd.child2);
+        loop_depth -= 1;
+        resolve(nd.child3);
         return;
     }
     if (k == 20) {
+        if (in_defer == 1) { die("'return' inside a defer"); }
         if (current_fn_is_void == 1) { if (nd.child1 != 0) { die("'void' function cannot return a value"); } }
+        if (current_fn_two_ret == 1 && nd.child2 == 0) { die("a two-value function must 'return a, b'"); }
+        if (current_fn_two_ret == 0 && nd.child2 != 0) { die("only a '(int, int)' function may return two values"); }
         resolve(nd.child1);
+        resolve(nd.child2);
+        return;
+    }
+    // The deferred statement runs at .Lret, outside every loop, so it is
+    // resolved with loop_depth 0 and may not jump out of the epilogue.
+    if (k == 42) {
+        if (in_defer == 1) { die("'defer' inside a defer"); }
+        saved = loop_depth;
+        loop_depth = 0;
+        in_defer = 1;
+        resolve(nd.child1);
+        in_defer = 0;
+        loop_depth = saved;
+        return;
+    }
+    if (k == 41) {
+        resolving_multi_call = 1;
+        resolve(nd.child1);
+        resolving_multi_call = 0;
+        if (nd.child1.kind != 6 || func_two_ret_of(nd.child1.sval) == 0) {
+            die("the right of a two-value assignment must call an '(int, int)' function");
+        }
+        resolve(nd.child2);
+        resolve(nd.child3);
+        if (nd.child2.kind != 3 || nd.child3.kind != 3) {
+            die("two-value assignment targets must be variables");
+        }
         return;
     }
     if (k == 21) { resolve(nd.child1); return; }
     if (k == 22) {
         if (scope_depth >= 64) { die("blocks nested too deeply (max 64)"); }
         store64(scope_marks + scope_depth * 8, sym_count);
-        scope_depth = scope_depth + 1;
+        scope_depth += 1;
         a = nd.child1;
         while (a != 0) { resolve(a); a = a.sibling; }
-        scope_depth = scope_depth - 1;
+        scope_depth -= 1;
         sym_count = load64(scope_marks + scope_depth * 8);
         return;
     }
-    if (k == 25) { if (loop_depth <= 0) { die("'break' outside of a loop"); } return; }
-    if (k == 26) { if (loop_depth <= 0) { die("'continue' outside of a loop"); } return; }
+    if (k == 25) {
+        if (loop_depth <= 0 && in_defer == 1) { die("'break' inside a defer"); }
+        if (loop_depth <= 0) { die("'break' outside of a loop"); }
+        return;
+    }
+    if (k == 26) {
+        if (loop_depth <= 0 && in_defer == 1) { die("'continue' inside a defer"); }
+        if (loop_depth <= 0) { die("'continue' outside of a loop"); }
+        return;
+    }
     if (k == 27) { resolve(nd.child1); resolve(nd.child2); return; }
     if (k == 28) {
         resolve(nd.child1);
@@ -2002,30 +2215,191 @@ void gen_block(int nd) {
     return;
 }
 
-void gen_binop(int nd, int k) {
-    gen_expr(nd.child1);
+// A leaf operand is a number or a variable. Loading one has no side effect
+// and touches no other register, so a binary operator can load it straight
+// into rcx instead of saving rax on the stack around it.
+int is_leaf(int nd) {
+    return nd.kind == 1 || nd.kind == 3;
+}
+
+// Leaves lhs in rax and rhs in rcx, the operand layout of every binary
+// operator.
+void gen_operands(int lhs, int rhs) {
+    gen_expr(lhs);
+    if (is_leaf(rhs) == 1) {
+        if (rhs.kind == 1) { emit("    mov rcx, "); print_int(rhs.ival); emit("\n"); }
+        else if (rhs.extra == 1) { emit("    mov rcx, [.G"); emit(rhs.sval); emit("]\n"); }
+        else { emit("    mov rcx, [rbp - "); print_int(rhs.ival); emit("]\n"); }
+        return;
+    }
     emit("    push rax\n");
-    gen_expr(nd.child2);
+    gen_expr(rhs);
     emit("    mov rcx, rax\n");
     emit("    pop rax\n");
-    if (k == 7) { emit("    add rax, rcx\n"); return; }
-    if (k == 8) { emit("    sub rax, rcx\n"); return; }
-    if (k == 9) { emit("    imul rax, rcx\n"); return; }
+    return;
+}
+
+// add, sub, imul, and, or, xor and cmp take a sign-extended 32-bit
+// immediate, so a number in that range on their right needs no register at
+// all.
+int is_imm32(int nd) {
+    return nd.kind == 1 && nd.ival >= 0 - 2147483647 - 1 && nd.ival <= 2147483647;
+}
+
+// Leaves lhs in rax and returns 1 when rhs can be an immediate, otherwise
+// loads both operands as gen_operands does and returns 0.
+int gen_operands_imm(int lhs, int rhs) {
+    if (is_imm32(rhs) == 1) {
+        gen_expr(lhs);
+        return 1;
+    }
+    gen_operands(lhs, rhs);
+    return 0;
+}
+
+// The right operand of an instruction, after gen_operands_imm.
+void emit_rhs(int imm, int rhs) {
+    if (imm == 1) { print_int(rhs.ival); emit("\n"); }
+    else { emit("rcx\n"); }
+    return;
+}
+
+// A number or a local can trade places with the other operand of a
+// commutative operator. A global cannot, since a call on the other side may
+// write it, and c0 has no way to take a local's address.
+int is_stable_leaf(int nd) {
+    return nd.kind == 1 || (nd.kind == 3 && nd.extra != 1);
+}
+
+// The jump taken when a comparison of rax against the right operand holds
+// (sense 1) or fails (sense 0), or 0 for a node that is not a comparison.
+int cmp_jump(int k, int sense) {
+    if (k == 11) { if (sense == 1) { return "je"; } return "jne"; }
+    if (k == 12) { if (sense == 1) { return "jne"; } return "je"; }
+    if (k == 13) { if (sense == 1) { return "jl"; } return "jge"; }
+    if (k == 14) { if (sense == 1) { return "jle"; } return "jg"; }
+    if (k == 15) { if (sense == 1) { return "jg"; } return "jle"; }
+    if (k == 16) { if (sense == 1) { return "jge"; } return "jl"; }
+    return 0;
+}
+
+// Jumps to .<label><l> when cond is (sense 1) or is not (sense 0) true. A
+// comparison branches on the flags directly instead of turning them into 0
+// or 1 and comparing that against 0, and && and || become chains of such
+// branches.
+void gen_jump(int cond, int sense, int label, int l) {
+    int k = cond.kind;
+    int jcc = cmp_jump(k, sense);
+    int imm = 0;
+    int skip = 0;
+    if (jcc != 0) {
+        imm = gen_operands_imm(cond.child1, cond.child2);
+        emit("    cmp rax, ");
+        emit_rhs(imm, cond.child2);
+        emit("    "); emit(jcc); emit(" ."); emit(label); print_int(l); emit("\n");
+        return;
+    }
+    // (a && b) is false when either is false, (a || b) is true when either is
+    // true. The other two cases skip to .Lskip when the left side decides.
+    if ((k == 23 && sense == 0) || (k == 24 && sense == 1)) {
+        gen_jump(cond.child1, sense, label, l);
+        gen_jump(cond.child2, sense, label, l);
+        return;
+    }
+    if (k == 23 || k == 24) {
+        skip = label_count;
+        label_count += 1;
+        gen_jump(cond.child1, k == 24, "Lskip", skip);
+        gen_jump(cond.child2, sense, label, l);
+        emit(".Lskip"); print_int(skip); emit(":\n");
+        return;
+    }
+    gen_expr(cond);
+    emit("    cmp rax, 0\n");
+    if (sense == 1) { emit("    jne ."); } else { emit("    je ."); }
+    emit(label); print_int(l); emit("\n");
+    return;
+}
+
+void gen_jump_if_false(int cond, int label, int l) {
+    gen_jump(cond, 0, label, l);
+    return;
+}
+
+// Leaves an address in rdi and a value in rax, evaluated in that order. A
+// leaf value loads into rax without disturbing rdi, so the address need not
+// wait on the stack.
+void gen_addr_value(int addr, int value) {
+    gen_expr(addr);
+    if (is_leaf(value) == 1) {
+        emit("    mov rdi, rax\n");
+        gen_expr(value);
+        return;
+    }
+    emit("    push rax\n");
+    gen_expr(value);
+    emit("    pop rdi\n");
+    return;
+}
+
+// A number, a local or a string literal, loaded straight into an argument
+// register. Nothing an argument expression does can change one, so it may
+// be loaded after the others.
+int is_stable_arg(int nd) {
+    return is_stable_leaf(nd) == 1 || nd.kind == 2;
+}
+
+int nth_arg(int args, int i) {
+    while (i > 0) {
+        args = args.sibling;
+        i -= 1;
+    }
+    return args;
+}
+
+void gen_stable_arg(int nd, int reg) {
+    if (nd.kind == 1) { emit("    mov "); emit(reg); emit(", "); print_int(nd.ival); emit("\n"); return; }
+    if (nd.kind == 2) { emit("    lea "); emit(reg); emit(", [.Lstr"); print_int(nd.extra); emit("]\n"); return; }
+    emit("    mov "); emit(reg); emit(", [rbp - "); print_int(nd.ival); emit("]\n");
+    return;
+}
+
+void gen_binop(int nd, int k) {
+    int imm = 0;
+    int lhs = nd.child1;
+    int rhs = nd.child2;
+    int commutes = k == 7 || k == 9 || k == 34 || k == 35 || k == 36;
+    // With the leaf on the right, it loads straight into place instead of
+    // rax being saved around the other operand.
+    if (commutes && is_stable_leaf(lhs) == 1 && is_leaf(rhs) == 0) { lhs = nd.child2; rhs = nd.child1; }
+    if (commutes || k == 8 || (k >= 11 && k <= 16)) { imm = gen_operands_imm(lhs, rhs); }
+    else { gen_operands(lhs, rhs); }
+    if (k >= 11 && k <= 16) {
+        emit("    cmp rax, ");
+        emit_rhs(imm, rhs);
+    }
+    if (k == 7) { emit("    add rax, "); emit_rhs(imm, rhs); return; }
+    if (k == 8) { emit("    sub rax, "); emit_rhs(imm, rhs); return; }
+    if (k == 9) {
+        if (imm == 1) { emit("    imul rax, rax, "); print_int(rhs.ival); emit("\n"); }
+        else { emit("    imul rax, rcx\n"); }
+        return;
+    }
     if (k == 10) { emit("    cqo\n    idiv rcx\n"); return; }
     // idiv leaves the remainder in rdx, with the sign of the dividend.
     if (k == 33) { emit("    cqo\n    idiv rcx\n    mov rax, rdx\n"); return; }
-    if (k == 34) { emit("    and rax, rcx\n"); return; }
-    if (k == 35) { emit("    or rax, rcx\n"); return; }
-    if (k == 36) { emit("    xor rax, rcx\n"); return; }
+    if (k == 34) { emit("    and rax, "); emit_rhs(imm, rhs); return; }
+    if (k == 35) { emit("    or rax, "); emit_rhs(imm, rhs); return; }
+    if (k == 36) { emit("    xor rax, "); emit_rhs(imm, rhs); return; }
     // The count is in cl, x86 masks it to its low six bits. >> is arithmetic.
     if (k == 37) { emit("    shl rax, cl\n"); return; }
     if (k == 38) { emit("    sar rax, cl\n"); return; }
-    if (k == 11) { emit("    cmp rax, rcx\n    sete al\n    movzx rax, al\n"); return; }
-    if (k == 12) { emit("    cmp rax, rcx\n    setne al\n    movzx rax, al\n"); return; }
-    if (k == 13) { emit("    cmp rax, rcx\n    setl al\n    movzx rax, al\n"); return; }
-    if (k == 14) { emit("    cmp rax, rcx\n    setle al\n    movzx rax, al\n"); return; }
-    if (k == 15) { emit("    cmp rax, rcx\n    setg al\n    movzx rax, al\n"); return; }
-    if (k == 16) { emit("    cmp rax, rcx\n    setge al\n    movzx rax, al\n"); return; }
+    if (k == 11) { emit("    sete al\n    movzx rax, al\n"); return; }
+    if (k == 12) { emit("    setne al\n    movzx rax, al\n"); return; }
+    if (k == 13) { emit("    setl al\n    movzx rax, al\n"); return; }
+    if (k == 14) { emit("    setle al\n    movzx rax, al\n"); return; }
+    if (k == 15) { emit("    setg al\n    movzx rax, al\n"); return; }
+    if (k == 16) { emit("    setge al\n    movzx rax, al\n"); return; }
     return;
 }
 
@@ -2036,12 +2410,13 @@ void gen_call(int nd) {
     int i = 0;
     int nargs = 0;
     int a = 0;
+    int last = 0 - 1;
 
     if (streq(name, "print") == 1) {
         l = label_count;
         // One label id serves both .Lstrlen and .Lstrlend, which differ by
         // name.
-        label_count = label_count + 1;
+        label_count += 1;
         // rsi and rcx, not rbx, because the ABI has a function preserve
         // rbx.
         gen_expr(args);
@@ -2079,7 +2454,7 @@ void gen_call(int nd) {
             emit("    syscall\n");
             return;
         }
-        l = label_count; label_count = label_count + 1;
+        l = label_count; label_count += 1;
         gen_expr(args);
         emit("    push rax\n");
         emit("    mov rax, [.Lcurbrk]\n");
@@ -2104,10 +2479,7 @@ void gen_call(int nd) {
         return;
     }
     if (streq(name, "store8") == 1) {
-        gen_expr(args);
-        emit("    push rax\n");
-        gen_expr(args.sibling);
-        emit("    pop rdi\n");
+        gen_addr_value(args, args.sibling);
         emit("    mov byte ptr [rdi], al\n");
     
         return;
@@ -2132,7 +2504,7 @@ void gen_call(int nd) {
     // SYSCALL instruction clobbers rcx with the return RIP. Every argument
     // is evaluated left to right onto the stack first, then popped into its
     // register in reverse, so an argument expression may itself call.
-    if (elf_mode == 0) {
+    if (!elf_mode) {
         if (streq(name, "win_info") == 1 || streq(name, "win_max") == 1
             || streq(name, "key_poll") == 1 || streq(name, "ticks") == 1
             || streq(name, "present") == 1 || streq(name, "readfile") == 1
@@ -2269,16 +2641,24 @@ void gen_call(int nd) {
         emit("    mov rax, 3\n    syscall\n");
         return;
     }
+    if (streq(name, "load32") == 1) {
+        // A 32-bit load clears the upper half of rax by itself.
+        gen_expr(args);
+        emit("    mov eax, dword ptr [rax]\n");
+        return;
+    }
+    if (streq(name, "store32") == 1) {
+        gen_addr_value(args, args.sibling);
+        emit("    mov dword ptr [rdi], eax\n");
+        return;
+    }
     if (streq(name, "load64") == 1) {
         gen_expr(args);
  emit("    mov rax, [rax]\n"); 
         return;
     }
     if (streq(name, "store64") == 1) {
-        gen_expr(args);
-        emit("    push rax\n");
-        gen_expr(args.sibling);
-        emit("    pop rdi\n");
+        gen_addr_value(args, args.sibling);
         emit("    mov [rdi], rax\n");
     
         return;
@@ -2352,23 +2732,45 @@ void gen_call(int nd) {
 
     a = args;
     while (a != 0) {
-        gen_expr(a);
-        emit("    push rax\n");
+        if (is_stable_arg(a) == 0) { last = nargs; }
         a = a.sibling;
-        nargs = nargs + 1;
+        nargs += 1;
     }
     if (nargs <= 6) {
-        i = nargs - 1;
-        while (i >= 0) {
-            emit("    pop "); emit(arg_reg(i)); emit("\n");
-            i = i - 1;
+        // The other arguments are evaluated left to right as usual. The last
+        // of them goes straight to its register, the rest wait on the stack,
+        // and the stable ones are loaded last, directly into place.
+        a = args;
+        i = 0;
+        while (a != 0) {
+            if (is_stable_arg(a) == 0) {
+                gen_expr(a);
+                if (i == last) { emit("    mov "); emit(arg_reg(i)); emit(", rax\n"); }
+                else { emit("    push rax\n"); }
+            }
+            a = a.sibling;
+            i += 1;
+        }
+        for (i = nargs - 1; i >= 0; i -= 1) {
+            if (is_stable_arg(nth_arg(args, i)) == 0 && i != last) {
+                emit("    pop "); emit(arg_reg(i)); emit("\n");
+            }
+        }
+        for (i = 0; i < nargs; i += 1) {
+            a = nth_arg(args, i);
+            if (is_stable_arg(a) == 1) { gen_stable_arg(a, arg_reg(i)); }
         }
     } else {
+        a = args;
+        while (a != 0) {
+            gen_expr(a);
+            emit("    push rax\n");
+            a = a.sibling;
+        }
         i = 0;
-        while (i < 6) {
+        for (i = 0; i < 6; i += 1) {
             emit("    mov "); emit(arg_reg(i)); emit(", [rsp + ");
             print_int((nargs - 1 - i) * 8); emit("]\n");
-            i = i + 1;
         }
     }
 
@@ -2454,11 +2856,9 @@ void gen_expr_node(int nd) {
     }
     // --- array index (load8 offset) ---
     if (k == 27) {
-        gen_expr(nd.child1);
-        emit("    push rax\n");
-        gen_expr(nd.child2);
-        emit("    mov rcx, rax\n");
-        emit("    pop rax\n");
+        // base + index, so the operands may trade places like ADD's.
+        if (is_stable_leaf(nd.child1) == 1 && is_leaf(nd.child2) == 0) { gen_operands(nd.child2, nd.child1); }
+        else { gen_operands(nd.child1, nd.child2); }
         emit("    add rax, rcx\n");
         emit("    movzx rax, byte ptr [rax]\n");
     
@@ -2480,13 +2880,8 @@ void gen_expr_node(int nd) {
         // One label id serves both .Lfalse and .Landend, since the labels
         // are distinct names (.Lfalse7 / .Landend7 cannot collide).
         l = label_count;
-        label_count = label_count + 1;
-        gen_expr(nd.child1);
-        emit("    cmp rax, 0\n");
-        emit("    je .Lfalse"); print_int(l); emit("\n");
-        gen_expr(nd.child2);
-        emit("    cmp rax, 0\n");
-        emit("    je .Lfalse"); print_int(l); emit("\n");
+        label_count += 1;
+        gen_jump(nd, 0, "Lfalse", l);
         emit("    mov rax, 1\n");
         emit("    jmp .Landend"); print_int(l); emit("\n");
         emit(".Lfalse"); print_int(l); emit(":\n");
@@ -2499,13 +2894,8 @@ void gen_expr_node(int nd) {
     if (k == 24) {
         // One label id for .Ltrue and .Lorend, as in the AND case above.
         l = label_count;
-        label_count = label_count + 1;
-        gen_expr(nd.child1);
-        emit("    cmp rax, 0\n");
-        emit("    jne .Ltrue"); print_int(l); emit("\n");
-        gen_expr(nd.child2);
-        emit("    cmp rax, 0\n");
-        emit("    jne .Ltrue"); print_int(l); emit("\n");
+        label_count += 1;
+        gen_jump(nd, 1, "Ltrue", l);
         emit("    mov rax, 0\n");
         emit("    jmp .Lorend"); print_int(l); emit("\n");
         emit(".Ltrue"); print_int(l); emit(":\n");
@@ -2554,24 +2944,25 @@ void gen_stmt_node(int nd) {
     }
     // --- array-index assignment (k=28) ---
     if (k == 28) {
-        gen_expr(nd.child1);
-        emit("    push rax\n");
-        gen_expr(nd.child2);
-        emit("    pop rcx\n");
-        emit("    add rcx, rax\n");
-        emit("    push rcx\n");
-        gen_expr(nd.child3);
-        emit("    pop rdi\n");
+        // base + index, then the value, as for store8.
+        if (is_stable_leaf(nd.child1) == 1 && is_leaf(nd.child2) == 0) { gen_operands(nd.child2, nd.child1); }
+        else { gen_operands(nd.child1, nd.child2); }
+        emit("    add rax, rcx\n");
+        if (is_leaf(nd.child3) == 1) {
+            emit("    mov rdi, rax\n");
+            gen_expr(nd.child3);
+        } else {
+            emit("    push rax\n");
+            gen_expr(nd.child3);
+            emit("    pop rdi\n");
+        }
         emit("    mov byte ptr [rdi], al\n");
     
         return;
     }
     // --- field assignment (k=31, e.field = value) ---
     if (k == 31) {
-        gen_expr(nd.child1);  // base
-        emit("    push rax\n");
-        gen_expr(nd.child2);  // value
-        emit("    pop rdi\n");
+        gen_addr_value(nd.child1, nd.child2);
         emit("    mov [rdi + "); print_int(nd.ival); emit("], rax\n");
     
         return;
@@ -2582,12 +2973,12 @@ void gen_stmt_node(int nd) {
     if (k == 18) {
         l = label_count;
         // One label id for .Lelse and .Lend, told apart by name.
-        label_count = label_count + 1;
-        gen_expr(nd.child1);
-        emit("    cmp rax, 0\n");
-        emit("    je .Lelse"); print_int(l); emit("\n");
+        label_count += 1;
+        gen_jump_if_false(nd.child1, "Lelse", l);
         gen_stmt(nd.child2);
-        emit("    jmp .Lend"); print_int(l); emit("\n");
+        // Without an else, .Lend follows .Lelse directly, so the jump would
+        // land on the next instruction.
+        if (nd.child3 != 0) { emit("    jmp .Lend"); print_int(l); emit("\n"); }
         emit(".Lelse"); print_int(l); emit(":\n");
         if (nd.child3 != 0) { gen_stmt(nd.child3); }
         emit(".Lend"); print_int(l); emit(":\n");
@@ -2598,25 +2989,68 @@ void gen_stmt_node(int nd) {
     if (k == 19) {
         l = label_count;
         // One label id for .Lstart and .Lend, as in if/else above.
-        label_count = label_count + 1;
+        label_count += 1;
         emit(".Lstart"); print_int(l); emit(":\n");
-        gen_expr(nd.child1);
-        emit("    cmp rax, 0\n");
-        emit("    je .Lend"); print_int(l); emit("\n");
+        gen_jump_if_false(nd.child1, "Lend", l);
         if (gen_loop_depth >= 64) { die("loops nested too deeply (max 64)"); }
         store64(loop_labels + gen_loop_depth * 8, l);
-        gen_loop_depth = gen_loop_depth + 1;
+        store64(loop_is_for + gen_loop_depth * 8, 0);
+        gen_loop_depth += 1;
         gen_stmt(nd.child2);
-        gen_loop_depth = gen_loop_depth - 1;
+        gen_loop_depth -= 1;
         emit("    jmp .Lstart"); print_int(l); emit("\n");
         emit(".Lend"); print_int(l); emit(":\n");
-    
+
+        return;
+    }
+    // --- for loop (k=40), child1 cond, child2 body, child3 step. continue
+    // jumps to .Lstep so the step always runs, matching C. ---
+    if (k == 40) {
+        l = label_count;
+        label_count += 1;
+        emit(".Lstart"); print_int(l); emit(":\n");
+        gen_jump_if_false(nd.child1, "Lend", l);
+        if (gen_loop_depth >= 64) { die("loops nested too deeply (max 64)"); }
+        store64(loop_labels + gen_loop_depth * 8, l);
+        store64(loop_is_for + gen_loop_depth * 8, 1);
+        gen_loop_depth += 1;
+        gen_stmt(nd.child2);
+        gen_loop_depth -= 1;
+        emit(".Lstep"); print_int(l); emit(":\n");
+        gen_stmt(nd.child3);
+        emit("    jmp .Lstart"); print_int(l); emit("\n");
+        emit(".Lend"); print_int(l); emit(":\n");
         return;
     }
     // --- return (k=20) ---
     if (k == 20) {
-        if (nd.child1 != 0) { gen_expr(nd.child1); }
+        if (nd.child2 != 0) {
+            // return a, b; -- first value in rax, second in rdx.
+            gen_expr(nd.child1);
+            emit("    push rax\n");
+            gen_expr(nd.child2);
+            emit("    mov rdx, rax\n");
+            emit("    pop rax\n");
+        } else if (nd.child1 != 0) {
+            gen_expr(nd.child1);
+        }
         emit("    jmp .Lret"); print_int(current_ret_label); emit("\n");
+        return;
+    }
+    // --- two-value assignment a, b = f(...) (k=41) ---
+    if (k == 41) {
+        gen_expr(nd.child1);
+        if (nd.child2.extra == 1) { emit("    mov [.G"); emit(nd.child2.sval); emit("], rax\n"); }
+        else { emit("    mov [rbp - "); print_int(nd.child2.ival); emit("], rax\n"); }
+        if (nd.child3.extra == 1) { emit("    mov [.G"); emit(nd.child3.sval); emit("], rdx\n"); }
+        else { emit("    mov [rbp - "); print_int(nd.child3.ival); emit("], rdx\n"); }
+        return;
+    }
+    // --- defer (k=42) is collected now and emitted, reversed, at .Lret ---
+    if (k == 42) {
+        if (n_defers >= 64) { die("too many defers in one function (max 64)"); }
+        store64(defers + n_defers * 8, nd.child1);
+        n_defers += 1;
         return;
     }
     // --- break (k=25) ---
@@ -2627,8 +3061,11 @@ void gen_stmt_node(int nd) {
     }
     // --- continue (k=26) ---
     if (k == 26) {
-        emit("    jmp .Lstart"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
-    
+        if (load64(loop_is_for + (gen_loop_depth - 1) * 8) == 1) {
+            emit("    jmp .Lstep"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
+        } else {
+            emit("    jmp .Lstart"); print_int(load64(loop_labels + (gen_loop_depth - 1) * 8)); emit("\n");
+        }
         return;
     }
     // --- block (k=22) ---
@@ -2642,10 +3079,10 @@ void gen_function(int f) {
     int nparams = f.nparams;
     int i = 0;
     int rem = frame % 16;
-    if (rem != 0) { frame = frame + (16 - rem); }
+    if (rem != 0) { frame += 16 - rem; }
 
     current_ret_label = label_count;
-    label_count = label_count + 1;
+    label_count += 1;
 
 
     emit(f.name); emit(":\n");
@@ -2660,12 +3097,25 @@ void gen_function(int f) {
             emit("    mov rax, [rbp + "); print_int(16 + (nparams - 1 - i) * 8); emit("]\n");
             emit("    mov [rbp - "); print_int((i + 1) * 8); emit("], rax\n");
         }
-        i = i + 1;
+        i += 1;
     }
 
+    n_defers = 0;
     gen_block(f.body);
 
     emit(".Lret"); print_int(current_ret_label); emit(":\n");
+    // Deferred statements run here, before the frame is torn down, in reverse
+    // order. rax and rdx are saved so a cleanup call cannot clobber the return
+    // value(s). Nothing is emitted when a function has no defers.
+    if (n_defers > 0) {
+        emit("    push rax\n");
+        emit("    push rdx\n");
+        for (i = n_defers - 1; i >= 0; i -= 1) {
+            gen_stmt(load64(defers + i * 8));
+        }
+        emit("    pop rdx\n");
+        emit("    pop rax\n");
+    }
     emit("    mov rsp, rbp\n");
     emit("    pop rbp\n");
     emit("    ret\n");
@@ -2710,6 +3160,8 @@ int main() {
     string_ptrs = alloc(4096 * 8);
     string_lens = alloc(4096 * 8);
     loop_labels = alloc(64 * 8);
+    loop_is_for = alloc(64 * 8);
+    defers = alloc(64 * 8);
     scope_marks = alloc(64 * 8);
     field_names = alloc(4096 * 8);
     field_offsets = alloc(4096 * 8);
@@ -2735,24 +3187,24 @@ int main() {
         if (streq(a, "--elf") == 1) {
             elf_mode = 1;
         } else if (streq(a, "-I") == 1 && argi + 1 < argc() && n_inc_dirs < MAX_INC_DIRS) {
-            argi = argi + 1;
+            argi += 1;
             int d = argv(argi);
             int dl = strlen_(d);
             int ws = alloc(dl + 2);
             int j = 0;
-            while (j < dl) { store8(ws + j, load8(d + j)); j = j + 1; }
+            for (j = 0; j < dl; j += 1) { store8(ws + j, load8(d + j)); }
             store8(ws + dl, 0);
             if (dl == 0 || load8(d + dl - 1) != '/') { store8(ws + dl, '/'); store8(ws + dl + 1, 0); }
             store64(inc_dirs + n_inc_dirs * 8, ws);
-            n_inc_dirs = n_inc_dirs + 1;
-        } else if (npos == 0) {
+            n_inc_dirs += 1;
+        } else if (!npos) {
             cli_input = argi; npos = 1;
         } else if (npos == 1) {
             cli_output = argi; npos = 2;
         } else {
             usage = 1;
         }
-        argi = argi + 1;
+        argi += 1;
     }
     if (npos == 1) { usage = 1; }
     if (usage == 1) {
@@ -2774,6 +3226,7 @@ int main() {
         expand_buf = alloc(EXPAND_CAP);
         expand_len = 0;
         include_stack = alloc(INCLUDE_MAX_DEPTH * 8);
+        included = alloc(MAX_INCLUDED * 8);
         expand_file(argv(cli_input));
         buf = expand_buf;
         n = expand_len;
@@ -2797,50 +3250,48 @@ int main() {
             int plen = tok_len(tpos + 2);
             int pstr = alloc(plen + 1);
             int pi = 0;
-            while (pi < plen) { store8(pstr + pi, load8(tok_name(tpos + 2) + pi)); pi = pi + 1; }
+            for (pi = 0; pi < plen; pi += 1) { store8(pstr + pi, load8(tok_name(tpos + 2) + pi)); }
             store8(pstr + plen, 0);
             em.epath = pstr;
             em.efile = (toks + (tpos + 1) * sizeof(Token)).tfile;
             em.eline = (toks + (tpos + 1) * sizeof(Token)).tline;
-            tpos = tpos + 3;
+            tpos += 3;
             expect(19, "';'");
             // The whole path the assembler will be given, the source file's
             // own directory included, since it goes between quotes in .incbin.
             em.eresolved = join_path(dirname_with_slash(em.efile), pstr);
-            pi = 0;
-            while (load8(em.eresolved + pi) != 0) {
+            for (pi = 0; load8(em.eresolved + pi) != 0; pi += 1) {
                 int pc = load8(em.eresolved + pi);
                 if (pc == 34 || pc == 92 || pc == 10) { at_prev(); die("embed: the path may not contain quotes, backslashes or newlines"); }
-                pi = pi + 1;
             }
-            if (embhead == 0) { embhead = em; embtail = em; }
+            if (!embhead) { embhead = em; embtail = em; }
             else { embtail.enext = em; embtail = em; }
             continue;
         }
         if (tok_kind(tpos) == 34) {
-            tpos = tpos + 1;
+            tpos += 1;
             expect(21, "'int' after 'extern'");
             want(2, "a name");
             name = tok_name(tpos);
-            tpos = tpos + 1;
+            tpos += 1;
             expect(19, "';'");
             e = alloc(sizeof(Global));  // externs are Global-shaped, name + (unused) init + next
             e.name = name;
             e.init = 0;
             e.gfile = (toks + (tpos - 2) * sizeof(Token)).tfile;
             e.gline = (toks + (tpos - 2) * sizeof(Token)).tline;
-            if (ehead == 0) { ehead = e; etail = e; }
+            if (!ehead) { ehead = e; etail = e; }
             else { etail.next = e; etail = e; }
             continue;
         }
         if (tok_kind(tpos) == 36) {
-            tpos = tpos + 1;
+            tpos += 1;
             want(2, "a layout name");
             l = alloc(sizeof(Layout));
             l.name = tok_name(tpos);
             l.lfile = (toks + tpos * sizeof(Token)).tfile;
             l.lline = (toks + tpos * sizeof(Token)).tline;
-            tpos = tpos + 1;
+            tpos += 1;
             expect(17, "'{'");
             fld_head = 0;
             fld_tail = 0;
@@ -2851,26 +3302,35 @@ int main() {
                 fld.name = tok_name(tpos);
                 fld.lffile = (toks + tpos * sizeof(Token)).tfile;
                 fld.lfline = (toks + tpos * sizeof(Token)).tline;
-                tpos = tpos + 1;
+                tpos += 1;
                 expect(19, "';'");
-                if (fld_head == 0) { fld_head = fld; fld_tail = fld; }
+                if (!fld_head) { fld_head = fld; fld_tail = fld; }
                 else { fld_tail.next = fld; fld_tail = fld; }
             }
             expect(18, "'}'");
             l.fields = fld_head;
-            if (lhead == 0) { lhead = l; ltail = l; }
+            if (!lhead) { lhead = l; ltail = l; }
             else { ltail.next = l; ltail = l; }
             continue;
         }
         int gtype = 0;
-        if (tok_kind(tpos) == 33) { is_void = 1; tpos = tpos + 1; }
-        else if (at_typed_decl() == 1) { gtype = tok_name(tpos); tpos = tpos + 1; }
+        int two_ret = 0;
+        if (tok_kind(tpos) == 15) {
+            tpos += 1;
+            expect(21, "'int'");
+            expect(20, "',' (a two-value return is '(int, int)')");
+            expect(21, "'int'");
+            expect(16, "')'");
+            two_ret = 1;
+        }
+        else if (tok_kind(tpos) == 33) { is_void = 1; tpos += 1; }
+        else if (at_typed_decl() == 1) { gtype = tok_name(tpos); tpos += 1; }
         else { expect(21, "'int' or 'void'"); }
         want(2, "a name");
         name = tok_name(tpos);
         decl_file = (toks + tpos * sizeof(Token)).tfile;
         decl_line = (toks + tpos * sizeof(Token)).tline;
-        tpos = tpos + 1;
+        tpos += 1;
         if (gtype != 0 && tok_kind(tpos) == 15) { at_prev(); die("a function returns int or void, not a layout"); }
         if (tok_kind(tpos) == 15) {
             f = alloc(sizeof(Function));
@@ -2879,14 +3339,15 @@ int main() {
             f.ffile = decl_file;
             f.fline = decl_line;
             f.is_void = is_void;
-            tpos = tpos + 1;
+            f.two_ret = two_ret;
+            tpos += 1;
             np = 0;
             extra_head = 0;
             extra_tail = 0;
             if (tok_kind(tpos) != 16) {
                 while (1) {
                     int ptype = 0;
-                    if (at_typed_decl() == 1) { ptype = tok_name(tpos); tpos = tpos + 1; }
+                    if (at_typed_decl() == 1) { ptype = tok_name(tpos); tpos += 1; }
                     else { expect(21, "'int' or a layout name"); }
                     if (np >= 16) { at_prev(); die3("too many parameters for '", f.name, "' (max 16)"); }
                     want(2, "a parameter name");
@@ -2896,12 +3357,12 @@ int main() {
                     } else {
                         pnode = alloc(sizeof(ExtraParam));
                         pnode.name = tok_name(tpos);
-                        if (extra_head == 0) { extra_head = pnode; extra_tail = pnode; }
+                        if (!extra_head) { extra_head = pnode; extra_tail = pnode; }
                         else { extra_tail.next = pnode; extra_tail = pnode; }
                     }
-                    np = np + 1;
-                    tpos = tpos + 1;
-                    if (tok_kind(tpos) == 20) { tpos = tpos + 1; }
+                    np += 1;
+                    tpos += 1;
+                    if (tok_kind(tpos) == 20) { tpos += 1; }
                     else { break; }
                 }
             }
@@ -2909,9 +3370,10 @@ int main() {
             f.nparams = np;
             f.extra_params = extra_head;
             f.body = p_block();
-            if (fhead == 0) { fhead = f; ftail = f; }
+            if (!fhead) { fhead = f; ftail = f; }
             else { ftail.fnext = f; ftail = f; }
         } else {
+            if (two_ret == 1) { at_prev(); die("'(int, int)' must be followed by a function"); }
             if (is_void == 1) { at_prev(); die("'void' is not a valid type for a global"); }
             g = alloc(sizeof(Global));
             g.name = name;
@@ -2919,11 +3381,11 @@ int main() {
             g.gline = decl_line;
             g.gtype = gtype;
             if (tok_kind(tpos) == 8) {
-                tpos = tpos + 1;
+                tpos += 1;
                 g.init = const_fold(p_expr());
             }
             expect(19, "';'");
-            if (ghead == 0) { ghead = g; gtail = g; }
+            if (!ghead) { ghead = g; gtail = g; }
             else { gtail.next = g; gtail = g; }
         }
     }
@@ -2953,7 +3415,7 @@ int main() {
         f = f.fnext;
     }
     err_line = 0;
-    if (found_main == 0) { die("no 'main' function defined"); }
+    if (!found_main) { die("no 'main' function defined"); }
 
     g = ghead;
     while (g != 0) {
@@ -3008,11 +3470,11 @@ int main() {
         ex.name = emb.name;
         ex.gfile = emb.efile;
         ex.gline = emb.eline;
-        if (ehead == 0) { ehead = ex; etail = ex; } else { etail.next = ex; etail = ex; }
+        if (!ehead) { ehead = ex; etail = ex; } else { etail.next = ex; etail = ex; }
         int nl = strlen_(emb.name);
         int sz = alloc(nl + 6);
         int si = 0;
-        while (si < nl) { store8(sz + si, load8(emb.name + si)); si = si + 1; }
+        for (si = 0; si < nl; si += 1) { store8(sz + si, load8(emb.name + si)); }
         store8(sz + nl, '_'); store8(sz + nl + 1, 's'); store8(sz + nl + 2, 'i');
         store8(sz + nl + 3, 'z'); store8(sz + nl + 4, 'e'); store8(sz + nl + 5, 0);
         if (glob_exists(sz) == 1 || func_exists(sz) == 1 || extern_exists(sz) == 1) {
@@ -3022,10 +3484,10 @@ int main() {
         sg.name = sz;
         sg.gfile = emb.efile;
         sg.gline = emb.eline;
-        emb_n = emb_n + 1;
+        emb_n += 1;
         sg.gembed = emb_n;
         sg.init = emb.name;   // what the size is measured from, for codegen
-        if (ghead == 0) { ghead = sg; gtail = sg; } else { gtail.next = sg; gtail = sg; }
+        if (!ghead) { ghead = sg; gtail = sg; } else { gtail.next = sg; gtail = sg; }
         emb = emb.enext;
     }
 
@@ -3049,15 +3511,15 @@ int main() {
         stack_size = 0;
         scope_depth = 0;
         current_fn_is_void = f.is_void;
+        current_fn_two_ret = f.two_ret;
         err_file = f.ffile;
         err_line = f.fline;
         np = f.nparams;
         i = 0;
-        while (i < np) {
+        for (i = 0; i < np; i += 1) {
             check_type(load64(f.ptypes + i * 8));
             sym_declare(param_name_at(f, i));
             store64(sym_types + (sym_count - 1) * 8, load64(f.ptypes + i * 8));
-            i = i + 1;
         }
         resolve(f.body);
         f.stack_size = stack_size;
@@ -3088,18 +3550,15 @@ int main() {
     if (string_count > 0) {
         emit("\n.section .rodata\n");
         i = 0;
-        while (i < string_count) {
+        for (i = 0; i < string_count; i += 1) {
             emit(".Lstr"); print_int(i); emit(":\n");
             emit("    .byte");
             p = load64(string_ptrs + i * 8);
             len = load64(string_lens + i * 8);
-            j = 0;
-            while (j < len) {
+            for (j = 0; j < len; j += 1) {
                 emit(" "); print_int(p[j]); emit(",");
-                j = j + 1;
             }
             emit(" 0\n");
-            i = i + 1;
         }
     }
 
@@ -3108,10 +3567,10 @@ int main() {
     int ei = 0;
     int eb = embhead;
     while (eb != 0) {
-        if (ei == 0) { emit("\n.section .rodata\n"); }
+        if (!ei) { emit("\n.section .rodata\n"); }
         emit(".balign 8\n"); emit(eb.name); emit(":\n    .incbin \"");
         emit(eb.eresolved); emit("\"\n.Lembend"); print_int(ei); emit(":\n");
-        ei = ei + 1;
+        ei += 1;
         eb = eb.enext;
     }
 

@@ -1,0 +1,70 @@
+// expect: 42
+//
+// tests/119_defer.c0 - defer runs its statements at every exit, in reverse order
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// `defer <stmt>;` runs the statement at every exit of the function, in
+// reverse order. A defer is static, so it runs even when it sat under a false
+// `if`. The return value survives a deferred call that overwrites rax/rdx.
+int trace = 0;
+
+void mark(int d) {
+    trace = trace * 10 + d;
+}
+
+int clobber() {
+    return 99;
+}
+
+int order() {
+    mark(1);
+    defer mark(3);
+    defer mark(2);
+    return 7;
+}
+
+int early(int x) {
+    defer mark(5);
+    if (x > 0) { return 1; }
+    mark(4);
+    return 2;
+}
+
+int static_defer() {
+    if (0) { defer mark(6); }
+    return 0;
+}
+
+(int, int) pair() {
+    defer clobber();
+    return 3, 4;
+}
+
+int locals() {
+    int n = 10;
+    defer mark(n);
+    n = 8;
+    return n;
+}
+
+int main() {
+    int r = order();
+    if (trace != 123 || r != 7) { return 1; }
+    trace = 0;
+    r = early(1);
+    if (trace != 5 || r != 1) { return 2; }
+    trace = 0;
+    r = early(0);
+    if (trace != 45 || r != 2) { return 3; }
+    trace = 0;
+    static_defer();
+    if (trace != 6) { return 4; }
+    int a = 0;
+    int b = 0;
+    a, b = pair();
+    if (a != 3 || b != 4) { return 5; }
+    trace = 0;
+    r = locals();
+    if (trace != 8 || r != 8) { return 6; }
+    return 42;
+}

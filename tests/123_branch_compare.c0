@@ -1,0 +1,105 @@
+// expect: 42
+//
+// tests/123_branch_compare.c0 - comparisons in conditions branch on the flags directly
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// An if/while/for whose condition is a comparison branches on the flags
+// with the inverse jump, and a leaf right operand (number or variable) is
+// loaded straight into rcx. Every comparison is checked below, above and at
+// its boundary, against a local, a global, a number and a computed operand.
+// add, sub and cmp take a number that fits in 32 bits as an immediate, and
+// a larger one still goes through rcx.
+int g = 5;
+
+int at(int a, int b) {
+    int r = 0;
+    if (a == b) { r += 1; }
+    if (a != b) { r += 2; }
+    if (a < b) { r += 4; }
+    if (a <= b) { r += 8; }
+    if (a > b) { r += 16; }
+    if (a >= b) { r += 32; }
+    return r;
+}
+
+int at_global(int a) {
+    int r = 0;
+    if (a == g) { r += 1; }
+    if (a != g) { r += 2; }
+    if (a < g) { r += 4; }
+    if (a <= g) { r += 8; }
+    if (a > g) { r += 16; }
+    if (a >= g) { r += 32; }
+    return r;
+}
+
+int at_five(int a) {
+    int r = 0;
+    if (a == 5) { r += 1; }
+    if (a != 5) { r += 2; }
+    if (a < 5) { r += 4; }
+    if (a <= 5) { r += 8; }
+    if (a > 5) { r += 16; }
+    if (a >= 5) { r += 32; }
+    return r;
+}
+
+int at_computed(int a) {
+    int r = 0;
+    if (a == g + 0) { r += 1; }
+    if (a != g + 0) { r += 2; }
+    if (a < g + 0) { r += 4; }
+    if (a <= g + 0) { r += 8; }
+    if (a > g + 0) { r += 16; }
+    if (a >= g + 0) { r += 32; }
+    return r;
+}
+
+int check(int a) {
+    // below: != < <=, equal: == <= >=, above: != > >=
+    int want = 0;
+    if (a < 5) { want = 2 + 4 + 8; }
+    if (a == 5) { want = 1 + 8 + 32; }
+    if (a > 5) { want = 2 + 16 + 32; }
+    if (at(a, 5) != want) { return 1; }
+    if (at_global(a) != want) { return 1; }
+    if (at_five(a) != want) { return 1; }
+    if (at_computed(a) != want) { return 1; }
+    return 0;
+}
+
+int main() {
+    if (check(4) + check(5) + check(6) != 0) { return 1; }
+    // Loop conditions, counted at their boundaries.
+    int n = 0;
+    int i = 0;
+    while (i <= 5) { n += 1; i += 1; }
+    if (n != 6) { return 2; }
+    n = 0;
+    for (i = 10; i >= 5; i -= 1) { n += 1; }
+    if (n != 6) { return 3; }
+    n = 0;
+    for (i = 0; i < g; i += 1) { n += 1; }
+    if (n != 5) { return 4; }
+    n = 0;
+    for (i = 10; i > g; i -= 1) { n += 1; }
+    if (n != 5) { return 5; }
+    // Non-commutative operators with a leaf right operand.
+    if (20 - g != 15) { return 6; }
+    if (g - 20 != 0 - 15) { return 7; }
+    if (17 / g != 3 || 17 % g != 2) { return 8; }
+    if ((1 << g) != 32 || (64 >> g) != 2) { return 9; }
+    // Comparisons used as values, with an immediate right operand.
+    int v = (g < 6) + (g <= 5) * 2 + (g > 4) * 4 + (g >= 6) * 8 + (g == 5) * 16 + (g != 5) * 32;
+    if (v != 23) { return 10; }
+    // Either side of the 32-bit immediate range.
+    int big = 2147483647;
+    if (big + 1 != 2147483648) { return 11; }
+    if (g + 2147483647 != 2147483652) { return 12; }
+    if (g + 4294967296 != 4294967301) { return 13; }
+    if (g - 4294967296 >= 0) { return 14; }
+    if (big < 2147483647 || big > 2147483647) { return 15; }
+    if (4294967296 < 4294967295) { return 16; }
+    if (big + 1 <= 2147483647) { return 17; }
+    return 42;
+}

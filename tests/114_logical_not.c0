@@ -1,0 +1,24 @@
+// expect: 10
+//
+// tests/114_logical_not.c0 - ! is logical not and binds tighter than the binary operators
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// ! is logical not, sugar for (E == 0), binding tighter than the binary
+// operators. Each check that holds adds one.
+int main() {
+    int ok = 0;
+    if (!0 == 1) { ok = ok + 1; }
+    if (!5 == 0) { ok = ok + 1; }
+    if (!1 == 0) { ok = ok + 1; }
+    if (!!7 == 1) { ok = ok + 1; }
+    int x = 0;
+    if (!x) { ok = ok + 1; }
+    int y = 9;
+    if (!(!y)) { ok = ok + 1; }
+    if (!(3 == 4)) { ok = ok + 1; }
+    if (!0 && !0) { ok = ok + 1; }
+    if (!(1 == 2) == 1) { ok = ok + 1; }
+    int z = 0;
+    if (!z == !0) { ok = ok + 1; }
+    return ok;
+}

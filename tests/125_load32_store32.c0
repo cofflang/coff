@@ -1,0 +1,29 @@
+// expect: 0
+//
+// tests/125_load32_store32.c0 - the 32-bit memory builtins load32 and store32
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int buf = alloc(32);
+    store64(buf, -1);
+    store64(buf + 8, -1);
+    // Only the four bytes at buf + 2 change, the bytes around them stay 0xFF.
+    store32(buf + 2, 0x12345678);
+    if (load8(buf + 1) != 255) { return 1; }
+    if (load8(buf + 2) != 0x78) { return 2; }
+    if (load8(buf + 5) != 0x12) { return 3; }
+    if (load8(buf + 6) != 255) { return 4; }
+    // A load is zero-extended, even with the top bit of the 32 set.
+    if (load32(buf + 4) != 0xFFFF1234) { return 5; }
+    if (load32(buf + 2) != 0x12345678) { return 6; }
+    // Only the low 4 bytes of the value are stored, and the store gives back
+    // the whole value.
+    int v = store32(buf + 8, 0x7700000000AABBCC);
+    if (v != 0x7700000000AABBCC) { return 7; }
+    if (load32(buf + 8) != 0xAABBCC) { return 8; }
+    if (load32(buf + 12) != 0xFFFFFFFF) { return 9; }
+    // An address computed from a local and stored through a leaf value.
+    int i = 3;
+    store32(buf + 16 + i * 4, i);
+    if (load32(buf + 28) != 3) { return 10; }
+    return 0;
+}

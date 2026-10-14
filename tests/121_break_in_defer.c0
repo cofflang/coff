@@ -1,0 +1,14 @@
+// expect: compile-error
+//
+// tests/121_break_in_defer.c0 - a break inside a deferred statement is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// A deferred statement runs in the epilogue, outside every loop, so `break`
+// inside it has no loop to leave even when the defer is written in one.
+int main() {
+    while (1) {
+        defer break;
+        break;
+    }
+    return 0;
+}

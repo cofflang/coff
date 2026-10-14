@@ -1,0 +1,1 @@
+coff0: tests/120_return_in_defer.c0:9: 'return' inside a defer

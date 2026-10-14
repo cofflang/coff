@@ -190,13 +190,13 @@ void print_int(int v) {
     int buf = alloc(24);
     int i = 23;
     int n = v;
-    if (n == 0) { print("0"); return; }
+    if (!n) { print("0"); return; }
     if (n < 0) { print("-"); n = 0 - n; }
     buf[i] = 0;
     while (n > 0) {
-        i = i - 1;
+        i -= 1;
         buf[i] = 48 + (n % 10);
-        n = n / 10;
+        n /= 10;
     }
     print(buf + i);
     return;
@@ -205,7 +205,7 @@ void print_int(int v) {
 void print_slice(int p, int n) {
     int buf = alloc(n + 1);
     int i = 0;
-    while (i < n) { buf[i] = p[i]; i = i + 1; }
+    for (i = 0; i < n; i += 1) { buf[i] = p[i]; }
     buf[n] = 0;
     print(buf);
     return;
@@ -244,7 +244,7 @@ void serr_at(int msg) {
 // 000000f8 instead of fffffff8.
 int u32(int v) {
     int u = v;
-    if (u < 0) { u = u + 4294967296; }
+    if (u < 0) { u += 4294967296; }
     return u;
 }
 
@@ -259,7 +259,7 @@ void emit1(int b) {
     int u = b;
     int p = 0;
     need_section();
-    if (u < 0) { u = u + 256; }
+    if (u < 0) { u += 256; }
     p = load64(sect_pos + cur * 8);
     if (pass == 2) { store8(load64(sect_buf + cur * 8) + p, u % 256); }
     store64(sect_pos + cur * 8, p + 1);
@@ -291,20 +291,21 @@ void emit4(int v) {
 // rather than by subtracting first, because the subtraction overflows for
 // the most negative values, and boot.s's trigger_doublefault loads exactly
 // 0x8000000000000000.
-int split_hi = 0;
-int split_lo = 0;
-
-void split64(int v) {
-    split_hi = v / 4294967296;
-    split_lo = v - split_hi * 4294967296;
-    if (split_lo < 0) { split_lo = split_lo + 4294967296; split_hi = split_hi - 1; }
-    return;
+// Splits a 64-bit value into its low and high 32-bit halves, returned as
+// (lo, hi).
+(int, int) split64(int v) {
+    int hi = v / 4294967296;
+    int lo = v - hi * 4294967296;
+    if (lo < 0) { lo += 4294967296; hi -= 1; }
+    return lo, hi;
 }
 
 void emit8(int v) {
-    split64(v);
-    emit4(split_lo);
-    emit4(split_hi);
+    int lo = 0;
+    int hi = 0;
+    lo, hi = split64(v);
+    emit4(lo);
+    emit4(hi);
     return;
 }
 
@@ -328,7 +329,7 @@ void align_to(int n) {
     if (n > load64(sect_align + cur * 8)) { store64(sect_align + cur * 8, n); }
     p = load64(sect_pos + cur * 8);
     pad = (p / n) * n;
-    if (pad != p) { pad = pad + n - p; } else { pad = 0; }
+    if (pad != p) { pad += n - p; } else { pad = 0; }
     skip_bytes(pad);
     return;
 }
@@ -362,7 +363,7 @@ int is_name_char(int c) {
 }
 
 void skip_space() {
-    while (cp < srclen && is_space(src[cp]) == 1) { cp = cp + 1; }
+    while (cp < srclen && is_space(src[cp]) == 1) { cp += 1; }
     return;
 }
 
@@ -380,10 +381,9 @@ int peek() {
 // Compares a slice against a NUL-terminated literal.
 int slice_is(int p, int n, int lit) {
     int i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 1) {
         if (lit[i] == 0) { return 0; }
         if (p[i] != lit[i]) { return 0; }
-        i = i + 1;
     }
     if (lit[n] != 0) { return 0; }
     return 1;
@@ -394,7 +394,7 @@ int slices_eq(int p, int n, int q, int m) {
     if (n != m) { return 0; }
     while (i < n) {
         if (p[i] != q[i]) { return 0; }
-        i = i + 1;
+        i += 1;
     }
     return 1;
 }
@@ -406,7 +406,7 @@ int word_len = 0;
 void read_word() {
     skip_space();
     word_start = cp;
-    while (cp < srclen && is_name_char(src[cp]) == 1) { cp = cp + 1; }
+    while (cp < srclen && is_name_char(src[cp]) == 1) { cp += 1; }
     word_len = cp - word_start;
     return;
 }
@@ -421,19 +421,19 @@ void strip_comments(int buf, int n) {
     int i = 0;
     while (i < n) {
         if (buf[i] == 35) {   // '#'
-            while (i < n && buf[i] != 10) { buf[i] = 32; i = i + 1; }
+            while (i < n && buf[i] != 10) { buf[i] = 32; i += 1; }
         } else if (buf[i] == 47 && i + 1 < n && buf[i + 1] == 42) {   // "/*"
-            buf[i] = 32; buf[i + 1] = 32; i = i + 2;
+            buf[i] = 32; buf[i + 1] = 32; i += 2;
             while (i < n) {
                 if (buf[i] == 42 && i + 1 < n && buf[i + 1] == 47) {
-                    buf[i] = 32; buf[i + 1] = 32; i = i + 2;
+                    buf[i] = 32; buf[i + 1] = 32; i += 2;
                     break;
                 }
                 if (buf[i] != 10) { buf[i] = 32; }
-                i = i + 1;
+                i += 1;
             }
         } else {
-            i = i + 1;
+            i += 1;
         }
     }
     return;
@@ -443,11 +443,10 @@ void strip_comments(int buf, int n) {
 
 int sym_find(int p, int n) {
     int i = 0;
-    while (i < sym_count) {
+    for (i = 0; i < sym_count; i += 1) {
         if (slices_eq(load64(sym_ptr + i * 8), load64(sym_len + i * 8), p, n) == 1) {
             return i;
         }
-        i = i + 1;
     }
     return 0 - 1;
 }
@@ -464,7 +463,7 @@ void sym_add(int p, int n, int sect, int off) {
     store64(sym_len + sym_count * 8, n);
     store64(sym_sect + sym_count * 8, sect);
     store64(sym_off + sym_count * 8, off);
-    sym_count = sym_count + 1;
+    sym_count += 1;
     return;
 }
 
@@ -524,7 +523,7 @@ int read_num() {
     int c = 0;
     int any = 0;
     if (cp + 1 < srclen && src[cp] == 48 && (src[cp + 1] == 120 || src[cp + 1] == 88)) {
-        cp = cp + 2;
+        cp += 2;
         while (cp < srclen) {
             c = src[cp];
             if (is_digit(c) == 1) { v = v * 16 + (c - 48); }
@@ -532,26 +531,26 @@ int read_num() {
             else if (c >= 65 && c <= 70) { v = v * 16 + (c - 65 + 10); }
             else { break; }
             any = 1;
-            cp = cp + 1;
+            cp += 1;
         }
     } else if (cp + 1 < srclen && src[cp] == 48 && (src[cp + 1] == 98 || src[cp + 1] == 66)) {
-        cp = cp + 2;
+        cp += 2;
         while (cp < srclen && (src[cp] == 48 || src[cp] == 49)) {
             v = v * 2 + (src[cp] - 48);
             any = 1;
-            cp = cp + 1;
+            cp += 1;
         }
     } else {
         while (cp < srclen && is_digit(src[cp]) == 1) {
             v = v * 10 + (src[cp] - 48);
             any = 1;
-            cp = cp + 1;
+            cp += 1;
         }
     }
-    if (any == 0) { serr_at("expected a number"); }
+    if (!any) { serr_at("expected a number"); }
     // Linker-script suffixes.
-    if (cp < srclen && (src[cp] == 75 || src[cp] == 107)) { v = v * 1024; cp = cp + 1; }
-    else if (cp < srclen && (src[cp] == 77 || src[cp] == 109)) { v = v * 1048576; cp = cp + 1; }
+    if (cp < srclen && (src[cp] == 75 || src[cp] == 107)) { v *= 1024; cp += 1; }
+    else if (cp < srclen && (src[cp] == 77 || src[cp] == 109)) { v *= 1048576; cp += 1; }
     return v;
 }
 
@@ -560,25 +559,25 @@ int read_unary() {
     int c = 0;
     skip_space();
     c = peek();
-    if (c == 45) { cp = cp + 1; return 0 - read_unary(); }
-    if (c == 43) { cp = cp + 1; return read_unary(); }
+    if (c == 45) { cp += 1; return 0 - read_unary(); }
+    if (c == 43) { cp += 1; return read_unary(); }
     if (c == 40) {
-        cp = cp + 1;
+        cp += 1;
         v = read_expr();
         skip_space();
         if (peek() != 41) { serr_at("expected )"); }
-        cp = cp + 1;
+        cp += 1;
         return v;
     }
     if (is_digit(c) == 1) { return read_num(); }
     if (c == 46 && cp + 1 < srclen && is_name_char(src[cp + 1]) == 0) {
         // A bare `.` is the location counter.
-        cp = cp + 1;
+        cp += 1;
         expr_used_sym = 1;
         return here();
     }
     read_word();
-    if (word_len == 0) { serr_at("expected a value"); }
+    if (!word_len) { serr_at("expected a value"); }
     return sym_ref(src + word_start, word_len);
 }
 
@@ -589,19 +588,17 @@ int read_mul() {
     skip_space();
     while (cp < srclen) {
         if (src[cp] == 42) {
-            cp = cp + 1; v = v * read_unary();
+            cp += 1; v *= read_unary();
         } else if (src[cp] == 47) {
-            cp = cp + 1; r = read_unary();
-            if (r == 0) { serr_at("division by zero"); }
-            v = v / r;
+            cp += 1; r = read_unary();
+            if (!r) { serr_at("division by zero"); }
+            v /= r;
         } else if (src[cp] == 60 && cp + 1 < srclen && src[cp + 1] == 60) {
-            cp = cp + 2; r = read_unary();
-            i = 0;
-            while (i < r) { v = v * 2; i = i + 1; }
+            cp += 2; r = read_unary();
+            for (i = 0; i < r; i += 1) { v *= 2; }
         } else if (src[cp] == 62 && cp + 1 < srclen && src[cp + 1] == 62) {
-            cp = cp + 2; r = read_unary();
-            i = 0;
-            while (i < r) { v = v / 2; i = i + 1; }
+            cp += 2; r = read_unary();
+            for (i = 0; i < r; i += 1) { v /= 2; }
         } else {
             break;
         }
@@ -614,8 +611,8 @@ int read_expr() {
     int v = read_mul();
     skip_space();
     while (cp < srclen) {
-        if (src[cp] == 43) { cp = cp + 1; v = v + read_mul(); }
-        else if (src[cp] == 45) { cp = cp + 1; v = v - read_mul(); }
+        if (src[cp] == 43) { cp += 1; v += read_mul(); }
+        else if (src[cp] == 45) { cp += 1; v -= read_mul(); }
         else { break; }
         skip_space();
     }
@@ -693,10 +690,10 @@ int reg_num(int p, int n) {
 void rex(int w, int r, int x, int b) {
     int v = 64;
     if (bits != 64) { serr_at("a REX prefix has no meaning in 32-bit code"); }
-    if (w == 1) { v = v + 8; }
-    if (r >= 8) { v = v + 4; }
-    if (x >= 8) { v = v + 2; }
-    if (b >= 8) { v = v + 1; }
+    if (w == 1) { v += 8; }
+    if (r >= 8) { v += 4; }
+    if (x >= 8) { v += 2; }
+    if (b >= 8) { v += 1; }
     emit1(v);
     return;
 }
@@ -764,7 +761,7 @@ void rm_operand(int reg_field, int s) {
     base = og(s, F_BASE);
     index = og(s, F_INDEX);
     d = og(s, F_DISP);
-    if (og(s, F_SYM) != 0) { d = d + sym_ref(og(s, F_SYM), og(s, F_SYMLEN)); }
+    if (og(s, F_SYM) != 0) { d += sym_ref(og(s, F_SYM), og(s, F_SYMLEN)); }
     if (base < 0) {
         if (index >= 0) { serr_at("an index register needs a base register"); }
         if (bits == 64) {
@@ -895,14 +892,12 @@ void enc_mov_reg_imm(int width, int r, int v, int hassym) {
 int op_width(int nops) {
     int w = 0;
     int s = 0;
-    while (s < nops) {
+    for (s = 0; s < nops; s += 1) {
         if (og(s, F_KIND) == 0 && og(s, F_CLASS) == 0) { return og(s, F_WIDTH); }
-        s = s + 1;
     }
     s = 0;
-    while (s < nops) {
+    for (s = 0; s < nops; s += 1) {
         if (og(s, F_WIDTH) != 0) { w = og(s, F_WIDTH); }
-        s = s + 1;
     }
     return w;
 }
@@ -913,8 +908,7 @@ void parse_operand(int s) {
     int r = 0;
     int w = 0;
     int f = 0;
-    f = 0;
-    while (f < NF) { os(s, f, 0); f = f + 1; }
+    for (f = 0; f < NF; f += 1) { os(s, f, 0); }
     os(s, F_BASE, 0 - 1);
     os(s, F_INDEX, 0 - 1);
     os(s, F_SCALE, 1);
@@ -940,7 +934,7 @@ void parse_operand(int s) {
     c = peek();
 
     if (c == 91) {   // '[' memory operand
-        cp = cp + 1;
+        cp += 1;
         sign = 1;
         while (1 == 1) {
             skip_space();
@@ -951,7 +945,7 @@ void parse_operand(int s) {
                 if (expr_used_sym == 1) { os(s, F_HASSYM, 1); }
             } else {
                 read_word();
-                if (word_len == 0) { serr_at("expected a register, number or symbol inside [ ]"); }
+                if (!word_len) { serr_at("expected a register, number or symbol inside [ ]"); }
                 r = reg_num(src + word_start, word_len);
                 if (r >= 0) {
                     if (reg_class != 0) { serr_at("only general registers can address memory"); }
@@ -959,7 +953,7 @@ void parse_operand(int s) {
                     if (sign < 0) { serr_at("cannot subtract a register"); }
                     skip_space();
                     if (peek() == 42) {   // '*'
-                        cp = cp + 1;
+                        cp += 1;
                         if (og(s, F_INDEX) >= 0) { serr_at("two index registers"); }
                         os(s, F_INDEX, r);
                         // A plain number, not an expression, since `rcx*8 + 8`
@@ -984,12 +978,12 @@ void parse_operand(int s) {
             }
             skip_space();
             c = peek();
-            if (c == 43) { sign = 1; cp = cp + 1; }
-            else if (c == 45) { sign = 0 - 1; cp = cp + 1; }
+            if (c == 43) { sign = 1; cp += 1; }
+            else if (c == 45) { sign = 0 - 1; cp += 1; }
             else { break; }
         }
         if (peek() != 93) { serr_at("expected ]"); }
-        cp = cp + 1;
+        cp += 1;
         os(s, F_KIND, 2);
         return;
     }
@@ -1025,9 +1019,9 @@ int parse_operands() {
     n = 1;
     skip_space();
     while (n < 3 && peek() == 44) {   // ','
-        cp = cp + 1;
+        cp += 1;
         parse_operand(n);
-        n = n + 1;
+        n += 1;
         skip_space();
     }
     return n;
@@ -1059,7 +1053,7 @@ void enc_alu(int nops, int op, int op8, int ext) {
         return;
     }
     if (is_imm(1) == 1) {
-        if (w == 0) { serr_at("memory operand needs a size (byte/word/dword/qword ptr)"); }
+        if (!w) { serr_at("memory operand needs a size (byte/word/dword/qword ptr)"); }
         if (is_reg(0) == 1 && is_gp(0) == 0) { serr_at("only general registers here"); }
         if (w == 8) {
             trailing = 1;
@@ -1087,7 +1081,7 @@ void enc_unary(int nops, int op, int ext) {
     int w = 0;
     if (nops != 1) { serr_at("this instruction wants one operand"); }
     w = op_width(1);
-    if (w == 0) { serr_at("operand needs a size"); }
+    if (!w) { serr_at("operand needs a size"); }
     if (is_reg(0) == 1 && is_gp(0) == 0) { serr_at("only general registers here"); }
     if (w == 8) { enc_rm(8, op - 1, 0 - 1, ext, 0); }
     else { enc_rm(w, op, 0 - 1, ext, 0); }
@@ -1101,7 +1095,7 @@ void enc_shift(int nops, int ext) {
         // x86 has, and what coff emits for c0's << and >>.
         w = og(0, F_WIDTH);
         if (is_reg(0) == 0) { w = op_width(1); }
-        if (w == 0) { serr_at("operand needs a size"); }
+        if (!w) { serr_at("operand needs a size"); }
         if (is_reg(0) == 1 && is_gp(0) == 0) { serr_at("only general registers here"); }
         if (w == 8) { enc_rm(8, 0xD2, 0 - 1, ext, 0); }
         else { enc_rm(w, 0xD3, 0 - 1, ext, 0); }
@@ -1109,7 +1103,7 @@ void enc_shift(int nops, int ext) {
     }
     if (nops != 2 || is_imm(1) == 0) { serr_at("shift wants r/m, imm or r/m, cl"); }
     w = op_width(2);
-    if (w == 0) { serr_at("operand needs a size"); }
+    if (!w) { serr_at("operand needs a size"); }
     // C1 /ext ib
     trailing = 1;
     if (w == 8) { enc_rm(8, 0xC0, 0 - 1, ext, 0); }
@@ -1177,7 +1171,7 @@ void enc_mov(int nops) {
     if (is_mem(0) == 1 && is_imm(1) == 1) {
         // mov r/m, imm  ->  C7 /0 id (C6 /0 ib for bytes, imm32 is
         // sign-extended for qword)
-        if (w == 0) { serr_at("mov mem, imm needs a size (byte/word/dword/qword ptr)"); }
+        if (!w) { serr_at("mov mem, imm needs a size (byte/word/dword/qword ptr)"); }
         if (w == 8) { trailing = 1; enc_rm(8, 0xC6, 0 - 1, 0, 0); emit_imm(8, og(1, F_IMM)); return; }
         if (w == 16) { trailing = 2; } else { trailing = 4; }
         enc_rm(w, 0xC7, 0 - 1, 0, 0);
@@ -1193,7 +1187,7 @@ void enc_branch(int op_reg_ext, int op_rel) {
     int r = 0;
     int target = 0;
     read_word();
-    if (word_len == 0) { serr_at("branch wants a target"); }
+    if (!word_len) { serr_at("branch wants a target"); }
     r = reg_num(src + word_start, word_len);
     if (r >= 0) {
         if (reg_width != bits || reg_class != 0) { serr_at("indirect branch wants a full-width general register"); }
@@ -1264,7 +1258,7 @@ void do_instruction() {
             sel = read_const();
             skip_space();
             if (peek() != 58) { serr_at("expected : in a far jump"); }
-            cp = cp + 1;
+            cp += 1;
             read_word();
             emit1(0xEA);
             emit4(sym_ref(src + word_start, word_len));
@@ -1408,7 +1402,7 @@ void do_instruction() {
             return;
         }
         if (is_imm(1) == 1) {
-            if (w == 0) { serr_at("operand needs a size"); }
+            if (!w) { serr_at("operand needs a size"); }
             if (w == 8) { trailing = 1; enc_rm(8, 0xF6, 0 - 1, 0, 0); emit_imm(8, og(1, F_IMM)); return; }
             if (w == 16) { trailing = 2; } else { trailing = 4; }
             enc_rm(w, 0xF7, 0 - 1, 0, 0);
@@ -1463,9 +1457,8 @@ void do_instruction() {
 
 int sect_find(int p, int n) {
     int i = 0;
-    while (i < sect_count) {
+    for (i = 0; i < sect_count; i += 1) {
         if (slices_eq(load64(sect_name + i * 8), load64(sect_namelen + i * 8), p, n) == 1) { return i; }
-        i = i + 1;
     }
     return 0 - 1;
 }
@@ -1486,14 +1479,14 @@ void enter_section(int p, int n) {
         store64(sect_base + i * 8, 0);
         store64(sect_align + i * 8, 1);
         store64(sect_data + i * 8, 0);
-        sect_count = sect_count + 1;
+        sect_count += 1;
     }
     cur = i;
     return;
 }
 
 void skip_to_eol() {
-    while (cp < srclen && src[cp] != 10) { cp = cp + 1; }
+    while (cp < srclen && src[cp] != 10) { cp += 1; }
     return;
 }
 
@@ -1513,7 +1506,7 @@ void do_directive() {
     if (word_is(".code64") == 1) { bits = 64; return; }
     if (word_is(".section") == 1) {
         read_word();
-        if (word_len == 0) { serr_at("section wants a name"); }
+        if (!word_len) { serr_at("section wants a name"); }
         enter_section(src + word_start, word_len);
         // Flags such as "a" or "ax" say nothing smed needs, since every
         // section lands in one RWX segment.
@@ -1528,32 +1521,32 @@ void do_directive() {
     if (word_is(".byte") == 1) {
         emit_imm(8, read_expr());
         skip_space();
-        while (peek() == 44) { cp = cp + 1; emit_imm(8, read_expr()); skip_space(); }
+        while (peek() == 44) { cp += 1; emit_imm(8, read_expr()); skip_space(); }
         return;
     }
     if (word_is(".word") == 1) {
         emit_imm(16, read_expr());
         skip_space();
-        while (peek() == 44) { cp = cp + 1; emit_imm(16, read_expr()); skip_space(); }
+        while (peek() == 44) { cp += 1; emit_imm(16, read_expr()); skip_space(); }
         return;
     }
     if (word_is(".long") == 1) {
         emit_imm(32, read_expr());
         skip_space();
-        while (peek() == 44) { cp = cp + 1; emit_imm(32, read_expr()); skip_space(); }
+        while (peek() == 44) { cp += 1; emit_imm(32, read_expr()); skip_space(); }
         return;
     }
     if (word_is(".quad") == 1) {
         emit8(read_expr());
         skip_space();
-        while (peek() == 44) { cp = cp + 1; emit8(read_expr()); skip_space(); }
+        while (peek() == 44) { cp += 1; emit8(read_expr()); skip_space(); }
         return;
     }
     if (word_is(".skip") == 1 || word_is(".space") == 1) {
         v = read_const();
         skip_space();
         if (peek() == 44) {
-            cp = cp + 1;
+            cp += 1;
             if (read_const() != 0) { serr_at("only zero fill is supported"); }
         }
         skip_bytes(v);
@@ -1573,22 +1566,21 @@ void do_directive() {
         // relative to where smed runs, as with GNU as.
         skip_space();
         if (peek() != 34) { serr_at(".incbin wants a \"path\""); }
-        cp = cp + 1;
+        cp += 1;
         int ps = cp;
-        while (cp < srclen && src[cp] != 34 && src[cp] != 10) { cp = cp + 1; }
+        while (cp < srclen && src[cp] != 34 && src[cp] != 10) { cp += 1; }
         if (cp >= srclen || src[cp] != 34) { serr_at("unterminated .incbin path"); }
         int path = alloc(cp - ps + 1);
         int k = 0;
-        while (k < cp - ps) { store8(path + k, load8(src + ps + k)); k = k + 1; }
+        for (k = 0; k < cp - ps; k += 1) { store8(path + k, load8(src + ps + k)); }
         store8(path + k, 0);
-        cp = cp + 1;
+        cp += 1;
         int fd = open_read(path);
         if (fd < 0) { serr_at(".incbin: cannot open the file"); }
         int chunk = alloc(65536);
         int got = read(fd, chunk, 65536);
         while (got > 0) {
-            k = 0;
-            while (k < got) { emit1(load8(chunk + k)); k = k + 1; }
+            for (k = 0; k < got; k += 1) { emit1(load8(chunk + k)); }
             got = read(fd, chunk, 65536);
         }
         close(fd);
@@ -1596,12 +1588,12 @@ void do_directive() {
     }
     if (word_is(".set") == 1) {
         read_word();
-        if (word_len == 0) { serr_at(".set wants a name"); }
+        if (!word_len) { serr_at(".set wants a name"); }
         p = src + word_start;
         n = word_len;
         skip_space();
         if (peek() != 44) { serr_at("expected , after the name"); }
-        cp = cp + 1;
+        cp += 1;
         v = read_expr();
         sym_set(p, n, v);
         return;
@@ -1623,15 +1615,15 @@ void run_source(int name, int buf, int n) {
     while (cp < srclen) {
         skip_space();
         if (at_eol() == 1) {
-            if (cp < srclen) { cp = cp + 1; lineno = lineno + 1; }
+            if (cp < srclen) { cp += 1; lineno += 1; }
             continue;
         }
         c = src[cp];
         read_word();
-        if (word_len == 0) { serr_at("unexpected character"); }
+        if (!word_len) { serr_at("unexpected character"); }
         skip_space();
         if (peek() == 58) {   // ':' -- a label, possibly with more on the line
-            cp = cp + 1;
+            cp += 1;
             label_here(src + word_start, word_len);
             continue;
         }
@@ -1645,7 +1637,7 @@ void run_source(int name, int buf, int n) {
         // plausible-looking wrong instruction.
         skip_space();
         if (at_eol() == 0) { serr_at("trailing text on line"); }
-        if (cp < srclen) { cp = cp + 1; lineno = lineno + 1; }
+        if (cp < srclen) { cp += 1; lineno += 1; }
     }
     return;
 }
@@ -1660,14 +1652,14 @@ void run_source(int name, int buf, int n) {
 void expect_char(int c, int msg) {
     skip_space_nl();
     if (peek() != c) { serr_at(msg); }
-    cp = cp + 1;
+    cp += 1;
     return;
 }
 
 void skip_space_nl() {
     while (cp < srclen) {
-        if (src[cp] == 10) { lineno = lineno + 1; cp = cp + 1; }
-        else if (is_space(src[cp]) == 1) { cp = cp + 1; }
+        if (src[cp] == 10) { lineno += 1; cp += 1; }
+        else if (is_space(src[cp]) == 1) { cp += 1; }
         else { break; }
     }
     return;
@@ -1684,10 +1676,10 @@ void script_dot_assign() {
     expr_used_sym = 0;
     skip_space_nl();
     if (peek() != 46) { serr_at("inside a section, . can only be advanced (. = . + N)"); }
-    cp = cp + 1;
+    cp += 1;
     skip_space_nl();
     if (peek() != 43) { serr_at("inside a section, . can only be advanced (. = . + N)"); }
-    cp = cp + 1;
+    cp += 1;
     v = read_expr();
     if (expr_used_sym == 1) { serr_at("a reservation must not depend on a symbol"); }
     skip_bytes(v);
@@ -1700,23 +1692,23 @@ void script_section_body() {
     while (1 == 1) {
         skip_space_nl();
         if (cp >= srclen) { serr_at("unterminated section block"); }
-        if (peek() == 125) { cp = cp + 1; return; }   // '}'
+        if (peek() == 125) { cp += 1; return; }   // '}'
         if (peek() == 42) {   // *(.name)  -- the inputs' contribution
-            cp = cp + 1;
+            cp += 1;
             expect_char(40, "expected ( after *");
             read_word();
             expect_char(41, "expected ) after the section name");
             continue;
         }
         if (peek() == 46 && cp + 1 < srclen && is_name_char(src[cp + 1]) == 0) {
-            cp = cp + 1;
+            cp += 1;
             expect_char(61, "expected = after .");
             script_dot_assign();
             expect_char(59, "expected ;");
             continue;
         }
         read_word();
-        if (word_len == 0) { serr_at("unexpected character in section block"); }
+        if (!word_len) { serr_at("unexpected character in section block"); }
         p = src + word_start;
         n = word_len;
         if (slice_is(p, n, "LONG") == 1) {
@@ -1735,7 +1727,7 @@ void script_section_body() {
         expect_char(61, "expected = after a symbol name");
         skip_space_nl();
         if (peek() != 46) { serr_at("a symbol in a section can only be set to ."); }
-        cp = cp + 1;
+        cp += 1;
         expect_char(59, "expected ;");
         label_here(p, n);
     }
@@ -1758,7 +1750,7 @@ void run_script() {
         skip_space_nl();
         if (cp >= srclen) { break; }
         read_word();
-        if (word_len == 0) { serr_at("unexpected character in linker script"); }
+        if (!word_len) { serr_at("unexpected character in linker script"); }
         p = src + word_start;
         n = word_len;
         if (slice_is(p, n, "ENTRY") == 1) {
@@ -1774,10 +1766,10 @@ void run_script() {
             while (1 == 1) {
                 skip_space_nl();
                 if (cp >= srclen) { serr_at("unterminated SECTIONS"); }
-                if (peek() == 125) { cp = cp + 1; break; }
+                if (peek() == 125) { cp += 1; break; }
                 if (peek() == 46 && cp + 1 < srclen && is_name_char(src[cp + 1]) == 0) {
                     // `. = 1M` before any section sets the base.
-                    cp = cp + 1;
+                    cp += 1;
                     expect_char(61, "expected = after .");
                     if (placed > 0) { serr_at("moving . between sections is not supported"); }
                     v = read_const();
@@ -1787,15 +1779,15 @@ void run_script() {
                     continue;
                 }
                 read_word();
-                if (word_len == 0) { serr_at("unexpected character in SECTIONS"); }
+                if (!word_len) { serr_at("unexpected character in SECTIONS"); }
                 p = src + word_start;
                 n = word_len;
                 skip_space_nl();
                 if (peek() == 58) {   // name : { ... }
-                    cp = cp + 1;
+                    cp += 1;
                     expect_char(123, "expected { after the section name");
                     enter_section(p, n);
-                    placed = placed + 1;
+                    placed += 1;
                     script_section_body();
                     cur = 0 - 1;
                     continue;
@@ -1804,9 +1796,9 @@ void run_script() {
                 expect_char(61, "expected : or = after a name");
                 skip_space_nl();
                 if (peek() != 46) { serr_at("a top-level symbol can only be set to ."); }
-                cp = cp + 1;
+                cp += 1;
                 expect_char(59, "expected ;");
-                if (placed == 0) { serr_at("a symbol before any section"); }
+                if (!placed) { serr_at("a symbol before any section"); }
                 last = sect_count - 1;
                 sym_set(p, n, load64(sect_base + last * 8) + load64(sect_size + last * 8));
             }
@@ -1828,7 +1820,7 @@ void place_sections() {
     int addr = 0;
     int size = 0;
     if (script != 0) {
-        if (have_base == 0) { serr("the linker script sets no base address (. = ...)"); }
+        if (!have_base) { serr("the linker script sets no base address (. = ...)"); }
         seg_vaddr = layout_base;
         seg_off = PAGE;
         addr = layout_base;
@@ -1843,15 +1835,15 @@ void place_sections() {
         store64(sect_base + i * 8, addr);
         size = load64(sect_pos + i * 8);
         store64(sect_size + i * 8, size);
-        addr = addr + size;
-        i = i + 1;
+        addr += size;
+        i += 1;
     }
     return;
 }
 
 void zero(int buf, int n) {
     int i = 0;
-    while (i < n) { store8(buf + i, 0); i = i + 1; }
+    for (i = 0; i < n; i += 1) { store8(buf + i, 0); }
     return;
 }
 
@@ -1892,9 +1884,11 @@ void hdr_32(int buf, int pos, int v) {
 }
 
 void hdr_64(int buf, int pos, int v) {
-    split64(v);
-    hdr_32(buf, pos, split_lo);
-    hdr_32(buf, pos + 4, split_hi);
+    int lo = 0;
+    int hi = 0;
+    lo, hi = split64(v);
+    hdr_32(buf, pos, lo);
+    hdr_32(buf, pos + 4, hi);
     return;
 }
 
@@ -1908,7 +1902,7 @@ void write_zeros(int fd, int n) {
         chunk = n;
         if (chunk > PAGE) { chunk = PAGE; }
         write(fd, buf, chunk);
-        n = n - chunk;
+        n -= chunk;
     }
     return;
 }
@@ -1931,9 +1925,9 @@ void write_elf(int fd) {
         off = load64(sect_base + i * 8) + size;
         if (off > mem_end) { mem_end = off; }
         if (load64(sect_data + i * 8) == 1 && off > data_end) { data_end = off; }
-        i = i + 1;
+        i += 1;
     }
-    if (script == 0) { data_end = mem_end; }
+    if (!script) { data_end = mem_end; }
 
     zero(hdr, HDRS);
     hdr_b(hdr, 0, 0x7F);
@@ -1973,7 +1967,7 @@ void write_elf(int fd) {
     write(fd, hdr, HDRS);
     filepos = HDRS;
     i = 0;
-    while (i < sect_count) {
+    for (i = 0; i < sect_count; i += 1) {
         size = load64(sect_size + i * 8);
         if (load64(sect_base + i * 8) < data_end && size > 0) {
             off = seg_off + (load64(sect_base + i * 8) - seg_vaddr);
@@ -1982,7 +1976,6 @@ void write_elf(int fd) {
             write(fd, load64(sect_buf + i * 8), size);
             filepos = off + size;
         }
-        i = i + 1;
     }
     return;
 }
@@ -2001,23 +1994,22 @@ void write_map(int name) {
         v = sym_value(i);
         j = 16;
         while (j > 0) {
-            j = j - 1;
+            j -= 1;
             // Floor division by hand, since an absolute symbol can be negative
             // (MB_CHECKSUM), and truncating division would print it wrong.
             d = v % 16;
-            v = v / 16;
-            if (d < 0) { d = d + 16; v = v - 1; }
+            v /= 16;
+            if (d < 0) { d += 16; v -= 1; }
             if (d < 10) { line[j] = 48 + d; } else { line[j] = 87 + d; }
         }
         line[16] = 32;
         n = load64(sym_len + i * 8);
         p = load64(sym_ptr + i * 8);
         if (n > 4000) { n = 4000; }
-        j = 0;
-        while (j < n) { line[17 + j] = p[j]; j = j + 1; }
+        for (j = 0; j < n; j += 1) { line[17 + j] = p[j]; }
         line[17 + n] = 10;
         write(fd, line, 18 + n);
-        i = i + 1;
+        i += 1;
     }
     close(fd);
     return;
@@ -2033,16 +2025,16 @@ int read_file(int name) {
     buf = alloc(cap);
     got = read(fd, buf, cap);
     while (got > 0) {
-        len = len + got;
+        len += got;
         // A full buffer doubles rather than failing, so no input is too
         // large. The old copy is not given back; smed lives for one run and
         // alloc() here has no free.
         if (len == cap) {
             int bigger = alloc(cap * 2);
             int k = 0;
-            while (k < len) { store64(bigger + k, load64(buf + k)); k = k + 8; }
+            for (k = 0; k < len; k += 8) { store64(bigger + k, load64(buf + k)); }
             buf = bigger;
-            cap = cap * 2;
+            cap *= 2;
         }
         got = read(fd, buf + len, cap - len);
     }
@@ -2085,10 +2077,10 @@ int main() {
         a = argv(i);
         if (slice_is(a, 2, "-T") == 1 && i + 1 < argc()) {
             script_name = argv(i + 1);
-            i = i + 2;
+            i += 2;
         } else if (slice_is(a, 2, "-m") == 1 && i + 1 < argc()) {
             map_name = argv(i + 1);
-            i = i + 2;
+            i += 2;
         } else if (slice_is(a, 6, "--base") == 1 && i + 1 < argc()) {
             // Where the single segment loads when no script says.  Moonshot
             // ring-3 programs are built with --base 0x80000000, the address
@@ -2096,27 +2088,26 @@ int main() {
             // executables use.
             src = argv(i + 1);
             srclen = 0;
-            while (src[srclen] != 0) { srclen = srclen + 1; }
+            while (src[srclen] != 0) { srclen += 1; }
             cp = 0;
             BASE = read_num();
             if (cp != srclen) { serr("--base wants a number"); }
-            i = i + 2;
+            i += 2;
         } else {
             if (in_count >= NIN_MAX) { serr("too many inputs"); }
             store64(in_names + in_count * 8, a);
-            in_count = in_count + 1;
-            i = i + 1;
+            in_count += 1;
+            i += 1;
         }
     }
     if (in_count < 2) { serr("need at least one input and an output"); }
-    in_count = in_count - 1;
+    in_count -= 1;
     out_name = load64(in_names + in_count * 8);
 
     i = 0;
-    while (i < in_count) {
+    for (i = 0; i < in_count; i += 1) {
         store64(in_bufs + i * 8, read_file(load64(in_names + i * 8)));
         store64(in_lens + i * 8, file_len);
-        i = i + 1;
     }
     if (script_name != 0) {
         script = read_file(script_name);
@@ -2131,9 +2122,8 @@ int main() {
     pass = 1;
     if (script != 0) { run_script(); script_sects = sect_count; }
     i = 0;
-    while (i < in_count) {
+    for (i = 0; i < in_count; i += 1) {
         run_source(load64(in_names + i * 8), load64(in_bufs + i * 8), load64(in_lens + i * 8));
-        i = i + 1;
     }
     if (script != 0 && sect_count != script_sects) {
         // An orphan section would land wherever the tool felt like putting
@@ -2147,31 +2137,28 @@ int main() {
 
     place_sections();
     i = 0;
-    while (i < sect_count) {
+    for (i = 0; i < sect_count; i += 1) {
         a = alloc(load64(sect_size + i * 8) + 1);
         zero(a, load64(sect_size + i * 8) + 1);
         store64(sect_buf + i * 8, a);
         store64(sect_pos + i * 8, 0);
         store64(sect_data + i * 8, 0);
-        i = i + 1;
     }
 
     pass = 2;
     if (script != 0) { run_script(); }
     i = 0;
-    while (i < in_count) {
+    for (i = 0; i < in_count; i += 1) {
         run_source(load64(in_names + i * 8), load64(in_bufs + i * 8), load64(in_lens + i * 8));
-        i = i + 1;
     }
     i = 0;
-    while (i < sect_count) {
+    for (i = 0; i < sect_count; i += 1) {
         if (load64(sect_pos + i * 8) != load64(sect_size + i * 8)) {
             print("smed: section ");
             print_slice(load64(sect_name + i * 8), load64(sect_namelen + i * 8));
             print(" changed size between passes\n");
             exit(1);
         }
-        i = i + 1;
     }
 
     e = sym_find(entry_ptr, entry_len);

@@ -59,28 +59,47 @@
  *                                                        and IDENT_size their
  *                                                        length. "embed" is a
  *                                                        word, not a keyword)
- *   function   := ("int" | "void") IDENT "(" params? ")" block
+ *   function   := ("int" | "void" | "(int, int)") IDENT "(" params? ")" block
+ *                                                     ("(int, int)" returns two
+ *                                                        values, in rax and rdx)
  *   params     := type IDENT ("," type IDENT)*          (max 16 total; first 6
  *                                                          register-passed, rest
  *                                                          on the stack -- see
  *                                                          gen_call/gen_function)
  *   block      := "{" stmt* "}"
- *   stmt       := decl_stmt | assign_stmt | if_stmt | while_stmt
- *               | return_stmt | break_stmt | continue_stmt | expr_stmt | block
+ *   stmt       := decl_stmt | assign_stmt | multi_assign | if_stmt
+ *               | while_stmt | for_stmt | return_stmt | break_stmt
+ *               | continue_stmt | defer_stmt | expr_stmt | block
  *   decl_stmt  := type IDENT ("=" expr)? ";"
- *   assign_stmt:= (IDENT | postfix) "=" expr ";"      (a postfix target must end
+ *   assign_stmt:= (IDENT | postfix) assign_op expr ";" (a postfix target must end
  *                                                        in an index or a field,
  *                                                        e.g. buf[i] = v or
  *                                                        e.hp = 10)
+ *   assign_op  := "=" | "+=" | "-=" | "*=" | "/=" | "%="
+ *                                                     (x OP= e is sugar for
+ *                                                        x = x OP (e))
+ *   multi_assign := IDENT "," IDENT "=" call ";"      (the call must be to a
+ *                                                        "(int, int)" function)
  *   if_stmt    := "if" "(" expr ")" stmt ("else" stmt)?
  *   while_stmt := "while" "(" expr ")" stmt
- *   return_stmt:= "return" expr? ";"                    ("return;" bare is required
+ *   for_stmt   := "for" "(" simple ";" expr ";" simple ")" stmt
+ *                                                     (simple is a declaration,
+ *                                                        an assignment or an
+ *                                                        expression without its
+ *                                                        ";". continue runs the
+ *                                                        step, as in C)
+ *   return_stmt:= "return" (expr ("," expr)?)? ";"      ("return;" bare is required
  *                                                          for void functions, optional
  *                                                          for int functions -- falling
  *                                                          off the end already left the
  *                                                          return value undefined)
- *   break_stmt := "break" ";"                            (must be inside a while loop)
- *   continue_stmt := "continue" ";"                      (must be inside a while loop)
+ *   break_stmt := "break" ";"                            (must be inside a loop)
+ *   continue_stmt := "continue" ";"                      (must be inside a loop)
+ *   defer_stmt := "defer" stmt                          (runs stmt at every exit
+ *                                                          of the function, the
+ *                                                          last defer first. It
+ *                                                          may not return, break,
+ *                                                          continue or defer)
  *   expr_stmt  := expr ";"                               (a bare call, e.g. `f(1);`)
  *
  *   expr       := logic_or
@@ -92,7 +111,7 @@
  *   shift      := additive (("<<" | ">>") additive)*
  *   additive   := term (("+" | "-") term)*
  *   term       := unary (("*" | "/" | "%") unary)*
- *   unary      := ("-" | "~") unary | postfix
+ *   unary      := ("-" | "~" | "!") unary | postfix      (!e is e == 0)
  *   postfix    := primary (("[" expr "]") | ("." IDENT))*
  *                                                     (buf[i] is sugar over
  *                                                        load8(buf+i) / store8;
@@ -150,6 +169,8 @@
  *   store8(addr, v)    -- stores the low byte of v at addr; evaluates to v
  *   load64(addr)       -- the 64-bit value at addr
  *   store64(addr, v)   -- stores v (all 8 bytes) at addr; evaluates to v
+ *   load32(addr)       -- the 32-bit value at addr, zero-extended
+ *   store32(addr, v)   -- stores the low 4 bytes of v at addr; evaluates to v
  *   exit(code)         -- terminates the process immediately (exit(2) syscall)
  *   argc()             -- the process's argument count (argv[0] is the
  *                          program name, same convention as C)
@@ -218,6 +239,10 @@ typedef enum {
   TK_DOT,
   TK_AMP, TK_PIPE, TK_CARET, TK_TILDE, TK_SHL, TK_SHR,
   TK_KW_LAYOUT, TK_KW_SIZEOF,
+  TK_NOT,
+  TK_PLUSEQ, TK_MINUSEQ, TK_STAREQ, TK_SLASHEQ, TK_PERCENTEQ,
+  TK_KW_FOR,
+  TK_KW_DEFER,
 } TokenKind;
 
 typedef struct {
@@ -397,6 +422,8 @@ static Token *tokenize(char *src) {
       else if (strcmp(word, "if") == 0) t->kind = TK_KW_IF;
       else if (strcmp(word, "else") == 0) t->kind = TK_KW_ELSE;
       else if (strcmp(word, "while") == 0) t->kind = TK_KW_WHILE;
+      else if (strcmp(word, "for") == 0) t->kind = TK_KW_FOR;
+      else if (strcmp(word, "defer") == 0) t->kind = TK_KW_DEFER;
       else if (strcmp(word, "return") == 0) t->kind = TK_KW_RETURN;
       else if (strcmp(word, "break") == 0) t->kind = TK_KW_BREAK;
       else if (strcmp(word, "continue") == 0) t->kind = TK_KW_CONTINUE;
@@ -410,11 +437,11 @@ static Token *tokenize(char *src) {
     }
 
     switch (*p) {
-      case '+': t->kind = TK_PLUS; p++; break;
-      case '-': t->kind = TK_MINUS; p++; break;
-      case '*': t->kind = TK_STAR; p++; break;
-      case '/': t->kind = TK_SLASH; p++; break;
-      case '%': t->kind = TK_PERCENT; p++; break;
+      case '+': if (p[1] == '=') { t->kind = TK_PLUSEQ; p += 2; } else { t->kind = TK_PLUS; p++; } break;
+      case '-': if (p[1] == '=') { t->kind = TK_MINUSEQ; p += 2; } else { t->kind = TK_MINUS; p++; } break;
+      case '*': if (p[1] == '=') { t->kind = TK_STAREQ; p += 2; } else { t->kind = TK_STAR; p++; } break;
+      case '/': if (p[1] == '=') { t->kind = TK_SLASHEQ; p += 2; } else { t->kind = TK_SLASH; p++; } break;
+      case '%': if (p[1] == '=') { t->kind = TK_PERCENTEQ; p += 2; } else { t->kind = TK_PERCENT; p++; } break;
       case '(': t->kind = TK_LPAREN; p++; break;
       case ')': t->kind = TK_RPAREN; p++; break;
       case '{': t->kind = TK_LBRACE; p++; break;
@@ -429,7 +456,7 @@ static Token *tokenize(char *src) {
         break;
       case '!':
         if (p[1] == '=') { t->kind = TK_NE; p += 2; break; }
-        error("unexpected character '!'");
+        t->kind = TK_NOT; p++;
         break;
       case '<':
         if (p[1] == '=') { t->kind = TK_LE; p += 2; }
@@ -478,6 +505,9 @@ typedef enum {
   ND_FUNCREF,
   ND_FIELD, ND_FIELD_ASSIGN, ND_SIZEOF,
   ND_BITAND, ND_BITOR, ND_BITXOR, ND_SHL, ND_SHR, ND_BITNOT,
+  ND_FORLOOP,
+  ND_MULTIASSIGN, /* a, b = f(...) -- lhs = call, cond = target1 VAR, rhs = target2 VAR */
+  ND_DEFER,       /* defer <stmt>; -- lhs = the deferred statement, run at every exit */
 } NodeKind;
 
 typedef struct Node Node;
@@ -519,6 +549,7 @@ struct Function {
   Param *extra_params;      /* params beyond MAX_PARAMS (stack-passed), in order */
   int nparams;
   int is_void;      /* declared "void" instead of "int" -- may not return a value */
+  int two_ret;      /* declared "(int, int)" -- returns two values, in rax and rdx */
   Node *body;
   long stack_size; /* filled in by resolve_function() */
   int ret_label;    /* filled in just before codegen */
@@ -640,6 +671,7 @@ static Token *expect(TokenKind k, const char *what) {
 
 static Node *parse_expr(void);
 static Node *parse_stmt(void);
+static Node *parse_simple(int want_semi);
 static Node *parse_block(void);
 
 static Node *parse_primary(void) {
@@ -740,6 +772,16 @@ static Node *parse_unary(void) {
     advance();
     Node *n = new_node(ND_BITNOT);
     n->lhs = parse_unary();
+    return n;
+  }
+  /* !E is sugar for (E == 0), so no new node kind or codegen is needed. */
+  if (check(TK_NOT)) {
+    advance();
+    Node *n = new_node(ND_EQ);
+    n->lhs = parse_unary();
+    Node *z = new_node(ND_NUM);
+    z->ival = 0;
+    n->rhs = z;
     return n;
   }
   return parse_postfix();
@@ -917,8 +959,19 @@ static Node *parse_stmt(void) {
   if (check(TK_KW_RETURN)) {
     advance();
     Node *n = new_node(ND_RETURN);
-    if (!check(TK_SEMI)) n->lhs = parse_expr();
+    if (!check(TK_SEMI)) {
+      n->lhs = parse_expr();
+      /* return a, b; -- two-value return (rhs set marks it). */
+      if (check(TK_COMMA)) { advance(); n->rhs = parse_expr(); }
+    }
     expect(TK_SEMI, "';'");
+    return n;
+  }
+
+  if (check(TK_KW_DEFER)) {
+    advance();
+    Node *n = new_node(ND_DEFER);
+    n->lhs = parse_stmt(); /* the statement to run at every exit */
     return n;
   }
 
@@ -934,19 +987,60 @@ static Node *parse_stmt(void) {
     return new_node(ND_CONTINUE);
   }
 
-  /* Parse a full expression first, then decide between a plain assignment
-   * (VAR '=' expr), an indexed assignment (buf[i] '=' expr), or -- if not
-   * followed by '=' at all -- an expression statement (e.g. `f(1);`). This
-   * needs arbitrary lookahead (buf[i] can be any length), so unlike the
-   * other statement forms it cannot be dispatched on a fixed token peek. */
+  /* for (init; cond; step) body parses to a BLOCK holding the init statement
+   * then a FORLOOP node, so init's declarations are scoped to the loop and
+   * `continue` runs the step. The step reuses parse_simple with no ';'. */
+  if (check(TK_KW_FOR)) {
+    advance();
+    expect(TK_LPAREN, "'('");
+    Node *init = parse_stmt();
+    Node *cond = parse_expr();
+    expect(TK_SEMI, "';'");
+    Node *step = parse_simple(0);
+    expect(TK_RPAREN, "')'");
+    Node *body = parse_stmt();
+    Node *loop = new_node(ND_FORLOOP);
+    loop->cond = cond;
+    loop->body = body;
+    loop->then = step;
+    Node *blk = new_node(ND_BLOCK);
+    init->next = loop;
+    blk->body = init;
+    return blk;
+  }
+
+  return parse_simple(1);
+}
+
+/* A plain/indexed/field assignment, a compound assignment, or -- if no
+ * assignment follows -- an expression statement. Needs arbitrary lookahead
+ * (buf[i] can be any length). want_semi is 0 for a for-loop step, which has
+ * ')' after it instead of ';'. */
+static Node *parse_simple(int want_semi) {
   Node *e = parse_expr();
+  /* q, r = f(...) -- a two-value assignment from a call that returns two. */
+  if (check(TK_COMMA)) {
+    if (e->kind != ND_VAR) { at_prev(); error("left of ',' in a two-value assignment must be a variable"); }
+    advance();
+    Node *t2 = parse_expr();
+    if (t2->kind != ND_VAR) { at_prev(); error("both targets of a two-value assignment must be variables"); }
+    expect(TK_ASSIGN, "'='");
+    Node *call = parse_expr();
+    if (call->kind != ND_CALL) { at_prev(); error("a two-value assignment needs a function call on the right"); }
+    Node *n = new_node(ND_MULTIASSIGN);
+    n->lhs = call;   /* the two-value call */
+    n->cond = e;     /* target 1 */
+    n->rhs = t2;     /* target 2 */
+    if (want_semi) expect(TK_SEMI, "';'");
+    return n;
+  }
   if (check(TK_ASSIGN)) {
     advance();
     if (e->kind == ND_VAR) {
       Node *n = new_node(ND_ASSIGN);
       n->name = e->name;
       n->rhs = parse_expr();
-      expect(TK_SEMI, "';'");
+      if (want_semi) expect(TK_SEMI, "';'");
       return n;
     }
     if (e->kind == ND_INDEX) {
@@ -954,7 +1048,7 @@ static Node *parse_stmt(void) {
       n->lhs = e->lhs;
       n->rhs = e->rhs;
       n->cond = parse_expr();
-      expect(TK_SEMI, "';'");
+      if (want_semi) expect(TK_SEMI, "';'");
       return n;
     }
     if (e->kind == ND_FIELD) {
@@ -962,7 +1056,49 @@ static Node *parse_stmt(void) {
       n->lhs = e->lhs;
       n->name = e->name;
       n->rhs = parse_expr();
-      expect(TK_SEMI, "';'");
+      if (want_semi) expect(TK_SEMI, "';'");
+      return n;
+    }
+    at_prev();
+    error("invalid assignment target");
+  }
+
+  /* A compound assignment lhs OP= rhs is sugar for lhs = (lhs OP rhs), which
+   * builds the same AST a hand-written lhs = lhs OP rhs would, so codegen
+   * needs nothing of its own for it, and an index or field target is
+   * evaluated twice exactly as in the hand-written form. */
+  if (check(TK_PLUSEQ) || check(TK_MINUSEQ) || check(TK_STAREQ)
+      || check(TK_SLASHEQ) || check(TK_PERCENTEQ)) {
+    NodeKind bk = ND_ADD;
+    if (check(TK_MINUSEQ)) bk = ND_SUB;
+    if (check(TK_STAREQ)) bk = ND_MUL;
+    if (check(TK_SLASHEQ)) bk = ND_DIV;
+    if (check(TK_PERCENTEQ)) bk = ND_MOD;
+    advance();
+    Node *bin = new_node(bk);
+    bin->lhs = e;
+    bin->rhs = parse_expr();
+    if (e->kind == ND_VAR) {
+      Node *n = new_node(ND_ASSIGN);
+      n->name = e->name;
+      n->rhs = bin;
+      if (want_semi) expect(TK_SEMI, "';'");
+      return n;
+    }
+    if (e->kind == ND_INDEX) {
+      Node *n = new_node(ND_INDEX_ASSIGN);
+      n->lhs = e->lhs;
+      n->rhs = e->rhs;
+      n->cond = bin;
+      if (want_semi) expect(TK_SEMI, "';'");
+      return n;
+    }
+    if (e->kind == ND_FIELD) {
+      Node *n = new_node(ND_FIELD_ASSIGN);
+      n->lhs = e->lhs;
+      n->name = e->name;
+      n->rhs = bin;
+      if (want_semi) expect(TK_SEMI, "';'");
       return n;
     }
     at_prev();
@@ -971,7 +1107,7 @@ static Node *parse_stmt(void) {
 
   Node *n = new_node(ND_EXPR_STMT);
   n->lhs = e;
-  expect(TK_SEMI, "';'");
+  if (want_semi) expect(TK_SEMI, "';'");
   return n;
 }
 
@@ -1166,6 +1302,22 @@ static void parse_program(void) {
       ltail = ltail->next;
       continue;
     }
+    /* (int, int) name(...) -- a function returning two values. */
+    if (check(TK_LPAREN)) {
+      advance();
+      expect(TK_KW_INT, "'int'");
+      expect(TK_COMMA, "',' (a two-value return is '(int, int)')");
+      expect(TK_KW_INT, "'int'");
+      expect(TK_RPAREN, "')'");
+      Token *nt = expect(TK_IDENT, "a function name");
+      if (!check(TK_LPAREN)) { at_prev(); error("'(int, int)' must be followed by a function"); }
+      ftail->next = parse_function(nt->name);
+      ftail->next->two_ret = 1;
+      ftail = ftail->next;
+      ftail->file = nt->file;
+      ftail->line = nt->line;
+      continue;
+    }
     int is_void = 0;
     char *gtype = NULL;
     if (check(TK_KW_VOID)) { is_void = 1; advance(); }
@@ -1212,6 +1364,7 @@ static const Builtin BUILTINS[] = {
   { "print", 1 }, { "write", 3 }, { "read", 3 },
   { "open_read", 1 }, { "open_write", 1 }, { "close", 1 },
   { "alloc", 1 }, { "load8", 1 }, { "store8", 2 },
+  { "load32", 1 }, { "store32", 2 },
   { "load64", 1 }, { "store64", 2 }, { "exit", 1 },
   { "argc", 0 }, { "argv", 1 },
   { "outb", 2 }, { "inb", 1 },
@@ -1258,15 +1411,17 @@ static const Builtin *find_builtin(const char *name) {
 
 static char *func_names[MAX_FUNCS];
 static int func_nparams[MAX_FUNCS];
+static int func_two_ret[MAX_FUNCS];
 static int func_count;
 
-static void func_declare_sig(char *name, int nparams) {
+static void func_declare_sig(char *name, int nparams, int two_ret) {
   for (int i = 0; i < func_count; i++) {
     if (strcmp(func_names[i], name) == 0) error("redefinition of function '%s'", name);
   }
   if (func_count >= MAX_FUNCS) error("too many functions (max %d)", MAX_FUNCS);
   func_names[func_count] = name;
   func_nparams[func_count] = nparams;
+  func_two_ret[func_count] = two_ret;
   func_count++;
 }
 
@@ -1275,6 +1430,13 @@ static int func_lookup_nparams(char *name) {
     if (strcmp(func_names[i], name) == 0) return func_nparams[i];
   }
   error("call to undeclared function '%s'", name);
+  return 0;
+}
+
+static int func_lookup_two_ret(char *name) {
+  for (int i = 0; i < func_count; i++) {
+    if (strcmp(func_names[i], name) == 0) return func_two_ret[i];
+  }
   return 0;
 }
 
@@ -1440,6 +1602,9 @@ static int sym_count;
 static long stack_size;
 static int loop_depth; /* nesting depth of while loops during resolve(); break/continue require loop_depth > 0 */
 static int current_fn_is_void; /* whether the function currently being resolved is void */
+static int current_fn_two_ret; /* whether the function currently being resolved returns two values */
+static int resolving_multi_call; /* set while resolving the call on the right of `a, b = f(...)` */
+static int in_defer; /* set while resolving a deferred statement; it may not return, break, continue or defer */
 
 /* Block scoping. Each '{' block marks the sym_count at entry; sym_declare's
  * redeclaration check only looks back to that mark, so sibling blocks can
@@ -1534,6 +1699,19 @@ static void resolve_node(Node *n) {
       else error("undeclared variable '%s'", n->name);
       return;
     }
+    case ND_MULTIASSIGN: {
+      int saved = resolving_multi_call;
+      resolving_multi_call = 1;
+      resolve(n->lhs); /* the call */
+      resolving_multi_call = saved;
+      if (n->lhs->kind != ND_CALL || !func_lookup_two_ret(n->lhs->name))
+        error("the right of a two-value assignment must call an '(int, int)' function");
+      resolve(n->cond); /* target 1 */
+      resolve(n->rhs);  /* target 2 */
+      if (n->cond->kind != ND_VAR || n->rhs->kind != ND_VAR)
+        error("two-value assignment targets must be variables");
+      return;
+    }
     case ND_DECL:
       resolve(n->rhs); /* must resolve before the new name enters scope */
       check_type(n->type);
@@ -1550,6 +1728,9 @@ static void resolve_node(Node *n) {
         int expected = func_lookup_nparams(n->name);
         if (expected != n->nargs) {
           error("'%s' takes %d argument(s), got %d", n->name, expected, n->nargs);
+        }
+        if (func_lookup_two_ret(n->name) && !resolving_multi_call) {
+          error("'%s' returns two values; call it as 'a, b = %s(...)'", n->name, n->name);
         }
       } else {
         /* Not a builtin, not a declared function -- an indirect call through
@@ -1570,11 +1751,33 @@ static void resolve_node(Node *n) {
       resolve(n->body);
       loop_depth--;
       return;
+    case ND_FORLOOP:
+      resolve(n->cond);
+      loop_depth++;
+      resolve(n->body);
+      loop_depth--;
+      resolve(n->then); /* step; outside loop_depth, it holds no break/continue */
+      return;
     case ND_RETURN:
+      if (in_defer) error("'return' inside a defer");
       if (current_fn_is_void && n->lhs) error("'void' function cannot return a value");
-      resolve(n->lhs); return;
+      if (current_fn_two_ret && !n->rhs) error("a two-value function must 'return a, b'");
+      if (!current_fn_two_ret && n->rhs) error("only a '(int, int)' function may return two values");
+      resolve(n->lhs); resolve(n->rhs); return;
     case ND_EXPR_STMT:
       resolve(n->lhs); return;
+    case ND_DEFER: {
+      /* The deferred statement runs at .Lret, outside every loop, so it is
+       * resolved with loop_depth 0 and may not jump out of the epilogue. */
+      if (in_defer) error("'defer' inside a defer");
+      int saved_loop_depth = loop_depth;
+      loop_depth = 0;
+      in_defer = 1;
+      resolve(n->lhs);
+      in_defer = 0;
+      loop_depth = saved_loop_depth;
+      return;
+    }
     case ND_BLOCK: {
       if (scope_depth >= MAX_SCOPE_DEPTH) error("blocks nested too deeply (max %d)", MAX_SCOPE_DEPTH);
       scope_marks[scope_depth++] = sym_count;
@@ -1584,9 +1787,11 @@ static void resolve_node(Node *n) {
       return;
     }
     case ND_BREAK:
+      if (loop_depth <= 0 && in_defer) error("'break' inside a defer");
       if (loop_depth <= 0) error("'break' outside of a loop");
       return;
     case ND_CONTINUE:
+      if (loop_depth <= 0 && in_defer) error("'continue' inside a defer");
       if (loop_depth <= 0) error("'continue' outside of a loop");
       return;
     case ND_INDEX:
@@ -1615,6 +1820,7 @@ static void resolve_function(Function *f) {
   stack_size = 0;
   scope_depth = 0;
   current_fn_is_void = f->is_void;
+  current_fn_two_ret = f->two_ret;
   err_file = f->file;
   err_line = f->line;
   for (int i = 0; i < f->nparams; i++) {
@@ -1656,9 +1862,13 @@ static int is_linux_only_builtin(const char *name) {
       || strcmp(name, "inw") == 0;
 }
 static int current_ret_label;
+#define MAX_DEFERS 64
+static Node *defers[MAX_DEFERS]; /* deferred statements collected while generating a function body */
+static int n_defers;             /* reset per function; emitted in reverse at .Lret */
 
 #define MAX_LOOP_DEPTH 64
 static int loop_labels[MAX_LOOP_DEPTH]; /* one label id per active while loop; .Lstart%d/.Lend%d are break/continue's targets */
+static int loop_is_for[MAX_LOOP_DEPTH]; /* 1 if the active loop is a for; continue then targets .Lstep%d (the step) */
 static int gen_loop_depth;
 
 static void gen_expr_node(Node *n);
@@ -1671,6 +1881,138 @@ static void gen_expr(Node *n) {
   gen_expr_node(n);
   err_file = saved_file;
   err_line = saved_line;
+}
+
+/* A leaf operand is a number or a variable. Loading one has no side effect
+ * and touches no other register, so a binary operator can load it straight
+ * into rcx instead of saving rax on the stack around it. */
+static int is_leaf(Node *n) {
+  return n->kind == ND_NUM || n->kind == ND_VAR;
+}
+
+/* Leaves lhs in rax and rhs in rcx, the operand layout of every binary
+ * operator. */
+static void gen_operands(Node *lhs, Node *rhs) {
+  gen_expr(lhs);
+  if (is_leaf(rhs)) {
+    if (rhs->kind == ND_NUM) fprintf(out, "    mov rcx, %ld\n", rhs->ival);
+    else if (rhs->is_global) fprintf(out, "    mov rcx, [.G%s]\n", rhs->name);
+    else fprintf(out, "    mov rcx, [rbp - %ld]\n", rhs->ival);
+    return;
+  }
+  fprintf(out, "    push rax\n");
+  gen_expr(rhs);
+  fprintf(out, "    mov rcx, rax\n");
+  fprintf(out, "    pop rax\n");
+}
+
+/* add, sub, imul, and, or, xor and cmp take a sign-extended 32-bit
+ * immediate, so a number in that range on their right needs no register at
+ * all. */
+static int is_imm32(Node *n) {
+  return n->kind == ND_NUM && n->ival >= -2147483647L - 1 && n->ival <= 2147483647L;
+}
+
+/* Leaves lhs in rax and returns 1 when rhs can be an immediate, otherwise
+ * loads both operands as gen_operands does and returns 0. */
+static int gen_operands_imm(Node *lhs, Node *rhs) {
+  if (is_imm32(rhs)) {
+    gen_expr(lhs);
+    return 1;
+  }
+  gen_operands(lhs, rhs);
+  return 0;
+}
+
+/* The right operand of an instruction, after gen_operands_imm. */
+static void emit_rhs(int imm, Node *rhs) {
+  if (imm) fprintf(out, "%ld\n", rhs->ival);
+  else fprintf(out, "rcx\n");
+}
+
+/* A number or a local can trade places with the other operand of a
+ * commutative operator. A global cannot, since a call on the other side may
+ * write it, and c0 has no way to take a local's address. */
+static int is_stable_leaf(Node *n) {
+  return n->kind == ND_NUM || (n->kind == ND_VAR && !n->is_global);
+}
+
+/* The jump taken when a comparison of rax against the right operand holds
+ * (sense 1) or fails (sense 0), or NULL for a node that is not a comparison. */
+static const char *cmp_jump(int kind, int sense) {
+  switch (kind) {
+    case ND_EQ: return sense ? "je" : "jne";
+    case ND_NE: return sense ? "jne" : "je";
+    case ND_LT: return sense ? "jl" : "jge";
+    case ND_LE: return sense ? "jle" : "jg";
+    case ND_GT: return sense ? "jg" : "jle";
+    case ND_GE: return sense ? "jge" : "jl";
+    default: return NULL;
+  }
+}
+
+/* Jumps to .<label><l> when cond is (sense 1) or is not (sense 0) true. A
+ * comparison branches on the flags directly instead of turning them into 0
+ * or 1 and comparing that against 0, and && and || become chains of such
+ * branches. */
+static void gen_jump(Node *cond, int sense, const char *label, int l) {
+  const char *jcc = cmp_jump(cond->kind, sense);
+  if (jcc) {
+    int imm = gen_operands_imm(cond->lhs, cond->rhs);
+    fprintf(out, "    cmp rax, ");
+    emit_rhs(imm, cond->rhs);
+    fprintf(out, "    %s .%s%d\n", jcc, label, l);
+    return;
+  }
+  /* (a && b) is false when either is false, (a || b) is true when either is
+   * true. The other two cases skip to .Lskip when the left side decides. */
+  if ((cond->kind == ND_AND && !sense) || (cond->kind == ND_OR && sense)) {
+    gen_jump(cond->lhs, sense, label, l);
+    gen_jump(cond->rhs, sense, label, l);
+    return;
+  }
+  if (cond->kind == ND_AND || cond->kind == ND_OR) {
+    int skip = label_count++;
+    gen_jump(cond->lhs, cond->kind == ND_OR, "Lskip", skip);
+    gen_jump(cond->rhs, sense, label, l);
+    fprintf(out, ".Lskip%d:\n", skip);
+    return;
+  }
+  gen_expr(cond);
+  fprintf(out, "    cmp rax, 0\n");
+  fprintf(out, "    %s .%s%d\n", sense ? "jne" : "je", label, l);
+}
+
+static void gen_jump_if_false(Node *cond, const char *label, int l) {
+  gen_jump(cond, 0, label, l);
+}
+
+/* Leaves an address in rdi and a value in rax, evaluated in that order. A
+ * leaf value loads into rax without disturbing rdi, so the address need not
+ * wait on the stack. */
+static void gen_addr_value(Node *addr, Node *value) {
+  gen_expr(addr);
+  if (is_leaf(value)) {
+    fprintf(out, "    mov rdi, rax\n");
+    gen_expr(value);
+    return;
+  }
+  fprintf(out, "    push rax\n");
+  gen_expr(value);
+  fprintf(out, "    pop rdi\n");
+}
+
+/* A number, a local or a string literal, loaded straight into an argument
+ * register. Nothing an argument expression does can change one, so it may
+ * be loaded after the others. */
+static int is_stable_arg(Node *n) {
+  return is_stable_leaf(n) || n->kind == ND_STR;
+}
+
+static void gen_stable_arg(Node *n, const char *reg) {
+  if (n->kind == ND_NUM) fprintf(out, "    mov %s, %ld\n", reg, n->ival);
+  else if (n->kind == ND_STR) fprintf(out, "    lea %s, [.Lstr%d]\n", reg, n->str_id);
+  else fprintf(out, "    mov %s, [rbp - %ld]\n", reg, n->ival);
 }
 
 static void gen_expr_node(Node *n) {
@@ -1697,11 +2039,9 @@ static void gen_expr_node(Node *n) {
       fprintf(out, "    not rax\n");
       return;
     case ND_INDEX:
-      gen_expr(n->lhs);        /* base */
-      fprintf(out, "    push rax\n");
-      gen_expr(n->rhs);        /* index */
-      fprintf(out, "    mov rcx, rax\n");
-      fprintf(out, "    pop rax\n");
+      /* base + index, so the operands may trade places like ADD's. */
+      if (is_stable_leaf(n->lhs) && !is_leaf(n->rhs)) gen_operands(n->rhs, n->lhs);
+      else gen_operands(n->lhs, n->rhs);
       fprintf(out, "    add rax, rcx\n");
       fprintf(out, "    movzx rax, byte ptr [rax]\n");
       return;
@@ -1775,10 +2115,7 @@ static void gen_expr_node(Node *n) {
         return;
       }
       if (strcmp(n->name, "store8") == 0) {
-        gen_expr(n->args);        /* addr */
-        fprintf(out, "    push rax\n");
-        gen_expr(n->args->next);  /* value */
-        fprintf(out, "    pop rdi\n");
+        gen_addr_value(n->args, n->args->next);
         fprintf(out, "    mov byte ptr [rdi], al\n");
         return;                   /* rax still holds the value */
       }
@@ -1853,16 +2190,24 @@ static void gen_expr_node(Node *n) {
         fprintf(out, "    mov rax, %d\n    syscall\n", strcmp(n->name, "blit") == 0 ? 5 : 3);
         return;
       }
+      if (strcmp(n->name, "load32") == 0) {
+        /* A 32-bit load clears the upper half of rax by itself. */
+        gen_expr(n->args);
+        fprintf(out, "    mov eax, dword ptr [rax]\n");
+        return;
+      }
+      if (strcmp(n->name, "store32") == 0) {
+        gen_addr_value(n->args, n->args->next);
+        fprintf(out, "    mov dword ptr [rdi], eax\n");
+        return;                   /* rax still holds the value */
+      }
       if (strcmp(n->name, "load64") == 0) {
         gen_expr(n->args);
         fprintf(out, "    mov rax, [rax]\n");
         return;
       }
       if (strcmp(n->name, "store64") == 0) {
-        gen_expr(n->args);        /* addr */
-        fprintf(out, "    push rax\n");
-        gen_expr(n->args->next);  /* value */
-        fprintf(out, "    pop rdi\n");
+        gen_addr_value(n->args, n->args->next);
         fprintf(out, "    mov [rdi], rax\n");
         return;                   /* rax still holds the value */
       }
@@ -1942,15 +2287,32 @@ static void gen_expr_node(Node *n) {
        * them the same way a caller-past-us would via [rbp+16+...]) and the
        * whole pushed block is reclaimed with one `add rsp` after the call. */
       int i = 0;
-      for (Node *a = n->args; a; a = a->next, i++) {
-        gen_expr(a);
-        fprintf(out, "    push rax\n");
-      }
       if (n->nargs <= MAX_PARAMS) {
-        for (i = n->nargs - 1; i >= 0; i--) {
-          fprintf(out, "    pop %s\n", ARG_REGS[i]);
+        /* The other arguments are evaluated left to right as usual. The last
+         * of them goes straight to its register, the rest wait on the stack,
+         * and the stable ones are loaded last, directly into place. */
+        int last = -1;
+        for (Node *a = n->args; a; a = a->next, i++)
+          if (!is_stable_arg(a)) last = i;
+        i = 0;
+        for (Node *a = n->args; a; a = a->next, i++) {
+          if (is_stable_arg(a)) continue;
+          gen_expr(a);
+          if (i == last) fprintf(out, "    mov %s, rax\n", ARG_REGS[i]);
+          else fprintf(out, "    push rax\n");
         }
+        Node *by_index[MAX_PARAMS];
+        i = 0;
+        for (Node *a = n->args; a; a = a->next, i++) by_index[i] = a;
+        for (i = n->nargs - 1; i >= 0; i--)
+          if (!is_stable_arg(by_index[i]) && i != last) fprintf(out, "    pop %s\n", ARG_REGS[i]);
+        for (i = 0; i < n->nargs; i++)
+          if (is_stable_arg(by_index[i])) gen_stable_arg(by_index[i], ARG_REGS[i]);
       } else {
+        for (Node *a = n->args; a; a = a->next, i++) {
+          gen_expr(a);
+          fprintf(out, "    push rax\n");
+        }
         for (i = 0; i < MAX_PARAMS; i++) {
           fprintf(out, "    mov %s, [rsp + %d]\n", ARG_REGS[i], (n->nargs - 1 - i) * 8);
         }
@@ -1983,12 +2345,7 @@ static void gen_expr_node(Node *n) {
     }
     case ND_AND: {
       int l = label_count++;
-      gen_expr(n->lhs);
-      fprintf(out, "    cmp rax, 0\n");
-      fprintf(out, "    je .Lfalse%d\n", l);
-      gen_expr(n->rhs);
-      fprintf(out, "    cmp rax, 0\n");
-      fprintf(out, "    je .Lfalse%d\n", l);
+      gen_jump(n, 0, "Lfalse", l);
       fprintf(out, "    mov rax, 1\n");
       fprintf(out, "    jmp .Landend%d\n", l);
       fprintf(out, ".Lfalse%d:\n", l);
@@ -1998,12 +2355,7 @@ static void gen_expr_node(Node *n) {
     }
     case ND_OR: {
       int l = label_count++;
-      gen_expr(n->lhs);
-      fprintf(out, "    cmp rax, 0\n");
-      fprintf(out, "    jne .Ltrue%d\n", l);
-      gen_expr(n->rhs);
-      fprintf(out, "    cmp rax, 0\n");
-      fprintf(out, "    jne .Ltrue%d\n", l);
+      gen_jump(n, 1, "Ltrue", l);
       fprintf(out, "    mov rax, 0\n");
       fprintf(out, "    jmp .Lorend%d\n", l);
       fprintf(out, ".Ltrue%d:\n", l);
@@ -2013,29 +2365,43 @@ static void gen_expr_node(Node *n) {
     }
     case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_MOD:
     case ND_EQ: case ND_NE: case ND_LT: case ND_LE: case ND_GT: case ND_GE:
-    case ND_BITAND: case ND_BITOR: case ND_BITXOR: case ND_SHL: case ND_SHR:
-      gen_expr(n->lhs);
-      fprintf(out, "    push rax\n");
-      gen_expr(n->rhs);
-      fprintf(out, "    mov rcx, rax\n");
-      fprintf(out, "    pop rax\n");
+    case ND_BITAND: case ND_BITOR: case ND_BITXOR: case ND_SHL: case ND_SHR: {
+      int imm = 0;
+      Node *lhs = n->lhs;
+      Node *rhs = n->rhs;
+      int commutes = n->kind == ND_ADD || n->kind == ND_MUL || n->kind == ND_BITAND
+        || n->kind == ND_BITOR || n->kind == ND_BITXOR;
+      /* With the leaf on the right, it loads straight into place instead of
+       * rax being saved around the other operand. */
+      if (commutes && is_stable_leaf(lhs) && !is_leaf(rhs)) { lhs = n->rhs; rhs = n->lhs; }
+      if (commutes || n->kind == ND_SUB || (n->kind >= ND_EQ && n->kind <= ND_GE))
+        imm = gen_operands_imm(lhs, rhs);
+      else
+        gen_operands(lhs, rhs);
+      if (n->kind >= ND_EQ && n->kind <= ND_GE) {
+        fprintf(out, "    cmp rax, ");
+        emit_rhs(imm, rhs);
+      }
       switch (n->kind) {
-        case ND_ADD: fprintf(out, "    add rax, rcx\n"); break;
-        case ND_SUB: fprintf(out, "    sub rax, rcx\n"); break;
-        case ND_MUL: fprintf(out, "    imul rax, rcx\n"); break;
+        case ND_ADD: fprintf(out, "    add rax, "); emit_rhs(imm, rhs); break;
+        case ND_SUB: fprintf(out, "    sub rax, "); emit_rhs(imm, rhs); break;
+        case ND_MUL:
+          if (imm) fprintf(out, "    imul rax, rax, %ld\n", rhs->ival);
+          else fprintf(out, "    imul rax, rcx\n");
+          break;
         case ND_DIV: fprintf(out, "    cqo\n    idiv rcx\n"); break;
         /* idiv leaves the remainder in rdx, with the sign of the dividend,
          * the same as C, so -7 % 2 is -1. */
         case ND_MOD: fprintf(out, "    cqo\n    idiv rcx\n    mov rax, rdx\n"); break;
-        case ND_EQ:  fprintf(out, "    cmp rax, rcx\n    sete al\n    movzx rax, al\n"); break;
-        case ND_NE:  fprintf(out, "    cmp rax, rcx\n    setne al\n    movzx rax, al\n"); break;
-        case ND_LT:  fprintf(out, "    cmp rax, rcx\n    setl al\n    movzx rax, al\n"); break;
-        case ND_LE:  fprintf(out, "    cmp rax, rcx\n    setle al\n    movzx rax, al\n"); break;
-        case ND_GT:  fprintf(out, "    cmp rax, rcx\n    setg al\n    movzx rax, al\n"); break;
-        case ND_GE:  fprintf(out, "    cmp rax, rcx\n    setge al\n    movzx rax, al\n"); break;
-        case ND_BITAND: fprintf(out, "    and rax, rcx\n"); break;
-        case ND_BITOR:  fprintf(out, "    or rax, rcx\n"); break;
-        case ND_BITXOR: fprintf(out, "    xor rax, rcx\n"); break;
+        case ND_EQ:  fprintf(out, "    sete al\n    movzx rax, al\n"); break;
+        case ND_NE:  fprintf(out, "    setne al\n    movzx rax, al\n"); break;
+        case ND_LT:  fprintf(out, "    setl al\n    movzx rax, al\n"); break;
+        case ND_LE:  fprintf(out, "    setle al\n    movzx rax, al\n"); break;
+        case ND_GT:  fprintf(out, "    setg al\n    movzx rax, al\n"); break;
+        case ND_GE:  fprintf(out, "    setge al\n    movzx rax, al\n"); break;
+        case ND_BITAND: fprintf(out, "    and rax, "); emit_rhs(imm, rhs); break;
+        case ND_BITOR:  fprintf(out, "    or rax, "); emit_rhs(imm, rhs); break;
+        case ND_BITXOR: fprintf(out, "    xor rax, "); emit_rhs(imm, rhs); break;
         /* the count is in cl, and x86 uses only its low six bits, so a
          * count outside 0..63 shifts by count & 63. >> is arithmetic (sar),
          * the sign bit fills in from the left, which is what gcc does for a
@@ -2045,6 +2411,7 @@ static void gen_expr_node(Node *n) {
         default: break;
       }
       return;
+    }
     default:
       error("internal error: not an expression node");
   }
@@ -2080,21 +2447,22 @@ static void gen_stmt_node(Node *n) {
       else fprintf(out, "    mov [rbp - %ld], rax\n", n->ival);
       return;
     case ND_INDEX_ASSIGN:
-      gen_expr(n->lhs);                       /* base */
-      fprintf(out, "    push rax\n");
-      gen_expr(n->rhs);                       /* index */
-      fprintf(out, "    pop rcx\n");
-      fprintf(out, "    add rcx, rax\n");      /* rcx = base + index (address) */
-      fprintf(out, "    push rcx\n");
-      gen_expr(n->cond);                      /* value */
-      fprintf(out, "    pop rdi\n");
+      /* base + index, then the value, as for store8. */
+      if (is_stable_leaf(n->lhs) && !is_leaf(n->rhs)) gen_operands(n->rhs, n->lhs);
+      else gen_operands(n->lhs, n->rhs);
+      fprintf(out, "    add rax, rcx\n");
+      if (is_leaf(n->cond)) {
+        fprintf(out, "    mov rdi, rax\n");
+        gen_expr(n->cond);
+      } else {
+        fprintf(out, "    push rax\n");
+        gen_expr(n->cond);
+        fprintf(out, "    pop rdi\n");
+      }
       fprintf(out, "    mov byte ptr [rdi], al\n");
       return;
     case ND_FIELD_ASSIGN:
-      gen_expr(n->lhs);                  /* base */
-      fprintf(out, "    push rax\n");
-      gen_expr(n->rhs);                  /* value */
-      fprintf(out, "    pop rdi\n");
+      gen_addr_value(n->lhs, n->rhs);
       fprintf(out, "    mov [rdi + %ld], rax\n", n->ival);
       return;
     case ND_EXPR_STMT:
@@ -2102,11 +2470,11 @@ static void gen_stmt_node(Node *n) {
       return;
     case ND_IF: {
       int l = label_count++;
-      gen_expr(n->cond);
-      fprintf(out, "    cmp rax, 0\n");
-      fprintf(out, "    je .Lelse%d\n", l);
+      gen_jump_if_false(n->cond, "Lelse", l);
       gen_stmt(n->then);
-      fprintf(out, "    jmp .Lend%d\n", l);
+      /* Without an else, .Lend follows .Lelse directly, so the jump would
+       * land on the next instruction. */
+      if (n->els) fprintf(out, "    jmp .Lend%d\n", l);
       fprintf(out, ".Lelse%d:\n", l);
       if (n->els) gen_stmt(n->els);
       fprintf(out, ".Lend%d:\n", l);
@@ -2115,10 +2483,9 @@ static void gen_stmt_node(Node *n) {
     case ND_WHILE: {
       int l = label_count++;
       fprintf(out, ".Lstart%d:\n", l);
-      gen_expr(n->cond);
-      fprintf(out, "    cmp rax, 0\n");
-      fprintf(out, "    je .Lend%d\n", l);
+      gen_jump_if_false(n->cond, "Lend", l);
       if (gen_loop_depth >= MAX_LOOP_DEPTH) error("loops nested too deeply (max %d)", MAX_LOOP_DEPTH);
+      loop_is_for[gen_loop_depth] = 0;
       loop_labels[gen_loop_depth++] = l;
       gen_stmt(n->body);
       gen_loop_depth--;
@@ -2126,15 +2493,59 @@ static void gen_stmt_node(Node *n) {
       fprintf(out, ".Lend%d:\n", l);
       return;
     }
+    case ND_FORLOOP: {
+      /* child cond/body/then(step). continue jumps to .Lstep so the step
+       * always runs, matching C. */
+      int l = label_count++;
+      fprintf(out, ".Lstart%d:\n", l);
+      gen_jump_if_false(n->cond, "Lend", l);
+      if (gen_loop_depth >= MAX_LOOP_DEPTH) error("loops nested too deeply (max %d)", MAX_LOOP_DEPTH);
+      loop_is_for[gen_loop_depth] = 1;
+      loop_labels[gen_loop_depth++] = l;
+      gen_stmt(n->body);
+      gen_loop_depth--;
+      fprintf(out, ".Lstep%d:\n", l);
+      gen_stmt(n->then);
+      fprintf(out, "    jmp .Lstart%d\n", l);
+      fprintf(out, ".Lend%d:\n", l);
+      return;
+    }
     case ND_RETURN:
-      if (n->lhs) gen_expr(n->lhs);
+      if (n->rhs) {
+        /* return a, b; -- first value in rax, second in rdx. */
+        gen_expr(n->lhs);
+        fprintf(out, "    push rax\n");
+        gen_expr(n->rhs);
+        fprintf(out, "    mov rdx, rax\n");
+        fprintf(out, "    pop rax\n");
+      } else if (n->lhs) {
+        gen_expr(n->lhs);
+      }
       fprintf(out, "    jmp .Lret%d\n", current_ret_label);
+      return;
+    case ND_MULTIASSIGN: {
+      /* a, b = f(...), where the call leaves value1 in rax and value2 in rdx. */
+      gen_expr(n->lhs);
+      Node *t1 = n->cond, *t2 = n->rhs;
+      if (t1->is_global) fprintf(out, "    mov [.G%s], rax\n", t1->name);
+      else fprintf(out, "    mov [rbp - %ld], rax\n", t1->ival);
+      if (t2->is_global) fprintf(out, "    mov [.G%s], rdx\n", t2->name);
+      else fprintf(out, "    mov [rbp - %ld], rdx\n", t2->ival);
+      return;
+    }
+    case ND_DEFER:
+      /* Collected now, emitted (reversed) at .Lret -- see gen_function. */
+      if (n_defers >= MAX_DEFERS) error("too many defers in one function (max %d)", MAX_DEFERS);
+      defers[n_defers++] = n->lhs;
       return;
     case ND_BREAK:
       fprintf(out, "    jmp .Lend%d\n", loop_labels[gen_loop_depth - 1]);
       return;
     case ND_CONTINUE:
-      fprintf(out, "    jmp .Lstart%d\n", loop_labels[gen_loop_depth - 1]);
+      if (loop_is_for[gen_loop_depth - 1])
+        fprintf(out, "    jmp .Lstep%d\n", loop_labels[gen_loop_depth - 1]);
+      else
+        fprintf(out, "    jmp .Lstart%d\n", loop_labels[gen_loop_depth - 1]);
       return;
     case ND_BLOCK:
       gen_block(n);
@@ -2168,9 +2579,21 @@ static void gen_function(Function *f) {
     }
   }
 
+  n_defers = 0;
   gen_block(f->body);
 
   fprintf(out, ".Lret%d:\n", current_ret_label);
+  /* Deferred statements run here, before the frame is torn down, in reverse
+   * (LIFO) order. The frame is still valid so they can touch locals; rax/rdx
+   * are saved so a cleanup call cannot clobber the return value(s). Nothing is
+   * emitted when a function has no defers. */
+  if (n_defers > 0) {
+    fprintf(out, "    push rax\n");
+    fprintf(out, "    push rdx\n");
+    for (int i = n_defers - 1; i >= 0; i--) gen_stmt(defers[i]);
+    fprintf(out, "    pop rdx\n");
+    fprintf(out, "    pop rax\n");
+  }
   fprintf(out, "    mov rsp, rbp\n");
   fprintf(out, "    pop rbp\n");
   fprintf(out, "    ret\n");
@@ -2200,6 +2623,12 @@ static void dump_tokens(void) {
       case TK_ASSIGN: printf("ASSIGN\n"); break;
       case TK_EQ:     printf("EQ\n"); break;
       case TK_NE:     printf("NE\n"); break;
+      case TK_NOT:    printf("NOT\n"); break;
+      case TK_PLUSEQ:    printf("PLUSEQ\n"); break;
+      case TK_MINUSEQ:   printf("MINUSEQ\n"); break;
+      case TK_STAREQ:    printf("STAREQ\n"); break;
+      case TK_SLASHEQ:   printf("SLASHEQ\n"); break;
+      case TK_PERCENTEQ: printf("PERCENTEQ\n"); break;
       case TK_LT:     printf("LT\n"); break;
       case TK_LE:     printf("LE\n"); break;
       case TK_GT:     printf("GT\n"); break;
@@ -2214,6 +2643,8 @@ static void dump_tokens(void) {
       case TK_KW_IF:     printf("IF\n"); break;
       case TK_KW_ELSE:   printf("ELSE\n"); break;
       case TK_KW_WHILE:  printf("WHILE\n"); break;
+      case TK_KW_FOR:    printf("FOR\n"); break;
+      case TK_KW_DEFER:  printf("DEFER\n"); break;
       case TK_KW_RETURN: printf("RETURN\n"); break;
       case TK_EOF:    printf("EOF\n"); break;
       case TK_AND:    printf("AND\n"); break;
@@ -2310,8 +2741,25 @@ static void dump_node(Node *n, int depth) {
       dump_node(n->cond, depth + 1);
       dump_node(n->body, depth + 1);
       return;
+    case ND_FORLOOP:
+      printf("FORLOOP\n");
+      dump_node(n->cond, depth + 1);
+      dump_node(n->body, depth + 1);
+      dump_node(n->then, depth + 1);
+      return;
     case ND_RETURN:
       printf("RETURN\n");
+      dump_node(n->lhs, depth + 1);
+      if (n->rhs) dump_node(n->rhs, depth + 1);
+      return;
+    case ND_MULTIASSIGN:
+      printf("MULTIASSIGN\n");
+      dump_node(n->cond, depth + 1);
+      dump_node(n->rhs, depth + 1);
+      dump_node(n->lhs, depth + 1);
+      return;
+    case ND_DEFER:
+      printf("DEFER\n");
       dump_node(n->lhs, depth + 1);
       return;
     case ND_EXPR_STMT:
@@ -2366,6 +2814,7 @@ static void dump_ast(void) {
   }
   for (Function *f = prog_functions; f; f = f->next) {
     if (f->is_void) printf("FUNC void %s", f->name);
+    else if (f->two_ret) printf("FUNC (int, int) %s", f->name);
     else printf("FUNC %s", f->name);
     for (int i = 0; i < f->nparams; i++) printf(" %s", param_name(f, i));
     printf("\n");
@@ -2490,6 +2939,15 @@ static int file_exists(const char *path) {
 static const char *include_stack[INCLUDE_MAX_DEPTH];
 static int include_depth = 0;
 
+/* Every file ever spliced, by its resolved path, so a file reached a second
+ * time (a diamond, two included files that both include a third) is spliced
+ * once and skipped after -- faster, and it removes the duplicate-definition
+ * error that a second textual copy would otherwise cause. A true cycle is
+ * still caught above by include_stack before we get here. */
+#define MAX_INCLUDED 256
+static const char *included[MAX_INCLUDED];
+static int n_included = 0;
+
 /* The line `at` is on, counting from the start of `src`. */
 static int line_in(const char *src, const char *at) {
   int line = 1;
@@ -2498,6 +2956,10 @@ static int line_in(const char *src, const char *at) {
 }
 
 static void expand_file(Growbuf *out, const char *path) {
+  for (int i = 0; i < n_included; i++)
+    if (strcmp(included[i], path) == 0) return; /* include-once, already spliced */
+  if (n_included >= MAX_INCLUDED) error("include: more than %d distinct files", MAX_INCLUDED);
+  included[n_included++] = path;
   include_stack[include_depth++] = path;
 
   char *src = read_file(path);
@@ -2656,7 +3118,7 @@ int main(int argc, char **argv) {
       error("'%s' is a builtin and cannot be redefined", f->name);
     }
     check_symbol_name(f->name, "a function");
-    func_declare_sig(f->name, f->nparams);
+    func_declare_sig(f->name, f->nparams, f->two_ret);
     if (strcmp(f->name, "main") == 0) {
       if (f->nparams != 0) error("'main' must take no parameters");
       if (f->is_void) error("'main' must return int, not void");

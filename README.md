@@ -67,7 +67,7 @@ is a different binary from the one smed makes of the same assembly, because
 smed does not pick the short encodings binutils picks. Running it once more
 through itself reaches a fixpoint immediately, and that is the binary the
 audit expects to find. Skip step 4 and `./verify_bootstrap.sh` will tell
-you the committed smed is not what smed produces from its own source, which
+you the in-tree smed is not what smed produces from its own source, which
 would be correct.
 
 (Note the temporary name. Linux refuses to write to a running executable,
@@ -141,19 +141,42 @@ the same thing for every input, and the test suite holds them to it.
 
 c0 has `int` variables and globals, functions with up to 16 parameters
 (the first six in registers, the rest on the stack), recursion, `if`/`else`,
-`while` with `break`/`continue`, block scoping with shadowing,
-short-circuiting `&&`/`||`, `%`, the bitwise operators `& | ^ ~ << >>`
-(with C's precedence, warts included, and `>>` arithmetic), string
-literals, char literals, hex literals,
+`while` and `for` with `break`/`continue`, block scoping with shadowing,
+short-circuiting `&&`/`||`, logical not `!`, `%`, the bitwise operators
+`& | ^ ~ << >>` (with C's precedence, warts included, and `>>` arithmetic),
+the compound assignments `+= -= *= /= %=`, string literals, char literals,
+hex literals,
 `buf[i]` indexing (sugar over byte load/store), and function references: a
 bare function name is its address, and calling through a variable holding
 one is an indirect call. `include "file.c0";` splits a program across
-files by plain textual substitution. `extern int name;` declares a global
+files by plain textual substitution, and a file reached along two paths is
+spliced once. `extern int name;` declares a global
 that some other object file defines. A global's initializer may be any
 constant expression, folded at compile time. `embed name "file";` puts a
 file's bytes into the program as data, with `name` as their address and
 `name_size` as their length; the compiler never opens the file, the
 assembler does.
+
+A function declared `(int, int)` returns two values, and the caller takes
+them both at once:
+
+```c
+(int, int) divmod(int a, int b) {
+    return a / b, a % b;
+}
+
+int q;
+int r;
+q, r = divmod(17, 5);
+```
+
+`defer stmt;` runs the statement at every exit of the function, the last
+defer first, which keeps a cleanup next to the thing it cleans up:
+
+```c
+int fd = open_read("notes.txt");
+defer close(fd);
+```
 
 `layout` gives a block of memory named offsets:
 
@@ -176,13 +199,13 @@ fields are looked up in that layout, so two layouts may put the same field
 name at different offsets. An untyped variable reaches a field through the
 one offset every layout agrees on, and is refused when they do not agree.
 
-There is no type checking, no optimizer, and on Linux nothing is ever
-freed. Some of that will change, some of it is the design. The full
+There is no type checking, no optimizer pass beyond a few shortcuts in the
+code generator, and on Linux nothing is ever freed. Some of that will change, some of it is the design. The full
 grammar is in the header comment of `coff0.c`.
 
 I/O and memory are compiler builtins that map directly to syscalls:
 `print`, `write`, `read`, `open_read`, `open_write`, `close`, `alloc`,
-`load8`/`store8`, `load64`/`store64`, `exit`, `argc`/`argv`, and
+`load8`/`store8`, `load32`/`store32`, `load64`/`store64`, `exit`, `argc`/`argv`, and
 `outb`/`inb`/`outw`/`inw` for port I/O in freestanding code. They are all listed with
 their signatures in `coff0.c`'s header comment.
 

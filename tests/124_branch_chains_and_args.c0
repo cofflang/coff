@@ -1,0 +1,97 @@
+// expect: 42
+//
+// tests/124_branch_chains_and_args.c0 - && and || chains, commutative operands and direct call arguments
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// Conditions built from && and || branch on the flags all the way through,
+// still short-circuiting. A number or local may trade places with the other
+// operand of a commutative operator, a global may not. Call arguments that
+// are numbers, locals or strings load straight into their registers, and the
+// others keep their left-to-right order. imul, and, or and xor take
+// immediates.
+layout Box {
+    int a;
+    int b;
+}
+
+int trace = 0;
+int g = 10;
+
+int t(int d, int v) {
+    trace = trace * 10 + d;
+    return v;
+}
+
+int bump() {
+    g += 5;
+    return 1;
+}
+
+int six(int a, int b, int c, int d, int e, int f) {
+    return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f;
+}
+
+int seven(int a, int b, int c, int d, int e, int f, int h) {
+    return six(a, b, c, d, e, f) * 10 + h;
+}
+
+int cond(int a, int b, int c) {
+    int r = 0;
+    if (a < b && b < c) { r += 1; }
+    if (a < b || b < c) { r += 2; }
+    if (!(a < b) || (b < c && c != 9)) { r += 4; }
+    if ((a == 1 || b == 2) && (c == 3 || a == 4)) { r += 8; }
+    while (a < b && a < 100) { a += 1; }
+    if (a < b) { return 99; }
+    return r;
+}
+
+int main() {
+    if (cond(1, 2, 3) != 15) { return 1; }
+    if (cond(3, 2, 1) != 4) { return 2; }
+    if (cond(1, 5, 3) != 2 + 8) { return 3; }
+    // Short-circuit order, in conditions and as values.
+    trace = 0;
+    if (t(1, 0) && t(2, 1)) { return 4; }
+    if (t(3, 1) || t(4, 1)) { trace = trace * 10 + 5; }
+    if (trace != 135) { return 5; }
+    trace = 0;
+    int v = t(1, 1) && t(2, 0) || t(3, 1);
+    if (v != 1 || trace != 123) { return 6; }
+    trace = 0;
+    v = (t(1, 0) || t(2, 0)) && t(3, 1);
+    if (v != 0 || trace != 12) { return 7; }
+    // A global on the left is read before the call on the right changes it.
+    g = 10;
+    if (g + bump() != 11) { return 8; }
+    if (g * bump() != 15) { return 9; }
+    // Arguments, left-to-right side effects and stable ones in between.
+    trace = 0;
+    int x = 7;
+    if (six(t(1, 1), 2, x, t(2, 4), 5, t(3, 6)) != 127456 || trace != 123) { return 10; }
+    g = 3;
+    if (six(g, bump(), g, x, 0, 9) != 318709) { return 11; }
+    if (seven(1, 2, 3, 4, 5, 6, t(4, 7)) != 1234567) { return 12; }
+    // Stores with leaf and computed values.
+    int buf = alloc(32);
+    store64(buf, x);
+    store64(buf + 8, x * 3);
+    store8(buf + 16, 200);
+    buf[17] = x;
+    buf[18] = x + 1;
+    if (load64(buf) != 7 || load64(buf + 8) != 21 || buf[16] != 200 || buf[17] != 7 || buf[18] != 8) { return 13; }
+    Box bx = alloc(sizeof(Box));
+    bx.a = x;
+    bx.b = bx.a * 2;
+    if (bx.a + bx.b != 21) { return 14; }
+    // Immediates, including negative ones.
+    if (x * 6 != 42 || x * (0 - 3) != 0 - 21) { return 15; }
+    if ((x & 3) != 3 || (x | 8) != 15 || (x ^ 5) != 2) { return 16; }
+    if (6 * x != 42 || 1 + x * 2 != 15) { return 17; }
+    // The left side of || jumps on truth, each comparison at its boundary.
+    int z = 0;
+    if (x == 6 || x != 7 || x < 7 || x <= 6 || x > 7 || x >= 8 || z) { return 18; }
+    if (!(x == 7 || z) || !(x != 6 || z) || !(x < 8 || z)) { return 19; }
+    if (!(x <= 7 || z) || !(x > 6 || z) || !(x >= 7 || z)) { return 20; }
+    return 42;
+}

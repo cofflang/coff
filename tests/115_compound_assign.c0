@@ -1,0 +1,24 @@
+// expect: 8
+//
+// tests/115_compound_assign.c0 - the compound assignments += -= *= /= %=
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// += -= *= /= %= are sugar for lhs = (lhs OP rhs). The right side is a full
+// expression. Works on plain variables and on indexed lvalues. Each check
+// that holds adds one.
+int main() {
+    int ok = 0;
+    int x = 10;
+    x += 5;  if (x == 15) { ok = ok + 1; }
+    x -= 3;  if (x == 12) { ok = ok + 1; }
+    x *= 2;  if (x == 24) { ok = ok + 1; }
+    x /= 5;  if (x == 4) { ok = ok + 1; }
+    x %= 3;  if (x == 1) { ok = ok + 1; }
+    int y = 2;
+    y += 3 * 4;  if (y == 14) { ok = ok + 1; }
+    int buf = alloc(8);
+    store8(buf, 40);
+    buf[0] += 2;  if (buf[0] == 42) { ok = ok + 1; }
+    buf[0] *= 2;  if (buf[0] == 84) { ok = ok + 1; }
+    return ok;
+}

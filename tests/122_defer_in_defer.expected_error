@@ -1,0 +1,1 @@
+coff0: tests/122_defer_in_defer.c0:8: 'defer' inside a defer

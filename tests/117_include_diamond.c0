@@ -1,0 +1,15 @@
+// expect: 45
+//
+// tests/117_include_diamond.c0 - a file included along two paths is spliced once
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// A diamond: this file includes both arms, and each arm includes
+// diamond_common.c0. include-once splices the shared file exactly once, so
+// diamond_base is defined once rather than twice (which would be a
+// redefinition error). 22 + 23 = 45.
+include "include_fixtures/diamond_left.c0";
+include "include_fixtures/diamond_right.c0";
+
+int main() {
+    return diamond_left_val() + diamond_right_val();
+}

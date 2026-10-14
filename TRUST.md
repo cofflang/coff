@@ -6,14 +6,9 @@ changing how any of the three are built, and it takes priority over
 convenience, build speed and elegance.
 
 It is written from the point of view of my own working tree, where the
-compiler and the kernel sit next to each other and the bootstrap binaries are
-checked in. This repository commits no binaries, so where the text says a
-binary is "committed" or "hash-gated", read that as a statement about that
-tree; the checks themselves ship here and report SKIP for anything that is not
-present.
-
-Last full review: 2026-09-17, when smed took over building the kernel. The
-first full review was 2026-09-05, when smed itself landed.
+compiler and the kernel sit next to each other. No binary is committed in
+either place. The compilers are built from source into the tree, and the checks
+ship here and report SKIP for anything that is not present.
 
 ## The threat
 
@@ -42,21 +37,21 @@ of forcing that mistake into the open.
 
 ## This is not hypothetical here
 
-A working Thompson attack was built against this exact toolchain on
-2026-09-05, as a test of whether the defences detect anything. A shim standing
+A working Thompson attack was built against this exact toolchain, as a test
+of whether the defences detect anything. A shim standing
 in for a compromised gcc silently altered the `coff0` it emitted, leaving
 `coff0.c` byte-identical to git. Results:
 
 - The kernel's password check was made to always succeed. The payload
   existed in no source file.
 - **The whole test suite passed. Both bootstrap fixpoints passed. The
-  committed-artifact checks passed.** A green suite on a compromised machine.
+  in-tree binary checks passed.** A green suite on a compromised machine.
 - A stage1-only DDC check **also passed**, because the payload fired on a
   program the compiler never compiles while checking itself.
 - Corpus-wide DDC, with the kernel sources in the corpus, **caught it** — the
   diff showed the password check reduced to `mov rax, 1 / ret`.
 
-That last iteration is why the DDC stage compares every c0 source it can find
+That last result is why the DDC stage compares every c0 source it can find
 rather than one.
 The check that only looked at the compiler compiling itself was worthless
 against a payload aimed at the kernel.
@@ -69,10 +64,10 @@ automated fails the build when it is wrong.
 | Component | Role | Status |
 |---|---|---|
 | `coff1` binary | compiles the kernel | **checked** — byte-verified against a fresh bootstrap; hash-gated on every kernel build |
-| `c0/coff.c0` | source of `coff1` | readable, about 3100 lines, in git, hashed in the manifest |
+| `c0/coff.c0` | source of `coff1` | readable, about 3600 lines, in git, hashed in the manifest |
 | `coff0` binary | bootstraps `coff1` once | **checked** — byte-verified against a fresh build of `coff0.c` |
-| `coff0.c` | the seed compiler | readable, about 2700 lines of plain C, hashed. Buildable by gcc, **tcc and cproc** |
-| gcc | *optional* | **no longer required.** See "gcc is out of the trusted base" |
+| `coff0.c` | the seed compiler | readable, about 3200 lines of plain C, hashed. Buildable by gcc, **tcc and cproc** |
+| gcc | *optional* | **not required.** See "gcc is out of the trusted base" |
 | **tcc 0.9.28** | builds `coff0` | **partially mitigated** — DDC-cross-checked against gcc **and cproc** over the whole corpus. Not yet from a bootstrapped seed |
 | **cproc + QBE** (pinned commits, see `fetch_ddc_cproc.sh`) | third DDC witness | built by tcc, not gcc; independent authors (Michael Forney, Quentin Carbonneaux). Diversifies the compilation proper only. It uses the system `cpp` (gcc's preprocessor), GNU as/ld and glibc, so those are not cross-checked by this leg |
 | `smed` binary | assembles and links `coff1`, every c0 program, **and the kernel** | **checked** — `smed.s` byte-verified as `coff1`'s output for `c0/smed.c0`, the binary byte-verified as smed's own output for `smed.s`; hash-gated on every kernel build like `coff1`; differential-tested against as+ld over the whole corpus and over the kernel's hand-written assembly and layout |
@@ -80,10 +75,10 @@ automated fails the build when it is wrong.
 | GNU as 2.47.0 | *off every build path.* Produces the very first `smed` once, the way a C compiler produces `coff0` once | **removed from the per-build base.** Kept installed as smed's oracle in `smed_tests.sh`; Thompson's own example of a better hiding place than a compiler |
 | GNU ld 2.47.0 | *off every build path.* Same one-time role | **removed from the per-build base.** Same |
 | glibc | linked into `coff0` only | `coff1` is statically linked and uses raw syscalls, so glibc is in the seed path only, never per-build |
-| the kernel's generators | pack compiler output into files the shipped kernel embeds | **checked** — written in c0 since 2026-09-17, so they are in the DDC corpus and hashed; output byte-identical to the python scripts they replaced. python3 is off the build path entirely and survives only in the QEMU test harness |
+| the kernel's generators | pack compiler output into files the shipped kernel embeds | **checked** — written in c0, so they are in the DDC corpus and hashed. python3 is off the build path entirely and appears only in the QEMU test harness |
 | kernel test programs, `tests/` | test data that becomes kernel content | **hashed** — see "the xz lesson" |
 | Build scripts | decide what gets compiled | **hashed** — build code is code |
-| `--elf` target | builds every ring-3 program baked into the kernel | **checked** — since 2026-09-17 the same assembly backend as the kernel with Moonshot's syscall numbers, present in `coff0.c` too, so `coff0 --elf` and `coff1 --elf` are diffed over every ring-3 program on every test run and the corpus DDC covers them; smed makes the ELF. The hand-encoded machine-code backend that stood here, outside every check, is deleted |
+| `--elf` target | builds every ring-3 program baked into the kernel | **checked** — the same assembly backend as the kernel with Moonshot's syscall numbers, present in `coff0.c` too, so `coff0 --elf` and `coff1 --elf` are diffed over every ring-3 program on every test run and the corpus DDC covers them; smed makes the ELF |
 | the audit's `cmp` and `sha256sum` | every byte-identity verdict and every manifest hash | **cross-checked**. `c0/cmp.c0` and `c0/sha256.c0` are built by the freshly verified `coff1`, and from that point every comparison and every manifest hash runs through both them and the system tools. Any disagreement fails the audit and blocks `--write-manifest`. A lie needs both inspectors to lie identically, and they share no code or compiler. **Limit.** The checks that verify `coff1` itself run before the c0 tools exist, so those use the system `cmp` alone. The c0 tools are also linked by GNU as/ld inside the audit, since smed is not yet verified at that point |
 | **the audit's other tools** | `diff`, `readelf`, `objdump`, `strings`, `grep`, `as`, `ld`, bash (and python3 in the kernel's QEMU test harness) | **UNMITIGATED.** The inspectors are built by the same toolchain they inspect |
 | the ISO builder | produces the bootable image | in the boot path, not in the kernel image |
@@ -91,9 +86,9 @@ automated fails the build when it is wrong.
 
 ## gcc is out of the trusted base
 
-Measured 2026-09-05: `coff0` built by **tcc alone**, with gcc absent from the
-entire chain, bootstraps a `coff1` that is **byte-identical** to the committed
-one, and that `coff1` emits **byte-identical** assembly for the kernel. The
+`coff0` built by **tcc alone**, with gcc absent from the entire chain,
+bootstraps a `coff1` that is **byte-identical** to the one a gcc-built `coff0`
+bootstraps, and that `coff1` emits **byte-identical** assembly for the kernel. The
 full suite passes gcc-free (`CC=tcc ./run_tests.sh`).
 
 This matters more than it first looks. gcc is reachable from nothing — there
@@ -104,14 +99,14 @@ documented source, up through `hex1`/`hex2`/`M0`/`M1`/`M2-Planet`, GNU Mes and
 MesCC, to a self-hosting tcc. Guix has shipped a full-source bootstrap on this
 basis since 2022.
 
-So the kernel now has a **credible path to a full-source bootstrap**:
+So the kernel has a **credible path to a full-source bootstrap**:
 
 ```
 hex0 (357 bytes, hand-auditable)
   -> hex1 -> hex2 -> M0 -> M1 -> M2-Planet
   -> GNU Mes / MesCC
   -> tcc
-  -> coff0        (about 2000 lines of C, hand-auditable)
+  -> coff0        (about 3200 lines of C, hand-auditable)
   -> coff1        (self-hosted c0)
   -> the kernel
 ```
@@ -125,14 +120,15 @@ Note the honest gap: the tcc in use here was built by gcc, so it is not yet
 independent of gcc. It raises the bar a long way — gcc would have to recognise
 tcc's source, inject a payload surviving tcc's self-hosting, and have that
 payload recognise `coff0.c` — but it is not the same as a tcc from the hex0
-seed. Closing that is item 2 below.
+seed. Closing that is item 1 under "Open work" below.
 
 ## What is checked, and by what
 
 **`./verify_bootstrap.sh`** — the full audit, four stages:
 
-1. Committed artifacts byte-match a fresh rebuild from source (SKIP here,
-   where nothing is committed; the rebuild itself still has to succeed).
+1. The in-tree binaries byte-match a fresh rebuild from source (SKIP on a
+   fresh clone where nothing has been built yet; the rebuild itself still has
+   to succeed).
 2. Bootstrap fixpoint (stage1 == stage2 == stage3).
 3. Determinism and environment independence — output must be identical under
    a hostile locale (`tr_TR`, where `toupper('i')` is not `'I'`; the classic
@@ -143,23 +139,28 @@ seed. Closing that is item 2 below.
    noise without it.
 4. Diverse double-compiling over every c0 source it can find — the tests,
    the compiler, smed, and the kernel sources when that tree sits next to
-   this one — plus manifest validation.
+   this one — plus manifest validation. It runs against every diverse
+   compiler it finds, not just the first. cproc with QBE, fetched and built
+   with tcc at pinned commits by `fetch_ddc_cproc.sh` into
+   `~/.local/opt/c0-ddc`, is the third, and tcc-built, gcc-built and
+   cproc-built `coff0` agree byte for byte over the whole corpus. One extra
+   instruction planted in the `coff0.c` given to cproc makes DDC report a
+   mismatch on every file it touches.
 
 **`./run_tests.sh`** — the unit tests, the differential stages and the
-fixpoint checks, including the committed-artifact checks. `CC=tcc` runs the
+fixpoint checks, including the in-tree binary checks. `CC=tcc` runs the
 whole thing without gcc.
 
 **The kernel build** — hash-gates `coff1` **and `smed`** on every build and
-refuses to produce a kernel on mismatch. Since this repository commits no
-binaries and its manifest records none, the kernel's build script keeps its
-own record of both hashes, written right after a passing audit and nowhere
+refuses to produce a kernel on mismatch. No binary is committed and the
+manifest records none, so the kernel's build script keeps its own record of both hashes, written right after a passing audit and nowhere
 else. A binary with no recorded hash at all is unverified, not tampered: it
 gets the full audit before building anything. Re-bootstraps and re-runs the
 full audit when `coff.c0` or `smed.c0` moves; a rebuilt smed is assembled by
 the smed already present, and by as+ld only when there is none, which is the
 one-time seed. Prefers tcc as the seed compiler when present. Fails closed.
 The kernel image itself is one smed call, reading the same linker script GNU
-ld used to read, so the oracle below consumes the same inputs.
+ld reads, so the oracle below consumes the same inputs.
 
 **`./smed_tests.sh`** — five checks on the assembler: a differential corpus
 against as+ld over every c0 source, the compiler rebuilding itself through
@@ -169,15 +170,14 @@ inputs -- by as+ld and by smed -- with the layout compared where the linker
 script fixes it (entry, multiboot header, reservation sizes, alignments) and
 the hand-written assembly compared as disassembled instruction sequences
 (encodings differ on purpose, small immediates must not). Every half of the
-kernel check was validated by a mutation it catches; six deliberate encoding
-mutations were also each caught by the kernel's own suite, three of them
+kernel check catches a deliberate mutation, and six deliberate encoding
+mutations are each caught by the kernel's own suite as well, three of them
 before the first serial byte. The check runs only when that tree sits next
 to this one, and reports SKIP otherwise.
 
-**`BOOTSTRAP.sha256`** — hashes of every bootstrap artifact, every build
-script, the kernel's generators and the whole test corpus, plus the versions
-of every tool trusted to produce them. In this repository it covers sources,
-scripts and tests, since no binaries are committed, and nothing outside this
+**`BOOTSTRAP.sha256`** — hashes of every source, every script and the whole
+test corpus, plus the versions of every tool trusted to build from them. It
+records no binary, since none is committed, and nothing outside this
 repository, so the same committed file matches whether or not the kernel sits
 next to it. Regenerate deliberately with `--write-manifest`; never to make a
 failure go away.
@@ -220,26 +220,20 @@ rests on. c0 versions of both, built by the verified `coff1`, cross-check
 the system ones (see the table above).
 
 **smed has no diverse implementation.** smed is checked against GNU as over
-the whole corpus and over the kernel's hand-written assembly today, which is a real oracle and caught a
-flipped `sub` direction bit immediately (13 programs diverged). But that
-oracle is the very tool that has been removed from the build, so it
-disappears the day binutils is uninstalled. A second c0 assembler, or a
+the whole corpus and over the kernel's hand-written assembly, which is a real
+oracle. A flipped `sub` direction bit makes 13 programs diverge at once. But
+that oracle is the very tool that is off the build, so it disappears the day
+binutils is uninstalled. A second c0 assembler, or a
 byte-level comparison against a disassembler, would be the durable answer.
 
-**The machine-code backend is gone, which closed the largest hole.** Until
-2026-09-17 `--elf` selected a second backend inside `coff.c0` that wrote
-x86-64 bytes directly, with its own label and call patching and its own ELF
-writer, and `coff0.c` had nothing like it, so the code path that produced
-every program running inside the operating system was the one path with no oracle of any
-kind. Several silent wrong-code bugs were found in it by eye. Rather than
-build an oracle for it, it was removed: `--elf` is now a target of the one
-assembly backend (a handful of emit lines that differ in a syscall number),
-mirrored in `coff0.c`, and smed assembles the result at the ring-3 base.
-Ring-3 code therefore gets exactly the coverage the kernel gets, the
-`coff0`-versus-`coff1` diff and the corpus DDC, plus smed's own oracle. It
-also gained globals, function pointers and stack-passed arguments, which the
-old backend refused. What remains true is the sentence above: smed has no
-diverse implementation.
+**One backend, so ring-3 code has an oracle.** `--elf` is a target of the
+one assembly backend (a handful of emit lines that differ in a syscall
+number), mirrored in `coff0.c`, and smed assembles the result at the ring-3
+base. Ring-3 code therefore gets exactly the coverage the kernel gets, the
+`coff0`-versus-`coff1` diff and the corpus DDC, plus smed's own oracle. A
+second backend that wrote machine code directly would have none of that,
+which is why there is no such backend. What remains true is the sentence
+above: smed has no diverse implementation.
 
 The `--elf` target is a coff feature aimed at Moonshot, and it is in this
 repository; the kernel and its ring-3 programs are not, so the coverage
@@ -250,8 +244,8 @@ claims above describe what runs when both trees are checked out together.
 1. **No binary enters a build path without a byte-check against source.** New
    tool, generator or prebuilt artifact: it gets a row in the table and a
    check in `verify_bootstrap.sh`, or it does not join.
-2. **Never trust a timestamp.** The kernel build once gated `coff1` on
-   `[ "$COFF_SRC" -nt "$COFF1" ]`, which a tampered binary answers correctly.
+2. **Never trust a timestamp.** A gate like `[ "$COFF_SRC" -nt "$COFF1" ]`
+   is one a tampered binary answers correctly.
 3. **Keep the seed readable and portable.** `coff0.c` is the only artifact
    small enough to audit in an afternoon and the only reason tcc, DDC and the
    full-source bootstrap path are available at all. Do not retire it because
@@ -262,43 +256,22 @@ claims above describe what runs when both trees are checked out together.
    source, it belongs in the corpus.
 5. **Test data is code.** Anything that reaches the kernel is reviewed and
    hashed as source, however it is labelled.
-6. **Prefer removing a tool to verifying it.** smed removing `as` and `ld`
-   was worth more than any amount of checking them, and deleting the
-   machine-code backend did more for ring-3 code than any oracle built
-   for it would have.
+6. **Prefer removing a tool to verifying it.** smed taking the place of `as`
+   and `ld` is worth more than any amount of checking them, and a single
+   backend does more for ring-3 code than any oracle for a second one could.
 7. **Determinism before diversity.** Any nondeterminism in coff's output
    blinds DDC and must be fixed before it is treated as noise.
 
 ## Open work, in priority order
 
-1. ~~**smed milestone two: the kernel.**~~ Done 2026-09-17. `as` and `ld`
-   are off every build path; see the table.
-2. ~~**Retire python3 from the kernel build.**~~ Done 2026-09-17: the three
-   python generators were rewritten in c0, with byte-identical output. A
-   post-bootstrap kernel build now needs nothing but `coff1`, `smed`, bash
-   and an ISO builder.
-3. **Get tcc from a bootstrapped seed instead of from gcc.** Run
+1. **Get tcc from a bootstrapped seed instead of from gcc.** Run
    `live-bootstrap` (or Guix's full-source bootstrap) to produce a tcc
    descended from the 357-byte hex0 seed, then re-run DDC against it. That
    converts the tcc row from "partially mitigated" to something close to
    settled, and makes the full-source bootstrap real rather than credible.
-4. ~~**Give the `--elf` backend an oracle.**~~ Done 2026-09-17 by removing
-   the backend instead (see "The machine-code backend is gone"). The
-   `--elf` target lives in both compilers and the diff covers every ring-3
-   program.
-5. **Audit `coff0.c` by hand, once, and record the date.** About 2700
+2. **Audit `coff0.c` by hand, once, and record the date.** About 3200
    lines, one sitting. It is the only artifact where this is feasible, which
    is exactly why it is worth doing.
-6. ~~**Add a third diverse compiler.**~~ Done with cproc and QBE, fetched
-   and built with tcc at pinned commits by `fetch_ddc_cproc.sh` into
-   `~/.local/opt/c0-ddc`. verify_bootstrap.sh runs DDC against every diverse
-   compiler it finds, not just the first, and tcc-built, gcc-built and
-   cproc-built coff0 agree byte for byte over the whole corpus. Validated by
-   planting one extra instruction in the coff0.c given to cproc, after which
-   DDC reported a mismatch on every file it touched.
-7. **Consider dropping committed binaries from my working tree.** All are
-   reproducible in under a second; this repository already commits none.
-   That would delete the surface rather than guard it.
 
 ## What none of this achieves
 
@@ -311,7 +284,7 @@ but the builder.
 What is achieved is narrower and real: every binary between `coff0.c` and a
 running kernel is derived from source in this repository and continuously
 checked to still be; a tampered compiler or assembler cannot silently build
-a kernel; gcc, as and ld have been removed from the per-build set; the compiler is verified against an
+a kernel; gcc, as and ld are not in the per-build set; the compiler is verified against an
 independent implementation over the code that actually matters; and the
 remaining trusted components are enumerated rather than forgotten. One of
 those remains genuinely open rather than merely acknowledged, the audit

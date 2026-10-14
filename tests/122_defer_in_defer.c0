@@ -1,0 +1,10 @@
+// expect: compile-error
+//
+// tests/122_defer_in_defer.c0 - a defer inside a deferred statement is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// The epilogue is generated once, so a defer inside a defer is refused.
+int main() {
+    defer { defer print("x"); }
+    return 0;
+}

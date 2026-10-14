@@ -1,5 +1,0 @@
-// expect: compile-error
-//
-// tests/77_lone_bang.c0 - a lone ! is not an operator in c0
-// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
-int main() { return !1; }

@@ -1,0 +1,24 @@
+// expect: 42
+//
+// tests/118_multi_return.c0 - a function returning two values, taken with a, b = f(...)
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// (int, int) functions return two values, in rax and rdx; the caller takes
+// them with `a, b = f(...)`. The right side must be a call to such a function,
+// and resolve() checks the arity on both sides.
+(int, int) divmod(int a, int b) {
+    return a / b, a % b;
+}
+(int, int) minmax(int a, int b) {
+    if (a < b) { return a, b; }
+    return b, a;
+}
+int main() {
+    int q = 0;
+    int r = 0;
+    q, r = divmod(17, 5);
+    int lo = 0;
+    int hi = 0;
+    lo, hi = minmax(9, 4);
+    return q + r + lo + hi + 24;
+}

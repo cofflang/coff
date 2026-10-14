@@ -35,7 +35,9 @@
 //   16 RPAREN, 17 LBRACE, 18 RBRACE, 19 SEMI, 20 COMMA, 21 INT, 22 IF,
 //   23 ELSE, 24 WHILE, 25 RETURN, 26 EOF, 27 AND, 28 OR, 29 BREAK, 30 CONTINUE,
 //   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN, 35 DOT, 36 LAYOUT, 37 SIZEOF,
-//   38 PERCENT, 39 AMP, 40 PIPE, 41 CARET, 42 TILDE, 43 SHL, 44 SHR.
+//   38 PERCENT, 39 AMP, 40 PIPE, 41 CARET, 42 TILDE, 43 SHL, 44 SHR, 45 NOT,
+//   46 PLUSEQ, 47 MINUSEQ, 48 STAREQ, 49 SLASHEQ, 50 PERCENTEQ, 51 FOR,
+//   52 DEFER.
 // An AST node is 64 bytes — 0 kind, 8 ival, 16 name/str ptr, 24 str len,
 //   32 child1 (lhs/cond/args/body), 40 child2 (rhs/then), 48 child3 (else),
 //   56 next sibling.
@@ -50,7 +52,9 @@
 //   parse.c0 only dumps the raw form, coff0's resolve pass is what
 //   rewrites it to a NUM, so -a output shows it as-is here),
 //   33 MOD (child1 % child2, same shape as DIV), 34 BITAND, 35 BITOR,
-//   36 BITXOR, 37 SHL, 38 SHR (binary, same shape), 39 BITNOT (unary, like NEG).
+//   36 BITXOR, 37 SHL, 38 SHR (binary, same shape), 39 BITNOT (unary, like NEG),
+//   40 FORLOOP (child1=cond, child2=body, child3=step), 41 MULTIASSIGN
+//   (child1=call, child2=target1, child3=target2), 42 DEFER (child1=stmt).
 // A layout record is 24 bytes — 0 name, 8 fields (head of a linked list),
 //   16 next. A layout field record is 16 bytes — 0 name, 8 next.
 // Precedence, low to high, is logic_or, logic_and, | ^ &, equality,
@@ -68,6 +72,9 @@ int tpos = 0;
 int INCLUDE_MAX_DEPTH = 32;
 int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
 int include_depth = 0;
+int MAX_INCLUDED = 256;
+int included = 0; // alloc'd once, every file ever spliced (include-once)
+int n_included = 0;
 int EXPAND_CAP = 4194304; // 4MB
 int expand_buf = 0;
 int expand_len = 0;
@@ -106,14 +113,14 @@ void print_int(int v) {
     int tmp = alloc(32);
     int neg = 0;
     int i = 31;
-    if (v == 0) { print("0"); return; }
+    if (!v) { print("0"); return; }
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         store8(tmp + i, '0' + (v % 10));
-        v = v / 10;
+        v /= 10;
     }
-    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    if (neg == 1) { i -= 1; store8(tmp + i, '-'); }
     print(tmp + i);
     return;
 }
@@ -123,9 +130,9 @@ int word_is(int buf, int start, int len, int kw) {
     int k = 0;
     while (i < len) {
         k = load8(kw + i);
-        if (k == 0) { return 0; }
+        if (!k) { return 0; }
         if (load8(buf + start + i) != k) { return 0; }
-        i = i + 1;
+        i += 1;
     }
     if (load8(kw + len) != 0) { return 0; }
     return 1;
@@ -134,9 +141,8 @@ int word_is(int buf, int start, int len, int kw) {
 int copy_bytes(int buf, int start, int len) {
     int p = alloc(len + 1);
     int i = 0;
-    while (i < len) {
+    for (i = 0; i < len; i += 1) {
         store8(p + i, load8(buf + start + i));
-        i = i + 1;
     }
     return p;
 }
@@ -151,7 +157,7 @@ int copy_bytes(int buf, int start, int len) {
 int slen(int s) {
     int i = 0;
     while (load8(s + i) != 0) {
-        i = i + 1;
+        i += 1;
     }
     return i;
 }
@@ -164,8 +170,8 @@ int streq_(int a, int b) {
         int ca = load8(a + i);
         int cb = load8(b + i);
         if (ca != cb) { going = 0; }
-        else if (ca == 0) { going = 0; result = 1; }
-        else { i = i + 1; }
+        else if (!ca) { going = 0; result = 1; }
+        else { i += 1; }
     }
     return result;
 }
@@ -175,12 +181,11 @@ int streq_(int a, int b) {
 // if `path` has no slash (same-directory relative resolution).
 int dirname_with_slash(int path) {
     int len = slen(path);
-    int i = len - 1;
-    while (i >= 0) {
+    int i = 0;
+    for (i = len - 1; i >= 0; i -= 1) {
         if (load8(path + i) == '/') {
             return copy_bytes(path, 0, i + 1);
         }
-        i = i - 1;
     }
     int empty = alloc(1);
     store8(empty, 0);
@@ -192,14 +197,12 @@ int join_path(int dir, int rel) {
     int rl = slen(rel);
     int out = alloc(dl + rl + 1);
     int i = 0;
-    while (i < dl) {
+    for (i = 0; i < dl; i += 1) {
         store8(out + i, load8(dir + i));
-        i = i + 1;
     }
     int j = 0;
-    while (j < rl) {
+    for (j = 0; j < rl; j += 1) {
         store8(out + dl + j, load8(rel + j));
-        j = j + 1;
     }
     store8(out + dl + rl, 0);
     return out;
@@ -211,7 +214,7 @@ void expand_putc(int c) {
         exit(1);
     }
     store8(expand_buf + expand_len, c);
-    expand_len = expand_len + 1;
+    expand_len += 1;
     return;
 }
 
@@ -228,19 +231,29 @@ void expand_putc(int c) {
 // contains `!= '"'`).
 void expand_file(int path) {
     int i = 0;
-    while (i < include_depth) {
+    for (i = 0; i < include_depth; i += 1) {
         if (streq_(load64(include_stack + i * 8), path) == 1) {
             print("PARSEERROR\n");
             exit(1);
         }
-        i = i + 1;
     }
     if (include_depth >= INCLUDE_MAX_DEPTH) {
         print("PARSEERROR\n");
         exit(1);
     }
+    // Include-once, so a file reached a second time (a diamond) is skipped.
+    i = 0;
+    for (i = 0; i < n_included; i += 1) {
+        if (streq_(load64(included + i * 8), path) == 1) { return; }
+    }
+    if (n_included >= MAX_INCLUDED) {
+        print("PARSEERROR\n");
+        exit(1);
+    }
+    store64(included + n_included * 8, path);
+    n_included += 1;
     store64(include_stack + include_depth * 8, path);
-    include_depth = include_depth + 1;
+    include_depth += 1;
 
     int fd = open_read(path);
     if (fd < 0) {
@@ -251,7 +264,7 @@ void expand_file(int path) {
     int n = 0;
     int got = read(fd, src, 1048576);
     while (got > 0) {
-        n = n + got;
+        n += got;
         got = read(fd, src + n, 1048576 - n);
     }
     close(fd);
@@ -262,7 +275,7 @@ void expand_file(int path) {
         int c = load8(src + p);
         if (c == '"') {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
             int scanning = 1;
             while (scanning == 1) {
                 if (p >= n || load8(src + p) == '"') { scanning = 0; }
@@ -270,76 +283,75 @@ void expand_file(int path) {
                     int sc = load8(src + p);
                     if (sc == '\\' && p + 1 < n) {
                         expand_putc(sc);
-                        p = p + 1;
+                        p += 1;
                         expand_putc(load8(src + p));
-                        p = p + 1;
+                        p += 1;
                     } else {
                         expand_putc(sc);
-                        p = p + 1;
+                        p += 1;
                     }
                 }
             }
-            if (p < n) { expand_putc('"'); p = p + 1; }
+            if (p < n) { expand_putc('"'); p += 1; }
         } else if (c == '\'') {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
             if (p < n && load8(src + p) == '\\' && p + 1 < n) {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             } else if (p < n) {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             }
             if (p < n && load8(src + p) == '\'') {
                 expand_putc('\'');
-                p = p + 1;
+                p += 1;
             }
         } else if (c == '/' && p + 1 < n && load8(src + p + 1) == '/') {
             while (p < n && load8(src + p) != '\n') {
                 expand_putc(load8(src + p));
-                p = p + 1;
+                p += 1;
             }
         } else if (is_ident_start(c) == 1) {
             int start = p;
             while (p < n && is_ident_char(load8(src + p)) == 1) {
-                p = p + 1;
+                p += 1;
             }
             int wlen = p - start;
             if (wlen == 7 && word_is(src, start, 7, "include") == 1) {
                 int q = p;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
-                    q = q + 1;
+                    q += 1;
                 }
                 if (q >= n || load8(src + q) != '"') { print("PARSEERROR\n"); exit(1); }
-                q = q + 1;
+                q += 1;
                 int pstart = q;
-                while (q < n && load8(src + q) != '"') { q = q + 1; }
+                while (q < n && load8(src + q) != '"') { q += 1; }
                 if (q >= n) { print("PARSEERROR\n"); exit(1); }
                 int rel = copy_bytes(src, pstart, q - pstart);
-                q = q + 1;
+                q += 1;
                 while (q < n && (load8(src + q) == ' ' || load8(src + q) == '\t' || load8(src + q) == '\n' || load8(src + q) == 13)) {
-                    q = q + 1;
+                    q += 1;
                 }
                 if (q >= n || load8(src + q) != ';') { print("PARSEERROR\n"); exit(1); }
-                q = q + 1;
+                q += 1;
                 expand_file(join_path(dir, rel));
                 p = q;
             } else {
-                int k = start;
-                while (k < p) {
+                int k = 0;
+                for (k = start; k < p; k += 1) {
                     expand_putc(load8(src + k));
-                    k = k + 1;
                 }
             }
         } else {
             expand_putc(c);
-            p = p + 1;
+            p += 1;
         }
     }
 
-    include_depth = include_depth - 1;
+    include_depth -= 1;
     return;
 }
 
@@ -388,10 +400,10 @@ void lex_all(int buf, int n) {
     while (pos < n) {
         c = load8(buf + pos);
 
-        if (c == ' ') { pos = pos + 1; }
-        else if (c == '\n') { pos = pos + 1; }
-        else if (c == '\t') { pos = pos + 1; }
-        else if (c == 13) { pos = pos + 1; }
+        if (c == ' ') { pos += 1; }
+        else if (c == '\n') { pos += 1; }
+        else if (c == '\t') { pos += 1; }
+        else if (c == 13) { pos += 1; }
 
         else if (c == '/') {
             nxt = 0;
@@ -400,14 +412,18 @@ void lex_all(int buf, int n) {
                 going = 1;
                 while (going == 1) {
                     if (pos < n) {
-                        if (load8(buf + pos) != '\n') { pos = pos + 1; }
+                        if (load8(buf + pos) != '\n') { pos += 1; }
                         else { going = 0; }
                     } else { going = 0; }
                 }
+            } else if (nxt == '=') {
+                tok_put(t, 49, 0, 0, 0);
+                t += 1;
+                pos += 2;
             } else {
                 tok_put(t, 7, 0, 0, 0);
-                t = t + 1;
-                pos = pos + 1;
+                t += 1;
+                pos += 1;
             }
         }
 
@@ -421,7 +437,7 @@ void lex_all(int buf, int n) {
                     is_hex = 1;
                 }
             }
-            if (is_hex == 1) { pos = pos + 2; base = 16; }
+            if (is_hex == 1) { pos += 2; base = 16; }
             going = 1;
             while (going == 1) {
                 if (pos < n) {
@@ -429,16 +445,16 @@ void lex_all(int buf, int n) {
                     if (base == 16) {
                         if (is_hex_digit(d) == 1) {
                             v = v * 16 + hex_value(d);
-                            pos = pos + 1;
+                            pos += 1;
                         } else { going = 0; }
                     } else if (is_digit(d) == 1) {
                         v = v * 10 + (d - '0');
-                        pos = pos + 1;
+                        pos += 1;
                     } else { going = 0; }
                 } else { going = 0; }
             }
             tok_put(t, 1, v, 0, 0);
-            t = t + 1;
+            t += 1;
         }
 
         else if (is_ident_start(c) == 1) {
@@ -446,7 +462,7 @@ void lex_all(int buf, int n) {
             going = 1;
             while (going == 1) {
                 if (pos < n) {
-                    if (is_ident_char(load8(buf + pos)) == 1) { pos = pos + 1; }
+                    if (is_ident_char(load8(buf + pos)) == 1) { pos += 1; }
                     else { going = 0; }
                 } else { going = 0; }
             }
@@ -455,6 +471,8 @@ void lex_all(int buf, int n) {
             else if (word_is(buf, start, len, "if") == 1) { tok_put(t, 22, 0, 0, 0); }
             else if (word_is(buf, start, len, "else") == 1) { tok_put(t, 23, 0, 0, 0); }
             else if (word_is(buf, start, len, "while") == 1) { tok_put(t, 24, 0, 0, 0); }
+            else if (word_is(buf, start, len, "for") == 1) { tok_put(t, 51, 0, 0, 0); }
+            else if (word_is(buf, start, len, "defer") == 1) { tok_put(t, 52, 0, 0, 0); }
             else if (word_is(buf, start, len, "return") == 1) { tok_put(t, 25, 0, 0, 0); }
             else if (word_is(buf, start, len, "break") == 1) { tok_put(t, 29, 0, 0, 0); }
             else if (word_is(buf, start, len, "continue") == 1) { tok_put(t, 30, 0, 0, 0); }
@@ -466,11 +484,11 @@ void lex_all(int buf, int n) {
                 name = copy_bytes(buf, start, len);
                 tok_put(t, 2, 0, name, len);
             }
-            t = t + 1;
+            t += 1;
         }
 
         else if (c == '"') {
-            pos = pos + 1;
+            pos += 1;
             sbuf = alloc(n + 1);
             slen = 0;
             going = 1;
@@ -479,9 +497,9 @@ void lex_all(int buf, int n) {
                 s = load8(buf + pos);
                 if (s == '"') {
                     going = 0;
-                    pos = pos + 1;
+                    pos += 1;
                 } else if (s == '\\') {
-                    pos = pos + 1;
+                    pos += 1;
                     if (pos >= n) { perr(); }
                     e = load8(buf + pos);
                     v = 0 - 1;
@@ -491,25 +509,25 @@ void lex_all(int buf, int n) {
                     if (e == '"') { v = '"'; }
                     if (v < 0) { perr(); }
                     store8(sbuf + slen, v);
-                    slen = slen + 1;
-                    pos = pos + 1;
+                    slen += 1;
+                    pos += 1;
                 } else {
                     store8(sbuf + slen, s);
-                    slen = slen + 1;
-                    pos = pos + 1;
+                    slen += 1;
+                    pos += 1;
                 }
             }
             tok_put(t, 3, 0, sbuf, slen);
-            t = t + 1;
+            t += 1;
         }
 
         else if (c == '\'') {
-            pos = pos + 1;
+            pos += 1;
             if (pos >= n) { perr(); }
             v = 0 - 1;
             e = load8(buf + pos);
             if (e == '\\') {
-                pos = pos + 1;
+                pos += 1;
                 if (pos >= n) { perr(); }
                 q = load8(buf + pos);
                 if (q == 'n') { v = '\n'; }
@@ -520,77 +538,101 @@ void lex_all(int buf, int n) {
                 if (v < 0) {
                     if (q != '0') { perr(); }
                 }
-                pos = pos + 1;
+                pos += 1;
             } else {
                 if (e == '\'') { perr(); }
                 v = e;
-                pos = pos + 1;
+                pos += 1;
             }
             if (pos >= n) { perr(); }
             if (load8(buf + pos) != '\'') { perr(); }
-            pos = pos + 1;
+            pos += 1;
             tok_put(t, 1, v, 0, 0);
-            t = t + 1;
+            t += 1;
         }
 
         else if (c == '=') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 9, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 8, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '=') { tok_put(t, 9, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 8, 0, 0, 0); pos += 1; }
+            t += 1;
         }
         else if (c == '!') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 10, 0, 0, 0); pos = pos + 2; t = t + 1; }
-            else { perr(); }
+            if (nxt == '=') { tok_put(t, 10, 0, 0, 0); pos += 2; t += 1; }
+            else { tok_put(t, 45, 0, 0, 0); pos += 1; t += 1; }
         }
         else if (c == '<') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos = pos + 2; }
-            else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 11, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos += 2; }
+            else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 11, 0, 0, 0); pos += 1; }
+            t += 1;
         }
         else if (c == '>') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos = pos + 2; }
-            else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 13, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos += 2; }
+            else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 13, 0, 0, 0); pos += 1; }
+            t += 1;
         }
-        else if (c == '+') { tok_put(t, 4, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '-') { tok_put(t, 5, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '*') { tok_put(t, 6, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '%') { tok_put(t, 38, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '~') { tok_put(t, 42, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '(') { tok_put(t, 15, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ')') { tok_put(t, 16, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '{') { tok_put(t, 17, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '}') { tok_put(t, 18, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ';') { tok_put(t, 19, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ',') { tok_put(t, 20, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '+') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 46, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 4, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '-') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 47, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 5, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '*') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 48, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 6, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '%') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 50, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 38, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
+        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '~') { tok_put(t, 42, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '(') { tok_put(t, 15, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ')') { tok_put(t, 16, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '{') { tok_put(t, 17, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '}') { tok_put(t, 18, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ';') { tok_put(t, 19, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ',') { tok_put(t, 20, 0, 0, 0); t += 1; pos += 1; }
         else if (c == '&') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 39, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 39, 0, 0, 0); pos += 1; }
+            t += 1;
         }
         else if (c == '|') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
-            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos = pos + 2; }
-            else { tok_put(t, 40, 0, 0, 0); pos = pos + 1; }
-            t = t + 1;
+            if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 40, 0, 0, 0); pos += 1; }
+            t += 1;
         }
-        else if (c == '[') { tok_put(t, 31, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == ']') { tok_put(t, 32, 0, 0, 0); t = t + 1; pos = pos + 1; }
-        else if (c == '.') { tok_put(t, 35, 0, 0, 0); t = t + 1; pos = pos + 1; }
+        else if (c == '[') { tok_put(t, 31, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == ']') { tok_put(t, 32, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '.') { tok_put(t, 35, 0, 0, 0); t += 1; pos += 1; }
         else { perr(); }
     }
 
@@ -605,10 +647,8 @@ int param_name_at(int f, int i) {
     int k = 0;
     if (i < 6) { return load64(f + 16 + i * 8); }
     p = load64(f + 88);
-    k = i - 6;
-    while (k > 0) {
+    for (k = i - 6; k > 0; k -= 1) {
         p = load64(p + 8);
-        k = k - 1;
     }
     return load64(p);
 }
@@ -623,7 +663,7 @@ int new_node(int kind) {
 
 void expect(int k) {
     if (tok_kind(tpos) != k) { perr(); }
-    tpos = tpos + 1;
+    tpos += 1;
     return;
 }
 
@@ -636,7 +676,7 @@ int p_primary() {
     int a = 0;
     k = tok_kind(tpos);
     if (k == 15) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = p_expr();
         expect(16);
         return nd;
@@ -644,21 +684,21 @@ int p_primary() {
     if (k == 1) {
         nd = new_node(1);
         store64(nd + 8, tok_ival(tpos));
-        tpos = tpos + 1;
+        tpos += 1;
         return nd;
     }
     if (k == 3) {
         nd = new_node(2);
         store64(nd + 16, tok_name(tpos));
         store64(nd + 24, tok_len(tpos));
-        tpos = tpos + 1;
+        tpos += 1;
         return nd;
     }
     if (k == 2) {
         name = tok_name(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         if (tok_kind(tpos) == 15) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(6);
             store64(nd + 16, name);
             head = 0;
@@ -668,7 +708,7 @@ int p_primary() {
                 head = a;
                 tail = a;
                 while (tok_kind(tpos) == 20) {
-                    tpos = tpos + 1;
+                    tpos += 1;
                     a = p_expr();
                     store64(tail + 56, a);
                     tail = a;
@@ -683,12 +723,12 @@ int p_primary() {
         return nd;
     }
     if (k == 37) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(15);
         if (tok_kind(tpos) != 2) { perr(); }
         nd = new_node(32);
         store64(nd + 16, tok_name(tpos));
-        tpos = tpos + 1;
+        tpos += 1;
         expect(16);
         return nd;
     }
@@ -704,19 +744,19 @@ int p_postfix() {
     nd = p_primary();
     while (going == 1) {
         if (tok_kind(tpos) == 31) {
-            tpos = tpos + 1;
+            tpos += 1;
             idx = new_node(27);
             store64(idx + 32, nd);
             store64(idx + 40, p_expr());
             expect(32);
             nd = idx;
         } else if (tok_kind(tpos) == 35) {
-            tpos = tpos + 1;
+            tpos += 1;
             if (tok_kind(tpos) != 2) { perr(); }
             fld = new_node(30);
             store64(fld + 32, nd);
             store64(fld + 16, tok_name(tpos));
-            tpos = tpos + 1;
+            tpos += 1;
             nd = fld;
         } else { going = 0; }
     }
@@ -725,16 +765,27 @@ int p_postfix() {
 
 int p_unary() {
     int nd = 0;
+    int zero = 0;
     if (tok_kind(tpos) == 5) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(17);
         store64(nd + 32, p_unary());
         return nd;
     }
     if (tok_kind(tpos) == 42) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(39);
         store64(nd + 32, p_unary());
+        return nd;
+    }
+    // !E is sugar for (E == 0), so no new node kind is needed.
+    if (tok_kind(tpos) == 45) {
+        tpos += 1;
+        nd = new_node(11);
+        store64(nd + 32, p_unary());
+        zero = new_node(1);
+        store64(zero + 8, 0);
+        store64(nd + 40, zero);
         return nd;
     }
     return p_postfix();
@@ -749,19 +800,19 @@ int p_term() {
     while (going == 1) {
         op = tok_kind(tpos);
         if (op == 6) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(9);
             store64(nd + 32, left);
             store64(nd + 40, p_unary());
             left = nd;
         } else if (op == 7) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(10);
             store64(nd + 32, left);
             store64(nd + 40, p_unary());
             left = nd;
         } else if (op == 38) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(33);
             store64(nd + 32, left);
             store64(nd + 40, p_unary());
@@ -780,13 +831,13 @@ int p_add() {
     while (going == 1) {
         op = tok_kind(tpos);
         if (op == 4) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(7);
             store64(nd + 32, left);
             store64(nd + 40, p_term());
             left = nd;
         } else if (op == 5) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(8);
             store64(nd + 32, left);
             store64(nd + 40, p_term());
@@ -811,7 +862,7 @@ int p_rel() {
         if (op == 13) { kind = 15; }
         if (op == 14) { kind = 16; }
         if (kind > 0) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(kind);
             store64(nd + 32, left);
             store64(nd + 40, p_shift());
@@ -834,7 +885,7 @@ int p_equality() {
         if (op == 9) { kind = 11; }
         if (op == 10) { kind = 12; }
         if (kind > 0) {
-            tpos = tpos + 1;
+            tpos += 1;
             nd = new_node(kind);
             store64(nd + 32, left);
             store64(nd + 40, p_rel());
@@ -853,7 +904,7 @@ int p_shift() {
     while (tok_kind(tpos) == 43 || tok_kind(tpos) == 44) {
         if (tok_kind(tpos) == 43) { nd = new_node(37); }
         else { nd = new_node(38); }
-        tpos = tpos + 1;
+        tpos += 1;
         store64(nd + 32, left);
         store64(nd + 40, p_add());
         left = nd;
@@ -867,7 +918,7 @@ int p_bitand() {
     left = p_equality();
     while (tok_kind(tpos) == 39) {
         nd = new_node(34);
-        tpos = tpos + 1;
+        tpos += 1;
         store64(nd + 32, left);
         store64(nd + 40, p_equality());
         left = nd;
@@ -881,7 +932,7 @@ int p_bitxor() {
     left = p_bitand();
     while (tok_kind(tpos) == 41) {
         nd = new_node(36);
-        tpos = tpos + 1;
+        tpos += 1;
         store64(nd + 32, left);
         store64(nd + 40, p_bitand());
         left = nd;
@@ -895,7 +946,7 @@ int p_bitor() {
     left = p_bitxor();
     while (tok_kind(tpos) == 40) {
         nd = new_node(35);
-        tpos = tpos + 1;
+        tpos += 1;
         store64(nd + 32, left);
         store64(nd + 40, p_bitxor());
         left = nd;
@@ -908,7 +959,7 @@ int p_logic_and() {
     int nd = 0;
     left = p_bitor();
     while (tok_kind(tpos) == 27) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(23);
         store64(nd + 32, left);
         store64(nd + 40, p_bitor());
@@ -922,7 +973,7 @@ int p_logic_or() {
     int nd = 0;
     left = p_logic_and();
     while (tok_kind(tpos) == 28) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(24);
         store64(nd + 32, left);
         store64(nd + 40, p_logic_and());
@@ -951,7 +1002,7 @@ int const_fold(int nd) {
         if (k == 8) { return a - b; }
         if (k == 9) { return a * b; }
         if (k == 10 || k == 33) {
-            if (b == 0) { perr(); }
+            if (!b) { perr(); }
             if (b == 0 - 1 && a == 1 << 63) { perr(); }
             if (k == 10) { return a / b; }
             return a % b;
@@ -974,40 +1025,38 @@ int p_stmt() {
     int nd = 0;
     int name = 0;
     int k = 0;
-    int e = 0;
-    int out = 0;
     k = tok_kind(tpos);
     if (k == 17) { return p_block(); }
     // `int x` or `Layout x` (two identifiers in a row); -a shows no types.
     if (k == 21 || (k == 2 && tok_kind(tpos + 1) == 2)) {
-        tpos = tpos + 1;
+        tpos += 1;
         if (tok_kind(tpos) != 2) { perr(); }
         name = tok_name(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(5);
         store64(nd + 16, name);
         if (tok_kind(tpos) == 8) {
-            tpos = tpos + 1;
+            tpos += 1;
             store64(nd + 40, p_expr());
         }
         expect(19);
         return nd;
     }
     if (k == 22) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(15);
         nd = new_node(18);
         store64(nd + 32, p_expr());
         expect(16);
         store64(nd + 40, p_stmt());
         if (tok_kind(tpos) == 23) {
-            tpos = tpos + 1;
+            tpos += 1;
             store64(nd + 48, p_stmt());
         }
         return nd;
     }
     if (k == 24) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(15);
         nd = new_node(19);
         store64(nd + 32, p_expr());
@@ -1016,36 +1065,95 @@ int p_stmt() {
         return nd;
     }
     if (k == 25) {
-        tpos = tpos + 1;
+        tpos += 1;
         nd = new_node(20);
-        if (tok_kind(tpos) != 19) { store64(nd + 32, p_expr()); }
+        if (tok_kind(tpos) != 19) {
+            store64(nd + 32, p_expr());
+            if (tok_kind(tpos) == 20) { tpos += 1; store64(nd + 40, p_expr()); }
+        }
         expect(19);
         return nd;
     }
     if (k == 29) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(19);
         return new_node(25);
     }
     if (k == 30) {
-        tpos = tpos + 1;
+        tpos += 1;
         expect(19);
         return new_node(26);
     }
-    // Parse a full expression first, then decide between a plain assignment
-    // (VAR '=' expr), an indexed assignment (buf[i] '=' expr), or -- if
-    // not followed by '=' at all -- an expression statement. Needs
-    // arbitrary lookahead (buf[i] can be any length), unlike the other
-    // statement forms above which dispatch on a fixed token peek.
+    // for (init; cond; step) body parses to a BLOCK holding the init statement
+    // then a FORLOOP node (kind 40); the step reuses p_simple with no ';'.
+    if (k == 51) {
+        int finit = 0;
+        int fcond = 0;
+        int fstep = 0;
+        int fbody = 0;
+        int floop = 0;
+        int fblk = 0;
+        tpos += 1;
+        expect(15);
+        finit = p_stmt();
+        fcond = p_expr();
+        expect(19);
+        fstep = p_simple(0);
+        expect(16);
+        fbody = p_stmt();
+        floop = new_node(40);
+        store64(floop + 32, fcond);
+        store64(floop + 40, fbody);
+        store64(floop + 48, fstep);
+        fblk = new_node(22);
+        store64(finit + 56, floop);
+        store64(fblk + 32, finit);
+        return fblk;
+    }
+    if (k == 52) {
+        tpos += 1;
+        nd = new_node(42);
+        store64(nd + 32, p_stmt());
+        return nd;
+    }
+    return p_simple(1);
+}
+
+// A plain/indexed/field assignment, a compound assignment, or an expression
+// statement. want_semi is 0 for a for-loop step, which has ')' after it.
+int p_simple(int want_semi) {
+    int e = 0;
+    int out = 0;
+    int name = 0;
+    int ck = 0;
+    int bk = 0;
+    int bin = 0;
     e = p_expr();
+    if (tok_kind(tpos) == 20) {
+        int t2 = 0;
+        int call = 0;
+        if (load64(e) != 3) { perr(); }
+        tpos += 1;
+        t2 = p_expr();
+        if (load64(t2) != 3) { perr(); }
+        expect(8);
+        call = p_expr();
+        if (load64(call) != 6) { perr(); }
+        out = new_node(41);
+        store64(out + 32, call);
+        store64(out + 40, e);
+        store64(out + 48, t2);
+        if (want_semi == 1) { expect(19); }
+        return out;
+    }
     if (tok_kind(tpos) == 8) {
-        tpos = tpos + 1;
+        tpos += 1;
         if (load64(e) == 3) {
             name = load64(e + 16);
             out = new_node(4);
             store64(out + 16, name);
             store64(out + 40, p_expr());
-            expect(19);
+            if (want_semi == 1) { expect(19); }
             return out;
         }
         if (load64(e) == 27) {
@@ -1053,7 +1161,7 @@ int p_stmt() {
             store64(out + 32, load64(e + 32));
             store64(out + 40, load64(e + 40));
             store64(out + 48, p_expr());
-            expect(19);
+            if (want_semi == 1) { expect(19); }
             return out;
         }
         if (load64(e) == 30) {
@@ -1061,14 +1169,46 @@ int p_stmt() {
             store64(out + 16, load64(e + 16));
             store64(out + 32, load64(e + 32));
             store64(out + 40, p_expr());
-            expect(19);
+            if (want_semi == 1) { expect(19); }
             return out;
         }
         perr();
     }
+    // A compound assignment lhs OP= rhs is sugar for lhs = (lhs OP rhs).
+    if (tok_kind(tpos) >= 46 && tok_kind(tpos) <= 50) {
+        ck = tok_kind(tpos);
+        bk = 7;
+        if (ck == 47) { bk = 8; }
+        if (ck == 48) { bk = 9; }
+        if (ck == 49) { bk = 10; }
+        if (ck == 50) { bk = 33; }
+        tpos += 1;
+        bin = new_node(bk);
+        store64(bin + 32, e);
+        store64(bin + 40, p_expr());
+        if (load64(e) == 3) {
+            out = new_node(4);
+            store64(out + 16, load64(e + 16));
+            store64(out + 40, bin);
+        } else if (load64(e) == 27) {
+            out = new_node(28);
+            store64(out + 32, load64(e + 32));
+            store64(out + 40, load64(e + 40));
+            store64(out + 48, bin);
+        } else if (load64(e) == 30) {
+            out = new_node(31);
+            store64(out + 16, load64(e + 16));
+            store64(out + 32, load64(e + 32));
+            store64(out + 40, bin);
+        } else {
+            perr();
+        }
+        if (want_semi == 1) { expect(19); }
+        return out;
+    }
     out = new_node(21);
     store64(out + 32, e);
-    expect(19);
+    if (want_semi == 1) { expect(19); }
     return out;
 }
 
@@ -1081,7 +1221,7 @@ int p_block() {
     nd = new_node(22);
     while (tok_kind(tpos) != 18) {
         s = p_stmt();
-        if (head == 0) { head = s; tail = s; }
+        if (!head) { head = s; tail = s; }
         else { store64(tail + 56, s); tail = s; }
     }
     expect(18);
@@ -1093,9 +1233,8 @@ int p_block() {
 
 void print_indent(int depth) {
     int i = 0;
-    while (i < depth) {
+    for (i = 0; i < depth; i += 1) {
         print("  ");
-        i = i + 1;
     }
     return;
 }
@@ -1112,7 +1251,7 @@ void dump_node(int nd, int depth) {
     int i = 0;
     int p = 0;
     int len = 0;
-    if (nd == 0) { return; }
+    if (!nd) { return; }
     print_indent(depth);
     k = load64(nd);
     if (k == 1) { print("NUM "); print_int(load64(nd + 8)); print("\n"); return; }
@@ -1121,10 +1260,9 @@ void dump_node(int nd, int depth) {
         p = load64(nd + 16);
         len = load64(nd + 24);
         i = 0;
-        while (i < len) {
+        for (i = 0; i < len; i += 1) {
             print(" ");
             print_int(load8(p + i));
-            i = i + 1;
         }
         print("\n");
         return;
@@ -1200,8 +1338,28 @@ void dump_node(int nd, int depth) {
         dump_node(load64(nd + 40), depth + 1);
         return;
     }
+    if (k == 40) {
+        print("FORLOOP\n");
+        dump_node(load64(nd + 32), depth + 1);
+        dump_node(load64(nd + 40), depth + 1);
+        dump_node(load64(nd + 48), depth + 1);
+        return;
+    }
     if (k == 20) {
         print("RETURN\n");
+        dump_node(load64(nd + 32), depth + 1);
+        if (load64(nd + 40) != 0) { dump_node(load64(nd + 40), depth + 1); }
+        return;
+    }
+    if (k == 41) {
+        print("MULTIASSIGN\n");
+        dump_node(load64(nd + 40), depth + 1);
+        dump_node(load64(nd + 48), depth + 1);
+        dump_node(load64(nd + 32), depth + 1);
+        return;
+    }
+    if (k == 42) {
+        print("DEFER\n");
         dump_node(load64(nd + 32), depth + 1);
         return;
     }
@@ -1299,6 +1457,7 @@ int main() {
         expand_buf = alloc(EXPAND_CAP);
         expand_len = 0;
         include_stack = alloc(INCLUDE_MAX_DEPTH * 8);
+        included = alloc(MAX_INCLUDED * 8);
         expand_file(argv(1));
         buf = expand_buf;
         n = expand_len;
@@ -1307,7 +1466,7 @@ int main() {
         buf = alloc(1048576);
         got = read(0, buf, 1048576);
         while (got > 0) {
-            n = n + got;
+            n += got;
             got = read(0, buf + n, 1048576 - n);
         }
     }
@@ -1325,32 +1484,32 @@ int main() {
             int plen = tok_len(tpos + 2);
             int pstr = alloc(plen + 1);
             int pi = 0;
-            while (pi < plen) { store8(pstr + pi, load8(tok_name(tpos + 2) + pi)); pi = pi + 1; }
+            for (pi = 0; pi < plen; pi += 1) { store8(pstr + pi, load8(tok_name(tpos + 2) + pi)); }
             store8(pstr + plen, 0);
             store64(em + 8, pstr);
             store64(em + 16, 0);
-            tpos = tpos + 3;
+            tpos += 3;
             expect(19);
-            if (embhead == 0) { embhead = em; embtail = em; }
+            if (!embhead) { embhead = em; embtail = em; }
             else { store64(embtail + 16, em); embtail = em; }
             continue;
         }
         // `extern int name;` declares no AST of its own, and coff0 -a
         // prints nothing for it, so it is parsed and dropped.
         if (tok_kind(tpos) == 34) {
-            tpos = tpos + 1;
+            tpos += 1;
             expect(21);
             if (tok_kind(tpos) != 2) { perr(); }
-            tpos = tpos + 1;
+            tpos += 1;
             expect(19);
             continue;
         }
         if (tok_kind(tpos) == 36) {
-            tpos = tpos + 1;
+            tpos += 1;
             if (tok_kind(tpos) != 2) { perr(); }
             l = alloc(24);
             store64(l, tok_name(tpos));
-            tpos = tpos + 1;
+            tpos += 1;
             expect(17);
             fld_head = 0;
             fld_tail = 0;
@@ -1359,36 +1518,42 @@ int main() {
                 if (tok_kind(tpos) != 2) { perr(); }
                 fld = alloc(16);
                 store64(fld, tok_name(tpos));
-                tpos = tpos + 1;
+                tpos += 1;
                 expect(19);
-                if (fld_head == 0) { fld_head = fld; fld_tail = fld; }
+                if (!fld_head) { fld_head = fld; fld_tail = fld; }
                 else { store64(fld_tail + 8, fld); fld_tail = fld; }
             }
             expect(18);
             store64(l + 8, fld_head);
-            if (lhead == 0) { lhead = l; ltail = l; }
+            if (!lhead) { lhead = l; ltail = l; }
             else { store64(ltail + 16, l); ltail = l; }
             continue;
         }
         is_void = 0;
-        if (tok_kind(tpos) == 33) { is_void = 1; tpos = tpos + 1; }
-        else if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { tpos = tpos + 1; }
+        int two_ret = 0;
+        if (tok_kind(tpos) == 15) {
+            tpos += 1; expect(21); expect(20); expect(21); expect(16);
+            two_ret = 1;
+        }
+        else if (tok_kind(tpos) == 33) { is_void = 1; tpos += 1; }
+        else if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { tpos += 1; }
         else { expect(21); }
         if (tok_kind(tpos) != 2) { perr(); }
         name = tok_name(tpos);
-        tpos = tpos + 1;
+        tpos += 1;
         if (tok_kind(tpos) == 15) {
-            f = alloc(96);
+            f = alloc(104);
             store64(f, name);
             store64(f + 80, is_void);
-            tpos = tpos + 1;
+            store64(f + 96, two_ret);
+            tpos += 1;
             np = 0;
             extra_head = 0;
             extra_tail = 0;
             if (tok_kind(tpos) != 16) {
                 going = 1;
                 while (going == 1) {
-                    if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { tpos = tpos + 1; }
+                    if (tok_kind(tpos) == 2 && tok_kind(tpos + 1) == 2) { tpos += 1; }
                     else { expect(21); }
                     if (tok_kind(tpos) != 2) { perr(); }
                     if (np >= 16) { perr(); }
@@ -1397,12 +1562,12 @@ int main() {
                     } else {
                         pnode = alloc(16);
                         store64(pnode, tok_name(tpos));
-                        if (extra_head == 0) { extra_head = pnode; extra_tail = pnode; }
+                        if (!extra_head) { extra_head = pnode; extra_tail = pnode; }
                         else { store64(extra_tail + 8, pnode); extra_tail = pnode; }
                     }
-                    np = np + 1;
-                    tpos = tpos + 1;
-                    if (tok_kind(tpos) == 20) { tpos = tpos + 1; }
+                    np += 1;
+                    tpos += 1;
+                    if (tok_kind(tpos) == 20) { tpos += 1; }
                     else { going = 0; }
                 }
             }
@@ -1410,18 +1575,18 @@ int main() {
             store64(f + 8, np);
             store64(f + 88, extra_head);
             store64(f + 64, p_block());
-            if (fhead == 0) { fhead = f; ftail = f; }
+            if (!fhead) { fhead = f; ftail = f; }
             else { store64(ftail + 72, f); ftail = f; }
         } else {
             if (is_void == 1) { perr(); }
             g = alloc(24);
             store64(g, name);
             if (tok_kind(tpos) == 8) {
-                tpos = tpos + 1;
+                tpos += 1;
                 store64(g + 8, const_fold(p_expr()));
             }
             expect(19);
-            if (ghead == 0) { ghead = g; gtail = g; }
+            if (!ghead) { ghead = g; gtail = g; }
             else { store64(gtail + 16, g); gtail = g; }
         }
     }
@@ -1460,14 +1625,15 @@ int main() {
     }
     f = fhead;
     while (f != 0) {
-        if (load64(f + 80) == 1) { print("FUNC void "); } else { print("FUNC "); }
+        if (load64(f + 80) == 1) { print("FUNC void "); }
+        else if (load64(f + 96) == 1) { print("FUNC (int, int) "); }
+        else { print("FUNC "); }
         print(load64(f));
         np = load64(f + 8);
         i = 0;
-        while (i < np) {
+        for (i = 0; i < np; i += 1) {
             print(" ");
             print(param_name_at(f, i));
-            i = i + 1;
         }
         print("\n");
         dump_node(load64(f + 64), 1);

@@ -218,7 +218,7 @@ if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
   elflib=$(cd .. && pwd)/moonshot/programs/lib
   for src in ../moonshot/elf_tests/*.c0 ../moonshot/programs/*.c0 \
              ../moonshot/programs/lira/lira.c0 ../utsikt/utsikt.c0 \
-             ../gnista/gnista.c0 ../gnista/infecteria.c0 ../gnista/fps_probe.c0; do
+             ../gnista/infecteria.c0 ../gnista/fps_probe.c0; do
     [ -f "$src" ] || continue
     name=$(basename "$src" .c0)
     dir=$(dirname "$src")

@@ -31,18 +31,16 @@
 #
 # What it checks, in order of what it would catch.
 #
-#   1. Committed artifacts match a fresh rebuild. In my own tree coff0,
-#      coff1.s, coff1, smed.s and smed are checked in and the kernel build
-#      runs those binaries directly. A tampered binary committed once would
-#      compile or assemble every kernel from then on, and a binary diff
-#      inside a commit is not something a human reads. This stage rebuilds
-#      the whole chain from source and compares bytes. Since smed took over
-#      assembling and linking the kernel, smed is on that path too, so it
-#      is rebuilt and compared the same way. coff1 must reproduce smed.s
-#      from c0/smed.c0, and smed must reproduce itself from that assembly.
-#      This repository commits no binaries, so here the comparisons report
-#      SKIP unless you have built into the tree; the rebuilds themselves
-#      still have to succeed.
+#   1. In-tree binaries match a fresh rebuild. No binary is committed.
+#      coff0, coff1 and smed are built into this directory from source,
+#      and the kernel build runs the coff1 and smed found here directly,
+#      so a binary altered after it was built would compile or assemble
+#      every kernel from then on. This stage rebuilds the whole chain from
+#      source into a temporary directory and compares bytes against the
+#      binaries in the tree. smed is on that path as well, so coff1 must
+#      reproduce smed.s from c0/smed.c0, and smed must reproduce itself
+#      from that assembly. On a fresh clone that has not been built yet
+#      the comparisons report SKIP, and the rebuilds still have to succeed.
 #
 #   2. The bootstrap fixpoint. Kept here as well as in run_tests.sh so a
 #      single command covers the whole trust story.
@@ -170,10 +168,10 @@ hashq() {
 
 if [ "$ddc_only" -eq 0 ]; then
 
-echo "=== 1. Committed artifacts vs a fresh rebuild from source ==="
+echo "=== 1. In-tree binaries vs a fresh rebuild from source ==="
 echo ""
 
-# coff0 is rebuilt into the tmpdir rather than over the committed one. The
+# coff0 is rebuilt into the tmpdir rather than over the in-tree one. The
 # point is to compare against what is in the tree, so overwriting it first
 # would compare a file with itself.
 if $CC -Wall -Wextra -o "$tmpdir/coff0" coff0.c 2>"$tmpdir/cc.err"; then
@@ -186,7 +184,7 @@ else
   exit 1
 fi
 
-# The committed coff0 is accepted if ANY available C compiler reproduces it,
+# The in-tree coff0 is accepted if ANY available C compiler reproduces it,
 # and the matching one is named. Pinning this to a single compiler would
 # make the check fail merely because the tree was last built with the other
 # one, and a check that cries wolf gets ignored -- which is worse than no
@@ -200,13 +198,13 @@ if [ -f coff0 ]; then
     if cmpq "$tmpdir/coff0_$c" coff0; then coff0_match="$c"; break; fi
   done
   if [ -n "$coff0_match" ]; then
-    ok "committed coff0 == a fresh build of coff0.c (by $coff0_match)"
+    ok "in-tree coff0 == a fresh build of coff0.c (by $coff0_match)"
   else
-    bad "committed coff0 matches no fresh build of coff0.c by any available compiler"
-    echo "     the committed seed compiler is not what the source produces."
+    bad "in-tree coff0 matches no fresh build of coff0.c by any available compiler"
+    echo "     the in-tree seed compiler is not what the source produces."
   fi
 else
-  warn "no committed coff0 to compare against"
+  warn "no in-tree coff0 to compare against"
 fi
 
 if "$tmpdir/coff0" c0/coff.c0 "$tmpdir/coff1.s" 2>"$tmpdir/stage1.err"; then
@@ -221,13 +219,13 @@ fi
 
 if [ -f coff1.s ]; then
   if cmpq "$tmpdir/coff1.s" coff1.s; then
-    ok "committed coff1.s == freshly emitted stage1.s"
+    ok "in-tree coff1.s == freshly emitted stage1.s"
   else
-    bad "committed coff1.s differs from freshly emitted stage1"
+    bad "in-tree coff1.s differs from freshly emitted stage1"
     diff "$tmpdir/coff1.s" coff1.s | head -20
   fi
 else
-  warn "no committed coff1.s to compare against"
+  warn "no in-tree coff1.s to compare against"
 fi
 
 # The intermediate files are named coff1.s/coff1.o rather than anything
@@ -254,14 +252,14 @@ fi
 # help if this file is not what the source produces.
 if [ -f coff1 ]; then
   if cmpq "$tmpdir/coff1" coff1; then
-    ok "committed coff1 == freshly bootstrapped coff1 (the binary Moonshot runs)"
+    ok "in-tree coff1 == freshly bootstrapped coff1 (the binary Moonshot runs)"
   else
-    bad "committed coff1 differs from a fresh bootstrap"
+    bad "in-tree coff1 differs from a fresh bootstrap"
     echo "     this is the binary the kernel is compiled with."
     echo "     do not build a kernel until this is explained."
   fi
 else
-  warn "no committed coff1 to compare against"
+  warn "no in-tree coff1 to compare against"
 fi
 
 # The audit's own tools, from the coff1 just rebuilt from source. See the
@@ -281,33 +279,33 @@ else
 fi
 
 # smed assembles and links the kernel, so it has exactly coff1's standing,
-# a committed binary that moonshot/build.sh runs directly. Its assembly must
+# a binary in the tree that the kernel build runs directly. Its assembly must
 # be what coff1 emits from c0/smed.c0, and the binary must be what smed
-# produces from that assembly -- the committed smed assembling its own
+# produces from that assembly -- the in-tree smed assembling its own
 # source is a fixpoint check, and only the very first smed is produced any
 # other way (from as+ld).
 if [ -f "$tmpdir/coff1" ]; then
   if "$tmpdir/coff1" c0/smed.c0 "$tmpdir/smed.s" 2>/dev/null; then
     if [ -f smed.s ]; then
       if cmpq "$tmpdir/smed.s" smed.s; then
-        ok "committed smed.s == coff1's output for c0/smed.c0"
+        ok "in-tree smed.s == coff1's output for c0/smed.c0"
       else
-        bad "committed smed.s differs from what coff1 emits for c0/smed.c0"
+        bad "in-tree smed.s differs from what coff1 emits for c0/smed.c0"
       fi
     else
-      warn "no committed smed.s to compare against"
+      warn "no in-tree smed.s to compare against"
     fi
     if [ -x smed ]; then
       if ./smed "$tmpdir/smed.s" "$tmpdir/smed_self" 2>/dev/null \
          && cmpq "$tmpdir/smed_self" smed; then
-        ok "committed smed == smed assembling its own source (the binary that links the kernel)"
+        ok "in-tree smed == smed assembling its own source (the binary that links the kernel)"
       else
-        bad "committed smed is not what smed produces from its own source"
+        bad "in-tree smed is not what smed produces from its own source"
         echo "     this is the binary the kernel is assembled and linked with."
         echo "     do not build a kernel until this is explained."
       fi
     else
-      warn "no committed smed to compare against"
+      warn "no in-tree smed to compare against"
     fi
   else
     bad "coff1 could not compile c0/smed.c0"
@@ -537,7 +535,7 @@ echo ""
 # a hash that changes when nothing changed is not.
 {
   echo "# coff bootstrap manifest -- regenerate with ./verify_bootstrap.sh --write-manifest"
-  echo "# Recorded so that tampering with a committed binary shows up as a"
+  echo "# Recorded so that tampering with a committed file shows up as a"
   echo "# text diff. See TRUST.md."
   echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "seed CC: $CC ($($CC --version 2>&1 | head -1))"
@@ -547,12 +545,10 @@ echo ""
   [ -n "$diverse" ] && echo "diverse: $($diverse --version 2>&1 | head -1)"
   echo ""
   hashq coff0.c c0/coff.c0 c0/lex.c0 c0/parse.c0 c0/smed.c0 c0/sha256.c0 c0/cmp.c0
-  # In my own tree the bootstrap binaries (coff0, coff1.s, coff1, smed.s,
-  # smed) are committed and hashed here too, since they sit on the critical
-  # path. This repository commits none of them, so they are left out. A
-  # manifest that changes depending on whether you have built in the tree
-  # would fail for every fresh clone, and a check that cries wolf gets
-  # ignored.
+  # No binary is hashed. None is committed, and a manifest that changed
+  # whenever the tree was built would fail on every fresh clone, and a
+  # check that cries wolf gets ignored. The binaries themselves are checked
+  # by stage 1 above.
   # Build code is code. The xz-utils backdoor (CVE-2024-3094) did not live
   # in the library source at all. It lived in the build machinery and in
   # files that looked like test data. Both of those categories exist here
@@ -560,7 +556,7 @@ echo ""
   # this project is input to the compiler under test, so it is hashed like
   # code. The kernel's build script and its generators are the same
   # category, but they live in the kernel's repository and are recorded
-  # there. For the same reason no binary is hashed above, nothing outside
+  # there. For the same reason that no binary is hashed, nothing outside
   # this repository is either, or the committed manifest would match only
   # one of the two layouts the README describes. The kernel sources still
   # go into the DDC corpus (stage 3) when they sit next to this tree.
@@ -579,8 +575,8 @@ fi
 if [ "$write_manifest" -eq 1 ] && [ "$fail" -ne 0 ]; then
   # A manifest is a record of a tree that passed. Writing one after a
   # failure would bless whatever is in the tree right now, and the next
-  # hash-gated build would then trust it. A committed coff0 that does not
-  # match its source would fail stage 1, and moonshot/build.sh would still
+  # hash-gated build would then trust it. An in-tree coff0 that does not
+  # match its source would fail stage 1, and the kernel build would still
   # build a kernel against the blessed manifest.
   bad "not writing BOOTSTRAP.sha256: $fail check(s) failed above"
 elif [ "$write_manifest" -eq 1 ]; then

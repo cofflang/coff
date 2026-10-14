@@ -1,0 +1,11 @@
+// expect: compile-error
+//
+// tests/120_return_in_defer.c0 - a return inside a deferred statement is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+//
+// A deferred statement runs in the epilogue, so a `return` inside it would
+// jump back to the epilogue and run the defers again.
+int main() {
+    defer { return 1; }
+    return 0;
+}

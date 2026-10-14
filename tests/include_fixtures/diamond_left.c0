@@ -1,0 +1,6 @@
+// tests/include_fixtures/diamond_left.c0 - fixture for 117_include_diamond, the left arm of the diamond
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
+include "diamond_common.c0";
+int diamond_left_val() {
+    return diamond_base() + 1;
+}
