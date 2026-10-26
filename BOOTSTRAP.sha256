@@ -1,7 +1,7 @@
 # coff bootstrap manifest -- regenerate with ./verify_bootstrap.sh --write-manifest
 # Recorded so that tampering with a committed file shows up as a
 # text diff. See TRUST.md.
-date: 2026-10-25T15:27:41Z
+date: 2026-10-26T17:06:35Z
 seed CC: tcc (tcc version 0.9.28rc 2026-09-04 mob@0fb5430 (x86_64 Linux))
 gcc: gcc (GCC) 16.2.1 20260810
 as: GNU assembler (GNU Binutils) 2.47
@@ -17,7 +17,7 @@ f48cb9053e641d936a778ee57f188ef67da295f67e2188ba52267449f9a7531e  c0/coff.c0
 7b4cfe197e9809b5fa82217f2750a5693ea9303dcde5979a58b253e7648c64b4  c0/cmp.c0
 c171d22f36699758c2b8d796270d74a3185d2794f0fb58e457ef4145f5456e0d  lib/flyt.c0
 c513a3cc4d4b9130e21ed51f7dab81161159060205eb8614fcb41df1ddc1d0dd  lib/flyt_check.c0
-b54025b8ed779e8dd785a5193763e1edcb83446fe80ea61669f36ea1894df463  run_tests.sh
+1582bd37186b106b4728c40e5767fbf5a66617fc3772eda9f882f5d8670e728b  run_tests.sh
 a24dc03b88c8bc3237594f03fcf94fb4ecefa6606d52752867fc95029f6d93a2  check_saved_regs.awk
 240ff5f703d8465644ea8c0ce62013d459529a73fbed20e02455e232495cf924  verify_bootstrap.sh
 4184a3f16835dffce0d451a31d248775fa18c552e046ec6fceb047281680793d  smed_tests.sh

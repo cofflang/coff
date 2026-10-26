@@ -227,6 +227,9 @@ if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
              ../moonshot/programs/lira/lira.c0 ../moonshot/programs/utsikt/utsikt.c0 \
              ../utsikt/utsikt.c0 ../gnista/infecteria.c0 ../gnista/fps_probe.c0; do
     [ -f "$src" ] || continue
+    # A library beside the programs, such as Gnista's engine in a Moonshot
+    # clone, has no main of its own and is compiled as part of a program.
+    grep -qE '^(int|void) main\(' "$src" || continue
     name=$(basename "$src" .c0)
     dir=$(dirname "$src")
     if (cd "$dir" && "$OLDPWD/coff0" --elf -I "$elflib" -I "$gnistalib" "$(basename "$src")" "$tmpdir/eref_$name.s") 2>/dev/null; then

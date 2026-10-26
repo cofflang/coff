@@ -4,6 +4,15 @@ Every release of coff, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
 plain [semantic versions](https://semver.org/) with no names.
 
+## [0.7.1] - 2026-10-26
+
+### Fixed
+
+- `run_tests.sh` compared every `.c0` beside a Moonshot clone's programs
+  under `--elf`, the libraries among them, which have no `main`, so four
+  checks failed whenever Gnista's sources sat in `moonshot/programs`. A
+  file without a `main` is now left to the program that includes it.
+
 ## [0.7.0] - 2026-10-26
 
 ### Added
@@ -220,6 +229,7 @@ plain [semantic versions](https://semver.org/) with no names.
   assembly and is written in c0 itself. `coff0.c` is the one-time bootstrap,
   kept as the reference the tests compare everything against.
 
+[0.7.1]: https://github.com/cofflang/coff/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/cofflang/coff/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cofflang/coff/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cofflang/coff/compare/v0.4.0...v0.5.0
