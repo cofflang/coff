@@ -1,0 +1,1 @@
+coff0: tests/129_defer_inner_block_local.c0:13: a defer runs when the function returns, after the block that declares 'a' has ended

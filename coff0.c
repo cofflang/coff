@@ -32,6 +32,15 @@
  * The c0 grammar, as accepted here
  *
  *   program    := (function | global | extern | layout | embed)*
+ *   include    := "include" STRING ";"                 (anywhere, replaced by the
+ *                                                        file's text before
+ *                                                        lexing, each file once.
+ *                                                        The path is tried next
+ *                                                        to the including file,
+ *                                                        then in each -I
+ *                                                        directory. This makes
+ *                                                        "include" a reserved
+ *                                                        word everywhere)
  *   global     := type IDENT ("=" constexpr)? ";"     (folded at compile
  *                                                        time, so only
  *                                                        numbers, characters
@@ -82,31 +91,41 @@
  *                                                        "(int, int)" function)
  *   if_stmt    := "if" "(" expr ")" stmt ("else" stmt)?
  *   while_stmt := "while" "(" expr ")" stmt
- *   for_stmt   := "for" "(" simple ";" expr ";" simple ")" stmt
- *                                                     (simple is a declaration,
- *                                                        an assignment or an
+ *   for_stmt   := "for" "(" stmt expr ";" simple ")" stmt
+ *                                                     (the first stmt brings its
+ *                                                        own ";" and is meant to
+ *                                                        be a declaration or an
+ *                                                        assignment. simple is an
+ *                                                        assignment or an
  *                                                        expression without its
- *                                                        ";". continue runs the
- *                                                        step, as in C)
- *   return_stmt:= "return" (expr ("," expr)?)? ";"      ("return;" bare is required
- *                                                          for void functions, optional
- *                                                          for int functions -- falling
- *                                                          off the end already left the
- *                                                          return value undefined)
+ *                                                        ";". None of the three
+ *                                                        may be left out.
+ *                                                        continue runs the step,
+ *                                                        as in C)
+ *   return_stmt:= "return" (expr ("," expr)?)? ";"      (a void function may only
+ *                                                          use the bare form. An int
+ *                                                          function may use it too,
+ *                                                          like falling off the end,
+ *                                                          and then returns whatever
+ *                                                          rax holds)
  *   break_stmt := "break" ";"                            (must be inside a loop)
  *   continue_stmt := "continue" ";"                      (must be inside a loop)
  *   defer_stmt := "defer" stmt                          (runs stmt at every exit
  *                                                          of the function, the
  *                                                          last defer first. It
  *                                                          may not return, break,
- *                                                          continue or defer)
+ *                                                          continue or defer, nor
+ *                                                          use a local of a block
+ *                                                          that has ended by then)
  *   expr_stmt  := expr ";"                               (a bare call, e.g. `f(1);`)
  *
  *   expr       := logic_or
  *   logic_or   := logic_and ("||" logic_and)*        (short-circuiting)
- *   logic_and  := equality ("&&" equality)*            (short-circuiting)
+ *   logic_and  := bitor ("&&" bitor)*                  (short-circuiting)
+ *   bitor      := bitxor ("|" bitxor)*
+ *   bitxor     := bitand ("^" bitand)*
+ *   bitand     := equality ("&" equality)*
  *   equality   := relational (("==" | "!=") relational)*
- *   (logic_and binds | ^ & between it and equality, where C puts them)
  *   relational := shift (("<" | "<=" | ">" | ">=") shift)*
  *   shift      := additive (("<<" | ">>") additive)*
  *   additive   := term (("+" | "-") term)*
@@ -136,7 +155,8 @@
  * that & binds more loosely than ==, because anyone reading c0 reads C.
  *
  * A `main` function is required, takes no parameters, and must return
- * int (not void). The generated `_start` calls main and exits the
+ * one int (not void, not two). No function, extern or embed may be named
+ * `_start`, the entry point, or like a register. The generated `_start` calls main and exits the
  * process with its return value. Every other function returns normally
  * to its caller, args in rdi/rsi/rdx/rcx/r8/r9 and the return value in
  * rax. A void function may only use a bare `return;`, or fall off the
@@ -185,10 +205,11 @@
  *   outw / inw         -- the same, 16 bits wide.
  *
  * With --elf the output targets ring 3 of Moonshot, my OS kernel, instead
- * of Linux. It is the same backend with different syscall numbers. argc and
- * argv become syscalls, the file and port builtins are refused, and win_info,
- * win_max, fill, blit, key_poll, ticks, readfile, present, mouse_poll,
- * glyph, dealloc, sound and writefile exist instead, plus
+ * of Linux. It is the same backend with different syscall numbers. argc,
+ * argv and the file builtins become that kernel's syscalls, the port
+ * builtins are refused, and win_info, win_max, fill, blit, key_poll, ticks,
+ * readfile, present, mouse_poll, glyph, dealloc, sound and writefile exist
+ * beside them, plus
  * syscall(n, a, b, c, d, e) for any system call by number. Each is one
  * kernel syscall; see the BUILTINS table and gen_expr_node.
  */
@@ -323,34 +344,38 @@ static Token *tokenize(char *src) {
     err_line = t->line;
 
     if (isdigit((unsigned char)*p)) {
-      char *start = p;
       if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') && isxdigit((unsigned char)p[2])) {
         p += 2;
-        while (isxdigit((unsigned char)*p)) p++;
+        /* The digits are added up in an unsigned long, which wraps modulo
+         * 2^64, so a literal is what its low 64 bits are, reinterpreted as
+         * signed. The c0-written lexers (lex.c0, parse.c0, coff.c0) do
+         * `v = v * 16 + digit` on a plain int and wrap the same way.
+         * strtoul would agree up to 2^64 and then clamp. Hex literals with
+         * the top bit set are common, an 8x8 font glyph's packed bitmap such
+         * as 0xF88484F88484F800. */
+        unsigned long v = 0;
+        while (isxdigit((unsigned char)*p)) {
+          int c = (unsigned char)*p;
+          int d = isdigit(c) ? c - '0' : (tolower(c) - 'a' + 10);
+          v = v * 16 + (unsigned long)d;
+          p++;
+        }
         t->kind = TK_NUM;
-        /* strtoul, not strtol -- see the comment on the decimal path below.
-         * Hex literals with the top bit set are common (an 8x8 font glyph's
-         * packed bitmap, 0xF88484F88484F800), and strtol would clamp them
-         * to 0x7FFFFFFFFFFFFFFF. */
-        t->ival = (long)strtoul(start, NULL, 16);
+        t->ival = (long)v;
         n++;
         continue;
       }
-      while (isdigit((unsigned char)*p)) p++;
+      /* Decimal the same way, wrapping modulo 2^64 like the c0-written
+       * lexers' `v = v * 10 + digit`. c0 has no unsigned type, so a literal
+       * at or past 2^63 is just what its bits are, reinterpreted as
+       * negative, like every other c0 int. */
+      unsigned long v = 0;
+      while (isdigit((unsigned char)*p)) {
+        v = v * 10 + (unsigned long)(*p - '0');
+        p++;
+      }
       t->kind = TK_NUM;
-      /* strtoul, not strtol. c0's ival is a raw 64-bit bit pattern (c0 has
-       * no unsigned type -- a literal at or past 2^63 is just what its bits
-       * are, reinterpreted as negative, same as every other c0 int). strtol
-       * clamps any digit sequence that does not fit as a *signed* long to
-       * LONG_MAX with ERANGE, silently corrupting the top half of the
-       * range instead of wrapping. The c0-written lexers (lex.c0/
-       * parse.c0/coff.c0) accumulate digits with `v = v*10 + digit`,
-       * plain arithmetic on the CPU's own registers, which wraps naturally
-       * with no library-level clamping. strtoul parses the same digits as
-       * an unsigned magnitude with no clamping, and converting that back to
-       * `long` just reinterprets the bits (well-defined in practice on every
-       * platform this targets), so both agree. */
-      t->ival = (long)strtoul(start, NULL, 10);
+      t->ival = (long)v;
       n++;
       continue;
     }
@@ -1396,10 +1421,13 @@ static const char *REGISTER_NAMES[] = {
 };
 #define NREGISTER_NAMES ((int)(sizeof(REGISTER_NAMES) / sizeof(REGISTER_NAMES[0])))
 
+/* _start is the entry point every program gets, so a second one would only
+ * fail later, in the assembler. */
 static void check_symbol_name(const char *name, const char *what) {
   for (int i = 0; i < NREGISTER_NAMES; i++) {
     if (strcmp(REGISTER_NAMES[i], name) == 0) error("'%s' is a register name and cannot name %s", name, what);
   }
+  if (strcmp(name, "_start") == 0) error("'_start' is the entry point and cannot name %s", what);
 }
 
 static const Builtin *find_builtin(const char *name) {
@@ -1600,11 +1628,12 @@ static long sym_offsets[MAX_VARS];
 static char *sym_types[MAX_VARS];  /* layout name, or NULL for int */
 static int sym_count;
 static long stack_size;
-static int loop_depth; /* nesting depth of while loops during resolve(); break/continue require loop_depth > 0 */
+static int loop_depth; /* nesting depth of loops (while and for) during resolve(); break/continue require loop_depth > 0 */
 static int current_fn_is_void; /* whether the function currently being resolved is void */
 static int current_fn_two_ret; /* whether the function currently being resolved returns two values */
 static int resolving_multi_call; /* set while resolving the call on the right of `a, b = f(...)` */
 static int in_defer; /* set while resolving a deferred statement; it may not return, break, continue or defer */
+static int defer_sym_base; /* sym_count when the deferred statement began, so its own locals are told apart */
 
 /* Block scoping. Each '{' block marks the sym_count at entry; sym_declare's
  * redeclaration check only looks back to that mark, so sibling blocks can
@@ -1637,6 +1666,21 @@ static char *var_type(char *name) {
     if (strcmp(g->name, name) == 0) return g->type;
   }
   return NULL;
+}
+
+/* A deferred statement runs when the function returns, and by then every
+ * inner block has ended and its locals' slots may hold another block's
+ * variables. So a defer may use the parameters, the locals of the
+ * function's outermost block and its own locals, and nothing declared in an
+ * inner block. */
+static void check_defer_local(char *name) {
+  if (!in_defer || scope_depth < 2) return;
+  for (int i = sym_count - 1; i >= 0; i--) {
+    if (strcmp(sym_names[i], name) != 0) continue;
+    if (i >= scope_marks[1] && i < defer_sym_base)
+      error("a defer runs when the function returns, after the block that declares '%s' has ended", name);
+    return;
+  }
 }
 
 static long sym_declare(char *name) {
@@ -1677,7 +1721,7 @@ static void resolve_node(Node *n) {
     case ND_STR: return;
     case ND_VAR: {
       long off = sym_try_lookup(n->name); /* locals shadow globals shadow functions */
-      if (off >= 0) { n->ival = off; return; }
+      if (off >= 0) { check_defer_local(n->name); n->ival = off; return; }
       if (glob_exists(n->name)) { n->is_global = 1; return; }
       if (extern_exists(n->name)) { n->kind = ND_FUNCREF; return; }
       if (func_exists(n->name)) { n->kind = ND_FUNCREF; return; }
@@ -1694,7 +1738,7 @@ static void resolve_node(Node *n) {
     case ND_ASSIGN: {
       resolve(n->rhs);
       long off = sym_try_lookup(n->name);
-      if (off >= 0) n->ival = off;
+      if (off >= 0) { check_defer_local(n->name); n->ival = off; }
       else if (glob_exists(n->name)) n->is_global = 1;
       else error("undeclared variable '%s'", n->name);
       return;
@@ -1736,7 +1780,7 @@ static void resolve_node(Node *n) {
         /* Not a builtin, not a declared function -- an indirect call through
          * a function-pointer-valued variable, if `name` names one. */
         long off = sym_try_lookup(n->name);
-        if (off >= 0) { n->ival = off; n->is_indirect = 1; }
+        if (off >= 0) { check_defer_local(n->name); n->ival = off; n->is_indirect = 1; }
         else if (glob_exists(n->name)) { n->is_global = 1; n->is_indirect = 1; }
         else error("call to undeclared function '%s'", n->name);
       }
@@ -1773,6 +1817,7 @@ static void resolve_node(Node *n) {
       int saved_loop_depth = loop_depth;
       loop_depth = 0;
       in_defer = 1;
+      defer_sym_base = sym_count;
       resolve(n->lhs);
       in_defer = 0;
       loop_depth = saved_loop_depth;
@@ -1854,12 +1899,11 @@ static int is_moonshot_builtin(const char *name) {
       || strcmp(name, "dealloc") == 0 || strcmp(name, "sound") == 0
       || strcmp(name, "writefile") == 0 || strcmp(name, "syscall") == 0;
 }
+/* Port I/O has no meaning in ring 3. The file builtins do, Moonshot has
+ * syscalls for them. */
 static int is_linux_only_builtin(const char *name) {
-  return strcmp(name, "write") == 0 || strcmp(name, "read") == 0
-      || strcmp(name, "open_read") == 0 || strcmp(name, "open_write") == 0
-      || strcmp(name, "close") == 0 || strcmp(name, "outb") == 0
-      || strcmp(name, "inb") == 0 || strcmp(name, "outw") == 0
-      || strcmp(name, "inw") == 0;
+  return strcmp(name, "outb") == 0 || strcmp(name, "inb") == 0
+      || strcmp(name, "outw") == 0 || strcmp(name, "inw") == 0;
 }
 static int current_ret_label;
 #define MAX_DEFERS 64
@@ -1867,9 +1911,46 @@ static Node *defers[MAX_DEFERS]; /* deferred statements collected while generati
 static int n_defers;             /* reset per function; emitted in reverse at .Lret */
 
 #define MAX_LOOP_DEPTH 64
-static int loop_labels[MAX_LOOP_DEPTH]; /* one label id per active while loop; .Lstart%d/.Lend%d are break/continue's targets */
+static int loop_labels[MAX_LOOP_DEPTH]; /* one label id per active loop; .Lend%d is break's target, .Lstart%d (.Lstep%d in a for) continue's */
 static int loop_is_for[MAX_LOOP_DEPTH]; /* 1 if the active loop is a for; continue then targets .Lstep%d (the step) */
 static int gen_loop_depth;
+
+/* Register allocation, mirroring coff.c0. Every function is generated twice.
+ * The first pass (emit_dry, output to /dev/null) weighs each stack slot by its
+ * uses, each loop around a use multiplying its weight by 8, up to three
+ * loops deep. The busiest
+ * slots then live in callee-saved registers for the real pass, so a call
+ * never disturbs them and c0, having no address-of for locals, can never
+ * reach them through a pointer. */
+static int emit_dry;
+static long *slot_weight; /* per slot of the current function, filled by the dry pass */
+static int *slot_reg;     /* per slot, 0 for the stack or 1-5 for rbx, r12-r15 */
+static FILE *dry_out;
+
+static const char *saved_reg_name(int r) {
+  static const char *names[] = { "", "rbx", "r12", "r13", "r14", "r15" };
+  return names[r];
+}
+
+/* A local's operand, its register or its stack slot. The dry pass only
+ * weighs the use. */
+static const char *slot(long off) {
+  static char buf[4][32];
+  static int next;
+  if (emit_dry) {
+    long w = 1;
+    if (gen_loop_depth == 1) w = 8;
+    if (gen_loop_depth == 2) w = 64;
+    if (gen_loop_depth >= 3) w = 512;
+    slot_weight[off / 8] += w;
+    return "";
+  }
+  int r = slot_reg[off / 8];
+  if (r != 0) return saved_reg_name(r);
+  next = (next + 1) % 4;
+  snprintf(buf[next], sizeof buf[next], "[rbp - %ld]", off);
+  return buf[next];
+}
 
 static void gen_expr_node(Node *n);
 
@@ -1890,6 +1971,13 @@ static int is_leaf(Node *n) {
   return n->kind == ND_NUM || n->kind == ND_VAR;
 }
 
+/* The register a local lives in, or 0 when it is on the stack, a global or
+ * something else, and always 0 in the dry pass. */
+static int reg_local(Node *n) {
+  if (emit_dry || n->kind != ND_VAR || n->is_global) return 0;
+  return slot_reg[n->ival / 8];
+}
+
 /* Leaves lhs in rax and rhs in rcx, the operand layout of every binary
  * operator. */
 static void gen_operands(Node *lhs, Node *rhs) {
@@ -1897,7 +1985,7 @@ static void gen_operands(Node *lhs, Node *rhs) {
   if (is_leaf(rhs)) {
     if (rhs->kind == ND_NUM) fprintf(out, "    mov rcx, %ld\n", rhs->ival);
     else if (rhs->is_global) fprintf(out, "    mov rcx, [.G%s]\n", rhs->name);
-    else fprintf(out, "    mov rcx, [rbp - %ld]\n", rhs->ival);
+    else fprintf(out, "    mov rcx, %s\n", slot(rhs->ival));
     return;
   }
   fprintf(out, "    push rax\n");
@@ -1920,13 +2008,18 @@ static int gen_operands_imm(Node *lhs, Node *rhs) {
     gen_expr(lhs);
     return 1;
   }
+  if (reg_local(rhs)) {
+    gen_expr(lhs);
+    return 2;
+  }
   gen_operands(lhs, rhs);
   return 0;
 }
 
 /* The right operand of an instruction, after gen_operands_imm. */
 static void emit_rhs(int imm, Node *rhs) {
-  if (imm) fprintf(out, "%ld\n", rhs->ival);
+  if (imm == 1) fprintf(out, "%ld\n", rhs->ival);
+  else if (imm == 2) fprintf(out, "%s\n", saved_reg_name(reg_local(rhs)));
   else fprintf(out, "rcx\n");
 }
 
@@ -1957,6 +2050,13 @@ static const char *cmp_jump(int kind, int sense) {
  * branches. */
 static void gen_jump(Node *cond, int sense, const char *label, int l) {
   const char *jcc = cmp_jump(cond->kind, sense);
+  int lr = jcc ? reg_local(cond->lhs) : 0;
+  if (lr && (is_imm32(cond->rhs) || reg_local(cond->rhs))) {
+    if (is_imm32(cond->rhs)) fprintf(out, "    cmp %s, %ld\n", saved_reg_name(lr), cond->rhs->ival);
+    else fprintf(out, "    cmp %s, %s\n", saved_reg_name(lr), saved_reg_name(reg_local(cond->rhs)));
+    fprintf(out, "    %s .%s%d\n", jcc, label, l);
+    return;
+  }
   if (jcc) {
     int imm = gen_operands_imm(cond->lhs, cond->rhs);
     fprintf(out, "    cmp rax, ");
@@ -2012,7 +2112,7 @@ static int is_stable_arg(Node *n) {
 static void gen_stable_arg(Node *n, const char *reg) {
   if (n->kind == ND_NUM) fprintf(out, "    mov %s, %ld\n", reg, n->ival);
   else if (n->kind == ND_STR) fprintf(out, "    lea %s, [.Lstr%d]\n", reg, n->str_id);
-  else fprintf(out, "    mov %s, [rbp - %ld]\n", reg, n->ival);
+  else fprintf(out, "    mov %s, %s\n", reg, slot(n->ival));
 }
 
 static void gen_expr_node(Node *n) {
@@ -2025,7 +2125,7 @@ static void gen_expr_node(Node *n) {
       return;
     case ND_VAR:
       if (n->is_global) fprintf(out, "    mov rax, [.G%s]\n", n->name);
-      else fprintf(out, "    mov rax, [rbp - %ld]\n", n->ival);
+      else fprintf(out, "    mov rax, %s\n", slot(n->ival));
       return;
     case ND_FUNCREF:
       fprintf(out, "    lea rax, [%s]\n", n->name);
@@ -2040,10 +2140,14 @@ static void gen_expr_node(Node *n) {
       return;
     case ND_INDEX:
       /* base + index, so the operands may trade places like ADD's. */
-      if (is_stable_leaf(n->lhs) && !is_leaf(n->rhs)) gen_operands(n->rhs, n->lhs);
-      else gen_operands(n->lhs, n->rhs);
-      fprintf(out, "    add rax, rcx\n");
+    {
+      Node *ia = n->lhs, *ib = n->rhs;
+      if (is_stable_leaf(ia) && !is_leaf(ib)) { ia = n->rhs; ib = n->lhs; }
+      int iimm = gen_operands_imm(ia, ib);
+      fprintf(out, "    add rax, ");
+      emit_rhs(iimm, ib);
       fprintf(out, "    movzx rax, byte ptr [rax]\n");
+    }
       return;
     case ND_FIELD:
       gen_expr(n->lhs);
@@ -2317,7 +2421,22 @@ static void gen_expr_node(Node *n) {
           fprintf(out, "    mov %s, [rsp + %d]\n", ARG_REGS[i], (n->nargs - 1 - i) * 8);
         }
       }
-      if (strcmp(n->name, "write") == 0) {
+      /* Under --elf the file builtins are Moonshot's SYS_OPEN (23, mode 0
+       * to read and 1 to write), SYS_READ (24), SYS_WRITE (25) and
+       * SYS_CLOSE (26), with the arguments where Linux has them. */
+      if (elf_mode && strcmp(n->name, "write") == 0) {
+        fprintf(out, "    mov rax, 25\n    syscall\n");
+      } else if (elf_mode && strcmp(n->name, "read") == 0) {
+        fprintf(out, "    mov rax, 24\n    syscall\n");
+      } else if (elf_mode && strcmp(n->name, "close") == 0) {
+        fprintf(out, "    mov rax, 26\n    syscall\n");
+      } else if (elf_mode && strcmp(n->name, "open_read") == 0) {
+        fprintf(out, "    mov rsi, 0\n");
+        fprintf(out, "    mov rax, 23\n    syscall\n");
+      } else if (elf_mode && strcmp(n->name, "open_write") == 0) {
+        fprintf(out, "    mov rsi, 1\n");
+        fprintf(out, "    mov rax, 23\n    syscall\n");
+      } else if (strcmp(n->name, "write") == 0) {
         fprintf(out, "    mov rax, 1\n    syscall\n");
       } else if (strcmp(n->name, "read") == 0) {
         fprintf(out, "    mov rax, 0\n    syscall\n");
@@ -2335,7 +2454,7 @@ static void gen_expr_node(Node *n) {
          * caller-saved) -- load the pointer variable's value into it after
          * the real args are already in place, then call through it. */
         if (n->is_global) fprintf(out, "    mov r10, [.G%s]\n", n->name);
-        else fprintf(out, "    mov r10, [rbp - %ld]\n", n->ival);
+        else fprintf(out, "    mov r10, %s\n", slot(n->ival));
         fprintf(out, "    call r10\n");
       } else {
         fprintf(out, "    call %s\n", n->name);
@@ -2386,8 +2505,8 @@ static void gen_expr_node(Node *n) {
         case ND_ADD: fprintf(out, "    add rax, "); emit_rhs(imm, rhs); break;
         case ND_SUB: fprintf(out, "    sub rax, "); emit_rhs(imm, rhs); break;
         case ND_MUL:
-          if (imm) fprintf(out, "    imul rax, rax, %ld\n", rhs->ival);
-          else fprintf(out, "    imul rax, rcx\n");
+          if (imm == 1) fprintf(out, "    imul rax, rax, %ld\n", rhs->ival);
+          else { fprintf(out, "    imul rax, "); emit_rhs(imm, rhs); }
           break;
         case ND_DIV: fprintf(out, "    cqo\n    idiv rcx\n"); break;
         /* idiv leaves the remainder in rdx, with the sign of the dividend,
@@ -2434,23 +2553,63 @@ static void gen_stmt(Node *n) {
   err_line = saved_line;
 }
 
+/* The instruction for x = x op y done in place, or NULL. */
+static const char *inplace_op(int kind) {
+  switch (kind) {
+    case ND_ADD: return "add";
+    case ND_SUB: return "sub";
+    case ND_BITAND: return "and";
+    case ND_BITOR: return "or";
+    case ND_BITXOR: return "xor";
+    default: return NULL;
+  }
+}
+
+/* An assignment to a local in a register that needs no trip through rax. A
+ * number (or no initialiser) loads straight in, and x = x op y, which is
+ * also what x op= y is, works in place when y is a number or another
+ * register. Returns 1 when it emitted the assignment. */
+static int gen_reg_assign(long off, Node *val) {
+  if (emit_dry) return 0;
+  int r = slot_reg[off / 8];
+  if (!r) return 0;
+  if (!val || val->kind == ND_NUM) {
+    fprintf(out, "    mov %s, %ld\n", saved_reg_name(r), val ? val->ival : 0L);
+    return 1;
+  }
+  const char *op = inplace_op(val->kind);
+  if (!op) return 0;
+  Node *a = val->lhs, *b = val->rhs;
+  if (a->kind != ND_VAR || a->is_global || a->ival != off) return 0;
+  if (!is_imm32(b) && !reg_local(b)) return 0;
+  if (is_imm32(b)) fprintf(out, "    %s %s, %ld\n", op, saved_reg_name(r), b->ival);
+  else fprintf(out, "    %s %s, %s\n", op, saved_reg_name(r), saved_reg_name(reg_local(b)));
+  return 1;
+}
+
 static void gen_stmt_node(Node *n) {
   switch (n->kind) {
     case ND_DECL:
+      if (gen_reg_assign(n->ival, n->rhs)) return;
       if (n->rhs) gen_expr(n->rhs);
       else fprintf(out, "    mov rax, 0\n");
-      fprintf(out, "    mov [rbp - %ld], rax\n", n->ival);
+      fprintf(out, "    mov %s, rax\n", slot(n->ival));
       return;
     case ND_ASSIGN:
+      if (!n->is_global && gen_reg_assign(n->ival, n->rhs)) return;
       gen_expr(n->rhs);
       if (n->is_global) fprintf(out, "    mov [.G%s], rax\n", n->name);
-      else fprintf(out, "    mov [rbp - %ld], rax\n", n->ival);
+      else fprintf(out, "    mov %s, rax\n", slot(n->ival));
       return;
     case ND_INDEX_ASSIGN:
       /* base + index, then the value, as for store8. */
-      if (is_stable_leaf(n->lhs) && !is_leaf(n->rhs)) gen_operands(n->rhs, n->lhs);
-      else gen_operands(n->lhs, n->rhs);
-      fprintf(out, "    add rax, rcx\n");
+    {
+      Node *ia = n->lhs, *ib = n->rhs;
+      if (is_stable_leaf(ia) && !is_leaf(ib)) { ia = n->rhs; ib = n->lhs; }
+      int iimm = gen_operands_imm(ia, ib);
+      fprintf(out, "    add rax, ");
+      emit_rhs(iimm, ib);
+    }
       if (is_leaf(n->cond)) {
         fprintf(out, "    mov rdi, rax\n");
         gen_expr(n->cond);
@@ -2528,9 +2687,9 @@ static void gen_stmt_node(Node *n) {
       gen_expr(n->lhs);
       Node *t1 = n->cond, *t2 = n->rhs;
       if (t1->is_global) fprintf(out, "    mov [.G%s], rax\n", t1->name);
-      else fprintf(out, "    mov [rbp - %ld], rax\n", t1->ival);
+      else fprintf(out, "    mov %s, rax\n", slot(t1->ival));
       if (t2->is_global) fprintf(out, "    mov [.G%s], rdx\n", t2->name);
-      else fprintf(out, "    mov [rbp - %ld], rdx\n", t2->ival);
+      else fprintf(out, "    mov %s, rdx\n", slot(t2->ival));
       return;
     }
     case ND_DEFER:
@@ -2555,8 +2714,61 @@ static void gen_stmt_node(Node *n) {
   }
 }
 
+/* The parameters' arrival and the body, the part of a function generated
+ * twice. */
+static void gen_body(Function *f) {
+  for (int i = 0; i < f->nparams; i++) {
+    if (i < MAX_PARAMS) {
+      fprintf(out, "    mov %s, %s\n", slot((long)(i + 1) * 8), ARG_REGS[i]);
+    } else {
+      /* Stack-passed, the caller left it at [rbp+16+8*(nparams-1-i)], mirroring
+       * how its own stack looked at the moment of `call` (see gen_call). */
+      long stack_off = 16 + (long)(f->nparams - 1 - i) * 8;
+      fprintf(out, "    mov rax, [rbp + %ld]\n", stack_off);
+      fprintf(out, "    mov %s, rax\n", slot((long)(i + 1) * 8));
+    }
+  }
+  n_defers = 0;
+  gen_block(f->body);
+}
+
+/* Gives the up to five heaviest slots a register each, heaviest first, ties
+ * to the lower slot. A slot weighing less than 3 stays on the stack, since
+ * saving and restoring the register would cost what it saves. Returns how
+ * many registers are in use. */
+static int pick_slot_regs(long nslots) {
+  int used = 0;
+  while (used < 5) {
+    long best = -1, bestw = 2;
+    for (long i = 1; i <= nslots; i++)
+      if (slot_reg[i] == 0 && slot_weight[i] > bestw) { best = i; bestw = slot_weight[i]; }
+    if (best < 0) return used;
+    slot_reg[best] = ++used;
+  }
+  return used;
+}
+
 static void gen_function(Function *f) {
-  long frame = f->stack_size;
+  long nslots = f->stack_size / 8;
+  slot_weight = calloc(nslots + 1, sizeof *slot_weight);
+  slot_reg = calloc(nslots + 1, sizeof *slot_reg);
+  if (!slot_weight || !slot_reg) error("out of memory");
+  if (!dry_out) dry_out = fopen("/dev/null", "w");
+  if (!dry_out) error("cannot open /dev/null");
+
+  FILE *real_out = out;
+  int first_label = label_count;
+  out = dry_out;
+  emit_dry = 1;
+  current_ret_label = label_count++;
+  gen_body(f);
+  emit_dry = 0;
+  out = real_out;
+  label_count = first_label;
+  int nregs = pick_slot_regs(nslots);
+
+  /* The saved registers sit below the locals. */
+  long frame = f->stack_size + nregs * 8;
   if (frame % 16 != 0) frame += 16 - (frame % 16);
 
   current_ret_label = label_count++;
@@ -2566,21 +2778,10 @@ static void gen_function(Function *f) {
   fprintf(out, "    push rbp\n");
   fprintf(out, "    mov rbp, rsp\n");
   if (frame > 0) fprintf(out, "    sub rsp, %ld\n", frame);
+  for (int i = 1; i <= nregs; i++)
+    fprintf(out, "    mov [rbp - %ld], %s\n", f->stack_size + i * 8, saved_reg_name(i));
 
-  for (int i = 0; i < f->nparams; i++) {
-    if (i < MAX_PARAMS) {
-      fprintf(out, "    mov [rbp - %ld], %s\n", (long)(i + 1) * 8, ARG_REGS[i]);
-    } else {
-      /* Stack-passed, the caller left it at [rbp+16+8*(nparams-1-i)], mirroring
-       * how its own stack looked at the moment of `call` (see gen_call). */
-      long stack_off = 16 + (long)(f->nparams - 1 - i) * 8;
-      fprintf(out, "    mov rax, [rbp + %ld]\n", stack_off);
-      fprintf(out, "    mov [rbp - %ld], rax\n", (long)(i + 1) * 8);
-    }
-  }
-
-  n_defers = 0;
-  gen_block(f->body);
+  gen_body(f);
 
   fprintf(out, ".Lret%d:\n", current_ret_label);
   /* Deferred statements run here, before the frame is torn down, in reverse
@@ -2594,9 +2795,13 @@ static void gen_function(Function *f) {
     fprintf(out, "    pop rdx\n");
     fprintf(out, "    pop rax\n");
   }
+  for (int i = 1; i <= nregs; i++)
+    fprintf(out, "    mov %s, [rbp - %ld]\n", saved_reg_name(i), f->stack_size + i * 8);
   fprintf(out, "    mov rsp, rbp\n");
   fprintf(out, "    pop rbp\n");
   fprintf(out, "    ret\n");
+  free(slot_weight);
+  free(slot_reg);
 }
 
 /* ------------------------------------------------------------ token dump */
@@ -2929,17 +3134,15 @@ static int file_exists(const char *path) {
   return 1;
 }
 
-/* Currently-open include chain, for cycle detection -- a doubly-nested or
- * diamond-shaped include graph is not the expected shape (the usual case is
- * one entry file including several leaf subsystem files, none of which
- * include each other), but a cycle would otherwise recurse until the stack
- * overflows with no clear error, so it is cheap insurance to check for it
- * directly rather than leave it as a footgun. */
+/* Currently-open include chain, for cycle detection. A file that ends up
+ * including itself would otherwise recurse until the stack overflows with no
+ * clear error. A diamond, where two files include the same third one, is
+ * fine and is handled by `included` below. */
 #define INCLUDE_MAX_DEPTH 32
 static const char *include_stack[INCLUDE_MAX_DEPTH];
 static int include_depth = 0;
 
-/* Every file ever spliced, by its resolved path, so a file reached a second
+/* Every file ever spliced, by its path_key, so a file reached a second
  * time (a diamond, two included files that both include a third) is spliced
  * once and skipped after -- faster, and it removes the duplicate-definition
  * error that a second textual copy would otherwise cause. A true cycle is
@@ -2947,6 +3150,49 @@ static int include_depth = 0;
 #define MAX_INCLUDED 256
 static const char *included[MAX_INCLUDED];
 static int n_included = 0;
+
+/* The path with "." parts dropped and "dir/.." folded away, the key that
+ * tells whether two include paths name the same file. A ".." with nothing
+ * left to fold stays, and one above the root is the root. Messages keep the
+ * path as written. Symbolic links are not followed, so two names for one
+ * file through a link still count as two. */
+static char *path_key(const char *path) {
+  long n = strlen(path);
+  char *out = malloc(n + 2);
+  long len = 0;
+  int abs = path[0] == '/';
+  if (abs) out[len++] = '/';
+  long base = len;
+  long i = 0;
+  while (i < n) {
+    while (i < n && path[i] == '/') i++;
+    long s = i;
+    while (i < n && path[i] != '/') i++;
+    long plen = i - s;
+    if (plen == 0 || (plen == 1 && path[s] == '.')) {
+      /* nothing */
+    } else if (plen == 2 && path[s] == '.' && path[s + 1] == '.') {
+      long ls = len;
+      while (ls > base && out[ls - 1] != '/') ls--;
+      int last_is_up = len - ls == 2 && out[ls] == '.' && out[ls + 1] == '.';
+      if (len > base && !last_is_up) {
+        len = ls;
+        if (len > base) len--;
+      } else if (!abs) {
+        if (len > base) out[len++] = '/';
+        out[len++] = '.';
+        out[len++] = '.';
+      }
+    } else {
+      if (len > base) out[len++] = '/';
+      memcpy(out + len, path + s, plen);
+      len += plen;
+    }
+  }
+  if (len == 0) out[len++] = '.';
+  out[len] = 0;
+  return out;
+}
 
 /* The line `at` is on, counting from the start of `src`. */
 static int line_in(const char *src, const char *at) {
@@ -2956,11 +3202,12 @@ static int line_in(const char *src, const char *at) {
 }
 
 static void expand_file(Growbuf *out, const char *path) {
+  const char *key = path_key(path);
   for (int i = 0; i < n_included; i++)
-    if (strcmp(included[i], path) == 0) return; /* include-once, already spliced */
+    if (strcmp(included[i], key) == 0) return; /* include-once, already spliced */
   if (n_included >= MAX_INCLUDED) error("include: more than %d distinct files", MAX_INCLUDED);
-  included[n_included++] = path;
-  include_stack[include_depth++] = path;
+  included[n_included++] = key;
+  include_stack[include_depth++] = key;
 
   char *src = read_file(path);
   char *dir = dirname_with_slash(path);
@@ -3030,8 +3277,9 @@ static void expand_file(Growbuf *out, const char *path) {
             if (file_exists(cand)) { inc_path = cand; break; }
           }
         }
+        char *inc_key = path_key(inc_path);
         for (int i = 0; i < include_depth; i++) {
-          if (strcmp(include_stack[i], inc_path) == 0) error("include: circular include of %s", inc_path);
+          if (strcmp(include_stack[i], inc_key) == 0) error("include: circular include of %s", inc_path);
         }
         if (include_depth >= INCLUDE_MAX_DEPTH) error("include: nested more than %d files deep", INCLUDE_MAX_DEPTH);
         FILE *probe = fopen(inc_path, "rb");
@@ -3122,6 +3370,7 @@ int main(int argc, char **argv) {
     if (strcmp(f->name, "main") == 0) {
       if (f->nparams != 0) error("'main' must take no parameters");
       if (f->is_void) error("'main' must return int, not void");
+      if (f->two_ret) error("'main' must return one int, not two");
       found_main = 1;
     }
   }

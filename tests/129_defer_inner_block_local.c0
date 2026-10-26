@@ -1,0 +1,24 @@
+// expect: compile-error
+//
+// tests/129_defer_inner_block_local.c0 - a defer may not use a local of an inner block
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A defer runs when the function returns. By then the block that declared
+// `a` has ended, and the block after it reuses a's slot for `b`, so the
+// defer would read 7 instead of 5. It is refused.
+int seen = 0;
+
+int f() {
+    {
+        int a = 5;
+        defer seen = a;
+    }
+    {
+        int b = 7;
+    }
+    return 0;
+}
+
+int main() {
+    f();
+    return seen;
+}

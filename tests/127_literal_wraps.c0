@@ -1,0 +1,19 @@
+// expect: 6
+//
+// tests/127_literal_wraps.c0 - a literal past 64 bits keeps its low 64 bits
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A literal too large for 64 bits keeps its low 64 bits, in decimal and in
+// hex, so every implementation reads it the same way. A library that clamps
+// instead would make the first two 2^64 - 1, which is -1 here.
+int big = 18446744073709551617;
+
+int main() {
+    int ok = 0;
+    if (18446744073709551616 == 0) { ok += 1; }
+    if (big == 1) { ok += 1; }
+    if (0x10000000000000000 == 0) { ok += 1; }
+    if (0x1FFFFFFFFFFFFFFFF == -1) { ok += 1; }
+    if (99999999999999999999999 == 200376420520689663) { ok += 1; }
+    if (0xABCDEF0123456789ABCDEF == 0x0123456789ABCDEF) { ok += 1; }
+    return ok;
+}

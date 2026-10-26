@@ -1,0 +1,1 @@
+coff0: tests/131_start_as_function_name.c0:7: '_start' is the entry point and cannot name a function

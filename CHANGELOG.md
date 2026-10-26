@@ -4,6 +4,71 @@ Every release of coff, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
 plain [semantic versions](https://semver.org/) with no names.
 
+## [0.7.0] - 2026-10-26
+
+### Added
+
+- flyt, `lib/flyt.c0`, IEEE 754 doubles as a c0 library, since c0 has no
+  floating-point type. A double is an int holding its 64 bits. Addition,
+  subtraction, multiplication, division and square roots round to nearest
+  with ties to even, with signed zeros, subnormals, infinities and NaN, and
+  decimal text is read and written exactly rounded. `lib/flyt_check.sh`
+  compares it with the machine's own doubles over about 49000 cases.
+- `open_read`, `open_write`, `read`, `write` and `close` under `--elf`, as
+  Moonshot's file system calls, so coff and smed themselves compile for
+  Moonshot unchanged.
+- smed assembles `cpuid`.
+- Tests 126 to 132 cover the most negative number, the literals, the
+  include paths, the defer rule, `_start` and `main` below. Each was checked
+  by bringing the old behaviour back and watching the test fail, and test
+  130, which holds what a defer may still use, by making the new check too
+  strict.
+
+### Changed
+
+- smed writes a program as two segments, its code readable and runnable,
+  and everything else, from the next page on, readable and writable but not
+  runnable, where it was one segment that was all three.
+- smed starts with a 1MB input buffer instead of 8MB. It still grows as
+  needed, and now fits in a Moonshot program's heap.
+- The busiest local variables of each function live in registers (rbx and
+  r12 to r15) instead of on the stack. A use inside a loop counts for more
+  than one outside it, so loop counters get a register first. Each function
+  saves and restores the registers it uses.
+- A local held in a register is used directly as an operand, compared
+  directly in a condition, and updated in place by `x = x + y` and `+=` when
+  `y` is a number or another register.
+- `run_tests.sh` checks that every function saves and restores the
+  registers it keeps locals in, with `check_saved_regs.awk`, where it used to
+  check that no code used rbx at all.
+- `BOOTSTRAP.sha256` also hashes flyt and `check_saved_regs.awk`.
+- The checks that use my kernel find it in its new folder layout.
+- A defer may no longer use a local declared in an inner block. The block
+  has ended by the time the defer runs, and its slot may already hold
+  another block's variable, so such a defer read whatever was there.
+- A function, extern or embed named `_start` is refused. It used to get
+  through and fail in the assembler, since every program has a `_start`.
+- `main` declared `(int, int)` is refused, as `void main` already was.
+- coff writes its output through a 64KB buffer instead of one system call
+  per piece of text, so it compiles about twice as fast.
+
+### Fixed
+
+- Every string literal took a buffer as large as the whole source file while
+  it was read. It now takes what the literal can need. On Linux the unused
+  pages cost nothing, but a system that zeroes what it hands out paid for
+  all of them.
+- The most negative number, -2^63, was written into the assembly as a bare
+  minus sign, so `1 << 63` as a global or a constant came out as 0. coff0
+  wrote it correctly, so the two compilers disagreed on it. Every number
+  printer in the toolchain had the same fault and all are fixed.
+- A number literal too large for 64 bits is its low 64 bits in every
+  implementation. coff0 clamped it to 2^64 - 1 where the others wrapped, so
+  the two compilers disagreed on it.
+- Include-once goes by the file, not by how its path is written, so
+  `include "lib.c0";` and `include "./lib.c0";` no longer splice the same
+  file twice.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added
@@ -155,6 +220,7 @@ plain [semantic versions](https://semver.org/) with no names.
   assembly and is written in c0 itself. `coff0.c` is the one-time bootstrap,
   kept as the reference the tests compare everything against.
 
+[0.7.0]: https://github.com/cofflang/coff/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cofflang/coff/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cofflang/coff/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cofflang/coff/compare/v0.3.1...v0.4.0

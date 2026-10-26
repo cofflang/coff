@@ -62,8 +62,9 @@
 // Every `.section` directive switches to a named buffer, and a file may
 // return to an earlier section as often as it likes.  Without a linker
 // script the sections are placed in the order they were first named, packed
-// together, in one read/write/execute PT_LOAD segment at 0x400000 with
-// p_offset 0 -- which is what coff's output needs.
+// together from 0x400000, the code first.  The code gets a PT_LOAD of its
+// own, readable and runnable, and everything else a second one from the next
+// page on, readable and writable but not runnable.
 //
 // With `-T script` the layout comes from the script instead.  The script is
 // the same linker.ld GNU ld reads, or rather the small subset of that
@@ -94,6 +95,10 @@
 
 int BASE = 0x400000;   // load address when no script says otherwise (--base)
 int HDRS = 120;        // 64-byte ELF header + 56-byte program header
+int HDRS2 = 176;       // the same with two program headers, without a script
+int text_end = 0;      // without a script, where the code ends
+int data_start = 0;    // and where the rest starts, a page later, or 0 when
+                       // there is nothing but code
 int PAGE = 4096;
 
 int pass = 0;          // 1 = measure and place labels, 2 = emit
@@ -191,11 +196,13 @@ void print_int(int v) {
     int i = 23;
     int n = v;
     if (!n) { print("0"); return; }
-    if (n < 0) { print("-"); n = 0 - n; }
+    if (n < 0) { print("-"); }
     buf[i] = 0;
-    while (n > 0) {
+    while (n != 0) {
+        int d = n % 10;
+        if (d < 0) { d = 0 - d; }
         i -= 1;
-        buf[i] = 48 + (n % 10);
+        buf[i] = 48 + d;
         n /= 10;
     }
     print(buf + i);
@@ -1225,6 +1232,7 @@ void do_instruction() {
     if (slice_is(m, n, "nop") == 1)     { emit1(0x90); return; }
     if (slice_is(m, n, "rdmsr") == 1)   { emit1(0x0F); emit1(0x32); return; }
     if (slice_is(m, n, "wrmsr") == 1)   { emit1(0x0F); emit1(0x30); return; }
+    if (slice_is(m, n, "cpuid") == 1)   { emit1(0x0F); emit1(0xA2); return; }
 
     // Conditional branches are 0F 8x rel32.
     cc = 0 - 1;
@@ -1508,8 +1516,8 @@ void do_directive() {
         read_word();
         if (!word_len) { serr_at("section wants a name"); }
         enter_section(src + word_start, word_len);
-        // Flags such as "a" or "ax" say nothing smed needs, since every
-        // section lands in one RWX segment.
+        // Flags such as "a" or "ax" say nothing smed needs, since it tells
+        // code from the rest by the section's name.
         skip_space();
         if (peek() == 44) { skip_to_eol(); }
         return;
@@ -1827,7 +1835,30 @@ void place_sections() {
     } else {
         seg_vaddr = BASE;
         seg_off = 0;
-        addr = BASE + HDRS;
+        addr = BASE + HDRS2;
+        // The code first, then the rest from the next page.
+        data_start = 0;
+        int round = 0;
+        for (round = 0; round < 2; round += 1) {
+            if (round == 1) {
+                text_end = addr;
+                addr = ((addr + PAGE - 1) / PAGE) * PAGE;
+            }
+            int k = 0;
+            for (k = 0; k < sect_count; k += 1) {
+                if (sect_is_text(k) == 1 - round) {
+                    a = load64(sect_align + k * 8);
+                    if ((addr / a) * a != addr) { addr = (addr / a) * a + a; }
+                    if (round == 1 && data_start == 0) { data_start = addr; }
+                    store64(sect_base + k * 8, addr);
+                    size = load64(sect_pos + k * 8);
+                    store64(sect_size + k * 8, size);
+                    addr += size;
+                }
+            }
+        }
+        if (data_start == 0) { text_end = addr; }
+        return;
     }
     while (i < sect_count) {
         a = load64(sect_align + i * 8);
@@ -1841,6 +1872,11 @@ void place_sections() {
     return;
 }
 
+// 1 when section i is code, a .text.
+int sect_is_text(int i) {
+    return slices_eq(load64(sect_name + i * 8), load64(sect_namelen + i * 8), ".text", 5);
+}
+
 void zero(int buf, int n) {
     int i = 0;
     for (i = 0; i < n; i += 1) { store8(buf + i, 0); }
@@ -1848,10 +1884,12 @@ void zero(int buf, int n) {
 }
 
 // --- ELF ------------------------------------------------------------------
-// One PT_LOAD, read/write/execute because .data shares the single segment
-// with the code.  Without a script p_offset is 0 so the file maps at BASE
-// with no offset arithmetic.
-// With a script the segment starts one page into the file so that file
+// Without a script there are two PT_LOADs, the code readable and runnable
+// and everything else, from the next page on, readable and writable but not
+// runnable, or just the first when there is nothing but code.  The code's
+// p_offset is 0 so the file maps at BASE with no offset arithmetic.
+// With a script there is one PT_LOAD, read/write/execute, holding
+// everything where the script put it.  It starts one page into the file so that file
 // offsets and addresses stay congruent modulo the page size, the convention
 // every loader expects, and the first section sits exactly at the base
 // address the script asked for.
@@ -1908,7 +1946,9 @@ void write_zeros(int fd, int n) {
 }
 
 void write_elf(int fd) {
-    int hdr = alloc(HDRS);
+    int hsize = HDRS;
+    if (!script) { hsize = HDRS2; }
+    int hdr = alloc(hsize);
     int i = 0;
     int mem_end = 0;
     int data_end = 0;
@@ -1929,7 +1969,7 @@ void write_elf(int fd) {
     }
     if (!script) { data_end = mem_end; }
 
-    zero(hdr, HDRS);
+    zero(hdr, hsize);
     hdr_b(hdr, 0, 0x7F);
     hdr_b(hdr, 1, 69); hdr_b(hdr, 2, 76); hdr_b(hdr, 3, 70);   // E L F
     hdr_b(hdr, 4, 2);    // ELFCLASS64
@@ -1945,7 +1985,11 @@ void write_elf(int fd) {
     hdr_32(hdr, 48, 0);      // e_flags
     hdr_16(hdr, 52, 64);     // e_ehsize
     hdr_16(hdr, 54, 56);     // e_phentsize
-    hdr_16(hdr, 56, 1);      // e_phnum
+    if (!script && data_start != 0) {
+        hdr_16(hdr, 56, 2);  // e_phnum, the code and the rest
+    } else {
+        hdr_16(hdr, 56, 1);  // e_phnum
+    }
     if (script != 0) {
         hdr_16(hdr, 58, 64);     // e_shentsize
         hdr_16(hdr, 60, 1);      // e_shnum, the null entry only
@@ -1956,25 +2000,55 @@ void write_elf(int fd) {
     hdr_16(hdr, 62, 0);      // e_shstrndx
 
     hdr_32(hdr, 64, 1);      // p_type = PT_LOAD
-    hdr_32(hdr, 68, 7);      // p_flags = R | W | X
-    hdr_64(hdr, 72, seg_off);            // p_offset
-    hdr_64(hdr, 80, seg_vaddr);          // p_vaddr
-    hdr_64(hdr, 88, seg_vaddr);          // p_paddr
-    hdr_64(hdr, 96, data_end - seg_vaddr);  // p_filesz
-    hdr_64(hdr, 104, mem_end - seg_vaddr);  // p_memsz
+    if (script != 0) {
+        hdr_32(hdr, 68, 7);      // p_flags = R | W | X
+        hdr_64(hdr, 72, seg_off);            // p_offset
+        hdr_64(hdr, 80, seg_vaddr);          // p_vaddr
+        hdr_64(hdr, 88, seg_vaddr);          // p_paddr
+        hdr_64(hdr, 96, data_end - seg_vaddr);  // p_filesz
+        hdr_64(hdr, 104, mem_end - seg_vaddr);  // p_memsz
+    } else {
+        // The code, read and execute.
+        hdr_32(hdr, 68, 5);
+        hdr_64(hdr, 72, 0);
+        hdr_64(hdr, 80, seg_vaddr);
+        hdr_64(hdr, 88, seg_vaddr);
+        hdr_64(hdr, 96, text_end - seg_vaddr);
+        hdr_64(hdr, 104, text_end - seg_vaddr);
+    }
     hdr_64(hdr, 112, PAGE);  // p_align
+    if (!script && data_start != 0) {
+        // The rest, read and write, at the same distance into the file as
+        // into memory, so file offset and address agree modulo the page.
+        hdr_32(hdr, 120, 1);
+        hdr_32(hdr, 124, 6);
+        hdr_64(hdr, 128, data_start - seg_vaddr);
+        hdr_64(hdr, 136, data_start);
+        hdr_64(hdr, 144, data_start);
+        hdr_64(hdr, 152, data_end - data_start);
+        hdr_64(hdr, 160, mem_end - data_start);
+        hdr_64(hdr, 168, PAGE);
+    }
 
-    write(fd, hdr, HDRS);
-    filepos = HDRS;
-    i = 0;
-    for (i = 0; i < sect_count; i += 1) {
-        size = load64(sect_size + i * 8);
-        if (load64(sect_base + i * 8) < data_end && size > 0) {
-            off = seg_off + (load64(sect_base + i * 8) - seg_vaddr);
-            if (off < filepos) { serr("sections overlap in the file"); }
-            write_zeros(fd, off - filepos);
-            write(fd, load64(sect_buf + i * 8), size);
-            filepos = off + size;
+    write(fd, hdr, hsize);
+    filepos = hsize;
+    // In the order they were placed, which without a script is the code
+    // first, whatever order the sections were named in.
+    int round = 0;
+    int rounds = 1;
+    if (!script) { rounds = 2; }
+    for (round = 0; round < rounds; round += 1) {
+        for (i = 0; i < sect_count; i += 1) {
+            size = load64(sect_size + i * 8);
+            int take = 1;
+            if (!script) { take = sect_is_text(i) == 1 - round; }
+            if (take && load64(sect_base + i * 8) < data_end && size > 0) {
+                off = seg_off + (load64(sect_base + i * 8) - seg_vaddr);
+                if (off < filepos) { serr("sections overlap in the file"); }
+                write_zeros(fd, off - filepos);
+                write(fd, load64(sect_buf + i * 8), size);
+                filepos = off + size;
+            }
         }
     }
     return;
@@ -2017,7 +2091,9 @@ void write_map(int name) {
 
 int read_file(int name) {
     int fd = open_read(name);
-    int cap = 8388608;
+    // 1MB to start with, which leaves room in a Moonshot process's heap
+    // for everything else smed allocates.
+    int cap = 1048576;
     int buf = 0;
     int len = 0;
     int got = 0;
@@ -2082,7 +2158,7 @@ int main() {
             map_name = argv(i + 1);
             i += 2;
         } else if (slice_is(a, 6, "--base") == 1 && i + 1 < argc()) {
-            // Where the single segment loads when no script says.  Moonshot
+            // Where the code loads when no script says.  Moonshot
             // ring-3 programs are built with --base 0x80000000, the address
             // the kernel maps user images at; the default is what Linux
             // executables use.

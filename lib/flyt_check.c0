@@ -1,0 +1,103 @@
+// flyt_check.c0 - runs flyt over the cases flyt_check.sh writes
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0. coff is free
+// software, distributed under the GNU General Public License version 3
+// or (at your option) any later version, WITHOUT ANY WARRANTY; see the
+// LICENSE file for the full text.
+//
+// Runs flyt.c0 over the cases flyt_check.sh writes and writes the answers
+// back. Each case is a line of 36 characters, `op a b`, op one letter and a
+// and b sixteen hex digits each, or for p the text to read from the third
+// character on. Each answer is a line of 48 characters, sixteen hex digits or
+// for f the text written, padded with spaces.
+//   a add   s sub   m mul   d div   c cmp   i from_int(a)   t to_int(a)
+//   p parse   f format a with b places   q sqrt(a)
+// The second argument, if there is one, is how many times to run all of
+// them, for timing, and then only the last round is written.
+include "flyt.c0";
+
+int hexval(int c) {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    return c - 'a' + 10;
+}
+
+int read_hex(int s) {
+    int v = 0;
+    int i = 0;
+    for (i = 0; i < 16; i += 1) { v = (v << 4) | hexval(s[i]); }
+    return v;
+}
+
+void put_hex(int buf, int v) {
+    int i = 0;
+    for (i = 15; i >= 0; i -= 1) {
+        int d = v & 15;
+        if (d < 10) { buf[i] = '0' + d; } else { buf[i] = 'a' + d - 10; }
+        v = v >> 4;
+    }
+    return;
+}
+
+int main() {
+    if (argc() < 3) { return 1; }
+    int fd = open_read(argv(1));
+    if (fd < 0) { return 2; }
+    int cap = 1 << 24;
+    int in = alloc(cap);
+    int n = 0;
+    int got = read(fd, in, cap);
+    while (got > 0) { n += got; got = read(fd, in + n, cap - n); }
+    close(fd);
+    int cases = n / 36;          // "x " + 16 + " " + 16 + "\n"
+    int out = alloc(cases * 49 + 400);
+    int rounds = 1;
+    if (argc() >= 4) {
+        rounds = 0;
+        int r = argv(3);
+        int k = 0;
+        while (r[k] >= '0' && r[k] <= '9') { rounds = rounds * 10 + r[k] - '0'; k += 1; }
+    }
+    int round = 0;
+    for (round = 0; round < rounds; round += 1) {
+        int c = 0;
+        for (c = 0; c < cases; c += 1) {
+            int line = in + c * 36;
+            int op = line[0];
+            int o = out + c * 49;
+            int k2 = 0;
+            for (k2 = 0; k2 < 48; k2 += 1) { o[k2] = ' '; }
+            o[48] = '\n';
+            if (op == 'p') {
+                int pv = 0;
+                int used = 0;
+                pv, used = f64_parse(line + 2);
+                put_hex(o, pv);
+                continue;
+            }
+            int a = read_hex(line + 2);
+            int b = read_hex(line + 19);
+            if (op == 'f') {
+                int len = f64_format(a, o, b);
+                o[len] = ' ';
+                continue;
+            }
+            int r2 = 0;
+            if (op == 'a') { r2 = f64_add(a, b); }
+            if (op == 's') { r2 = f64_sub(a, b); }
+            if (op == 'm') { r2 = f64_mul(a, b); }
+            if (op == 'd') { r2 = f64_div(a, b); }
+            if (op == 'c') { r2 = f64_cmp(a, b); }
+            if (op == 'i') { r2 = f64_from_int(a); }
+            if (op == 't') { r2 = f64_to_int(a); }
+            if (op == 'q') { r2 = f64_sqrt(a); }
+            put_hex(o, r2);
+        }
+    }
+    int ofd = open_write(argv(2));
+    if (ofd < 0) { return 3; }
+    write(ofd, out, cases * 49);
+    close(ofd);
+    return 0;
+}

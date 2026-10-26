@@ -1,0 +1,22 @@
+// expect: 7
+//
+// tests/126_most_negative_int.c0 - the most negative int, -2^63
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// The most negative int, -2^63, as a global initialiser and as a constant in
+// code. It has no positive counterpart, so a compiler that writes a negative
+// number out by printing a minus and then the number negated has nothing to
+// print after the minus.
+int lowest = 1 << 63;
+
+int main() {
+    int ok = 0;
+    if (lowest < 0) { ok += 1; }
+    if (lowest - 1 > 0) { ok += 1; }
+    int here = 1 << 63;
+    if (here == lowest) { ok += 1; }
+    if ((lowest >> 62) == 0 - 2) { ok += 1; }
+    if (lowest + lowest == 0) { ok += 1; }
+    if ((lowest ^ (0 - 1)) == 9223372036854775807) { ok += 1; }
+    if (lowest / 2 == 0 - 4611686018427387904) { ok += 1; }
+    return ok;
+}

@@ -1,0 +1,8 @@
+// expect: compile-error
+//
+// tests/132_main_two_values.c0 - main cannot return two values
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// main's value is the exit code, one int, so main cannot return two.
+(int, int) main() {
+    return 1, 2;
+}

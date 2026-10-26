@@ -465,7 +465,7 @@ else
     # is the tool that packs the tests (bake.c0 sits in the kernel
     # directory and is picked up by the first glob). Gnista's sources live
     # in ../gnista in the dev tree and in programs/ in a release.
-    for f in "$ms"/*.c0 "$ms"/programs/*.c0 ../gnista/*.c0; do
+    for f in "$ms"/kernel/*/*.c0 "$ms"/tools/*.c0 "$ms"/programs/*.c0 ../gnista/*.c0; do
       case "$f" in *_data.c0|*.bak*) continue ;; esac
       [ -f "$f" ] && corpus="$corpus $f"
     done
@@ -544,7 +544,8 @@ echo ""
   echo "ld: $(ld --version 2>/dev/null | head -1)"
   [ -n "$diverse" ] && echo "diverse: $($diverse --version 2>&1 | head -1)"
   echo ""
-  hashq coff0.c c0/coff.c0 c0/lex.c0 c0/parse.c0 c0/smed.c0 c0/sha256.c0 c0/cmp.c0
+  hashq coff0.c c0/coff.c0 c0/lex.c0 c0/parse.c0 c0/smed.c0 c0/sha256.c0 c0/cmp.c0 \
+        lib/flyt.c0 lib/flyt_check.c0
   # No binary is hashed. None is committed, and a manifest that changed
   # whenever the tree was built would fail on every fresh clone, and a
   # check that cries wolf gets ignored. The binaries themselves are checked
@@ -560,7 +561,8 @@ echo ""
   # this repository is either, or the committed manifest would match only
   # one of the two layouts the README describes. The kernel sources still
   # go into the DDC corpus (stage 3) when they sit next to this tree.
-  hashq run_tests.sh verify_bootstrap.sh smed_tests.sh fetch_ddc_cproc.sh
+  hashq run_tests.sh check_saved_regs.awk verify_bootstrap.sh smed_tests.sh \
+        fetch_ddc_cproc.sh lib/flyt_check.sh
   # File names here never contain spaces, so word splitting is safe.
   hashq $(find tests -type f 2>/dev/null | LC_ALL=C sort)
 } > "$tmpdir/manifest"

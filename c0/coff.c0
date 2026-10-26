@@ -44,8 +44,8 @@
 //   50 PERCENTEQ, 51 FOR, 52 DEFER.
 //
 // Node kinds use the same numbering as parse.c0 (1 NUM .. 22 BLOCK), plus
-//   23 AND, 24 OR (both short-circuiting; precedence between equality and
-//   the statement grammar, || loosest of the two), 25 BREAK, 26 CONTINUE
+//   23 AND, 24 OR (both short-circuiting, the two loosest operators, ||
+//   looser than &&, with | ^ & between && and equality), 25 BREAK, 26 CONTINUE
 //   (both only valid inside a loop, which resolve() enforces),
 //   27 INDEX (child1=base, child2=index; buf[i] sugar over load8(buf+i)),
 //   28 INDEXASSIGN (child1=base, child2=index, child3=value),
@@ -219,6 +219,7 @@ int current_fn_is_void = 0;
 int current_fn_two_ret = 0;
 int resolving_multi_call = 0;
 int in_defer = 0;   // set while resolving a deferred statement; it may not return, break, continue or defer
+int defer_sym_base = 0; // sym_count when the deferred statement began, so its own locals are told apart
 
 int scope_marks = 0;
 int scope_depth = 0;
@@ -233,6 +234,17 @@ int current_ret_label = 0;
 int loop_labels = 0;
 int loop_is_for = 0;
 int gen_loop_depth = 0;
+
+// Register allocation. Every function is generated twice. The first pass
+// (emit_dry) writes nothing and weighs each stack slot by its uses, a use
+// each loop around a use multiplying its weight by 8, up to three loops
+// deep. The busiest slots then live
+// in callee-saved registers for the real pass, so a call never disturbs them
+// and c0, having no address-of for locals, can never reach them through a
+// pointer.
+int emit_dry = 0;
+int slot_weight = 0; // per slot of the current function, filled by the dry pass
+int slot_reg = 0;    // per slot, 0 for the stack or 1-5 for rbx, r12-r15
 
 int defers = 0;     // alloc'd 64 * 8, deferred statements collected while generating a function body
 int n_defers = 0;   // reset per function; emitted in reverse at .Lret
@@ -258,7 +270,7 @@ int elf_mode = 0;
 int INCLUDE_MAX_DEPTH = 32;
 int include_stack = 0; // alloc'd once, INCLUDE_MAX_DEPTH * 8 bytes
 int include_depth = 0;
-// Every file ever spliced, by resolved path, so a diamond (two files both
+// Every file ever spliced, by its path_key, so a diamond (two files both
 // including a third) splices it once and skips it after. A true cycle is
 // still caught by include_stack before this. Mirrors coff0.c's `included`.
 int MAX_INCLUDED = 256;
@@ -270,6 +282,13 @@ int expand_len = 0;
 
 // --- shared helpers (same as parse.c0) -------------------------------------
 
+void mem_copy_out(int dst, int src, int n) {
+    int i = 0;
+    for (i = 0; i + 8 <= n; i += 8) { store64(dst + i, load64(src + i)); }
+    while (i < n) { store8(dst + i, load8(src + i)); i += 1; }
+    return;
+}
+
 int strlen_(int s) {
     int i = 0;
     while (s[i] != 0) { i += 1; }
@@ -280,8 +299,25 @@ int strlen_(int s) {
 // builtin, since print() always targets stdout — emit() targets outfd, which
 // main() points at the output file when one is given (see the CLI handling
 // at the top of main), or stdout otherwise.
+// Output goes through a buffer, one write() per 64KB instead of one per
+// string.
+int out_buf = 0;
+int out_len = 0;
+
+void flush_out() {
+    if (out_len > 0) { write(outfd, out_buf, out_len); }
+    out_len = 0;
+    return;
+}
+
 void emit(int s) {
-    write(outfd, s, strlen_(s));
+    if (emit_dry == 1) { return; }
+    if (out_buf == 0) { out_buf = alloc(65536); }
+    int n = strlen_(s);
+    if (out_len + n > 65536) { flush_out(); }
+    if (n > 65536) { write(outfd, s, n); return; }
+    mem_copy_out(out_buf + out_len, s, n);
+    out_len += n;
     return;
 }
 
@@ -315,15 +351,25 @@ int is_ident_char(int c) {
     return is_ident_start(c);
 }
 
+// One buffer for every number, since emit() copies the digits out before
+// the next call. Byte 31 is never written and stays the terminating 0.
+int print_int_buf = 0;
+
 void print_int(int v) {
-    int tmp = alloc(32);
+    if (emit_dry == 1) { return; }
+    if (print_int_buf == 0) { print_int_buf = alloc(32); }
+    int tmp = print_int_buf;
     int neg = 0;
     int i = 31;
     if (!v) { emit("0"); return; }
-    if (v < 0) { neg = 1; v = 0 - v; }
-    while (v > 0) {
+    // The digits are taken from the number as it is, negative or not, so
+    // -2^63, which has no positive counterpart, is written out too.
+    if (v < 0) { neg = 1; }
+    while (v != 0) {
+        int d = v % 10;
+        if (d < 0) { d = 0 - d; }
         i -= 1;
-        tmp[i] = '0' + (v % 10);
+        tmp[i] = '0' + d;
         v /= 10;
     }
     if (neg == 1) { i -= 1; tmp[i] = '-'; }
@@ -471,15 +517,62 @@ int read_all(int fd) {
     return buf;
 }
 
+// The path with "." parts dropped and "dir/.." folded away, the key that
+// tells whether two include paths name the same file. A ".." with nothing
+// left to fold stays, and one above the root is the root. Messages keep the
+// path as written. Mirrors coff0.c's path_key.
+int path_key(int path) {
+    int n = 0;
+    while (load8(path + n) != 0) { n += 1; }
+    int out = alloc(n + 2);
+    int len = 0;
+    int abs = load8(path) == '/';
+    if (abs) { store8(out, '/'); len = 1; }
+    int base = len;
+    int i = 0;
+    while (i < n) {
+        while (i < n && load8(path + i) == '/') { i += 1; }
+        int s = i;
+        while (i < n && load8(path + i) != '/') { i += 1; }
+        int plen = i - s;
+        int dot = plen == 1 && load8(path + s) == '.';
+        int up = plen == 2 && load8(path + s) == '.' && load8(path + s + 1) == '.';
+        if (plen == 0 || dot) {
+        } else if (up) {
+            int ls = len;
+            while (ls > base && load8(out + ls - 1) != '/') { ls -= 1; }
+            int last_is_up = len - ls == 2 && load8(out + ls) == '.' && load8(out + ls + 1) == '.';
+            if (len > base && !last_is_up) {
+                len = ls;
+                if (len > base) { len -= 1; }
+            } else if (!abs) {
+                if (len > base) { store8(out + len, '/'); len += 1; }
+                store8(out + len, '.');
+                store8(out + len + 1, '.');
+                len += 2;
+            }
+        } else {
+            if (len > base) { store8(out + len, '/'); len += 1; }
+            int k = 0;
+            while (k < plen) { store8(out + len + k, load8(path + s + k)); k += 1; }
+            len += plen;
+        }
+    }
+    if (len == 0) { store8(out, '.'); len = 1; }
+    store8(out + len, 0);
+    return out;
+}
+
 void expand_file(int path) {
     int i = 0;
+    int key = path_key(path);
     for (i = 0; i < n_included; i += 1) {
-        if (streq(load64(included + i * 8), path) == 1) { return; }
+        if (streq(load64(included + i * 8), key) == 1) { return; }
     }
     if (n_included >= MAX_INCLUDED) { die("include: too many distinct files"); }
-    store64(included + n_included * 8, path);
+    store64(included + n_included * 8, key);
     n_included += 1;
-    store64(include_stack + include_depth * 8, path);
+    store64(include_stack + include_depth * 8, key);
     include_depth += 1;
 
     int fd = open_read(path);
@@ -575,8 +668,9 @@ void expand_file(int path) {
                     }
                 }
                 i = 0;
+                int inc_key = path_key(inc_path);
                 for (i = 0; i < include_depth; i += 1) {
-                    if (streq(load64(include_stack + i * 8), inc_path) == 1) {
+                    if (streq(load64(include_stack + i * 8), inc_key) == 1) {
                         die3("include: circular include of ", inc_path, "");
                     }
                 }
@@ -629,10 +723,12 @@ void eput_int(int v) {
     int neg = 0;
     int i = 31;
     if (!v) { eput("0"); return; }
-    if (v < 0) { neg = 1; v = 0 - v; }
-    while (v > 0) {
+    if (v < 0) { neg = 1; }
+    while (v != 0) {
+        int d = v % 10;
+        if (d < 0) { d = 0 - d; }
         i -= 1;
-        tmp[i] = '0' + (v % 10);
+        tmp[i] = '0' + d;
         v /= 10;
     }
     if (neg == 1) { i -= 1; tmp[i] = '-'; }
@@ -908,7 +1004,17 @@ void lex_all(int buf, int n) {
 
         else if (c == '"') {
             pos += 1;
-            sbuf = alloc(n + 1);
+            // The literal is no longer than the source up to its closing
+            // quote, so that much is enough. A buffer the size of the whole
+            // file per literal costs nothing on Linux, whose untouched pages
+            // are free, and hundreds of megabytes on Moonshot, which zeroes
+            // what it hands out.
+            int q = pos;
+            while (q < n && load8(buf + q) != '"') {
+                if (load8(buf + q) == '\\') { q += 1; }
+                q += 1;
+            }
+            sbuf = alloc(q - pos + 1);
             slen = 0;
             going = 1;
             while (going == 1) {
@@ -1741,10 +1847,17 @@ int is_register_name(int n) {
     return 0;
 }
 
+// _start is the entry point every program gets, so a second one would only
+// fail later, in the assembler.
 void check_symbol_name(int name, int what) {
     if (is_register_name(name) == 1) {
         eopen();
         eput("'"); eput(name); eput("' is a register name and cannot name "); eput(what);
+        efail();
+    }
+    if (streq(name, "_start") == 1) {
+        eopen();
+        eput("'_start' is the entry point and cannot name "); eput(what);
         efail();
     }
     return;
@@ -1973,6 +2086,26 @@ int sym_try_lookup(int name) {
     return 0 - 1;
 }
 
+// A deferred statement runs when the function returns, and by then every
+// inner block has ended and its locals' slots may hold another block's
+// variables. So a defer may use the parameters, the locals of the
+// function's outermost block and its own locals, and nothing declared in an
+// inner block. Mirrors coff0.c's check_defer_local.
+void check_defer_local(int name) {
+    int i = 0;
+    int found = 0;
+    if (in_defer != 1 || scope_depth < 2) { return; }
+    for (i = sym_count - 1; i >= 0 && !found; i -= 1) {
+        if (streq(load64(sym_names + i * 8), name) == 1) {
+            found = 1;
+            if (i >= load64(scope_marks + 8) && i < defer_sym_base) {
+                die3("a defer runs when the function returns, after the block that declares '", name, "' has ended");
+            }
+        }
+    }
+    return;
+}
+
 int sym_declared_in_scope(int name) {
     int scope_start = 0;
     int i = 0;
@@ -2026,7 +2159,7 @@ void resolve_node(int nd) {
     if (k == 3) {
         name = nd.sval;
         off = sym_try_lookup(name);
-        if (off >= 0) { nd.ival = off; return; }
+        if (off >= 0) { check_defer_local(name); nd.ival = off; return; }
         if (glob_exists(name) == 1) { nd.extra = 1; return; }
         if (extern_exists(name) == 1) { nd.kind = 29; return; }
         if (func_exists(name) == 1) { nd.kind = 29; return; }
@@ -2038,7 +2171,7 @@ void resolve_node(int nd) {
         resolve(nd.child2);
         name = nd.sval;
         off = sym_try_lookup(name);
-        if (off >= 0) { nd.ival = off; return; }
+        if (off >= 0) { check_defer_local(name); nd.ival = off; return; }
         if (glob_exists(name) == 1) { nd.extra = 1; return; }
         die3("undeclared variable '", name, "'");
         return;
@@ -2088,7 +2221,7 @@ void resolve_node(int nd) {
             // (whose stack offset then lives in `ival`, same slot VAR
             // uses for the same purpose).
             off = sym_try_lookup(name);
-            if (off >= 0) { nd.ival = off; nd.extra = 2; }
+            if (off >= 0) { check_defer_local(name); nd.ival = off; nd.extra = 2; }
             else if (glob_exists(name) == 1) { nd.extra = 1; }
             else { die3("call to undeclared function '", name, "'"); }
         }
@@ -2137,6 +2270,7 @@ void resolve_node(int nd) {
         saved = loop_depth;
         loop_depth = 0;
         in_defer = 1;
+        defer_sym_base = sym_count;
         resolve(nd.child1);
         in_defer = 0;
         loop_depth = saved;
@@ -2215,11 +2349,43 @@ void gen_block(int nd) {
     return;
 }
 
+int saved_reg_name(int r) {
+    if (r == 1) { return "rbx"; }
+    if (r == 2) { return "r12"; }
+    if (r == 3) { return "r13"; }
+    if (r == 4) { return "r14"; }
+    return "r15";
+}
+
+// A local's operand, its register or its stack slot. The dry pass only
+// weighs the use.
+void emit_slot(int off) {
+    int w = 1;
+    if (emit_dry == 1) {
+        if (gen_loop_depth == 1) { w = 8; }
+        if (gen_loop_depth == 2) { w = 64; }
+        if (gen_loop_depth >= 3) { w = 512; }
+        store64(slot_weight + off, load64(slot_weight + off) + w);
+        return;
+    }
+    int r = load64(slot_reg + off);
+    if (r != 0) { emit(saved_reg_name(r)); return; }
+    emit("[rbp - "); print_int(off); emit("]");
+    return;
+}
+
 // A leaf operand is a number or a variable. Loading one has no side effect
 // and touches no other register, so a binary operator can load it straight
 // into rcx instead of saving rax on the stack around it.
 int is_leaf(int nd) {
     return nd.kind == 1 || nd.kind == 3;
+}
+
+// The register a local lives in, or 0 when it is on the stack, a global or
+// something else, and always 0 in the dry pass.
+int reg_local(int nd) {
+    if (emit_dry == 1 || nd.kind != 3 || nd.extra == 1) { return 0; }
+    return load64(slot_reg + nd.ival);
 }
 
 // Leaves lhs in rax and rhs in rcx, the operand layout of every binary
@@ -2229,7 +2395,7 @@ void gen_operands(int lhs, int rhs) {
     if (is_leaf(rhs) == 1) {
         if (rhs.kind == 1) { emit("    mov rcx, "); print_int(rhs.ival); emit("\n"); }
         else if (rhs.extra == 1) { emit("    mov rcx, [.G"); emit(rhs.sval); emit("]\n"); }
-        else { emit("    mov rcx, [rbp - "); print_int(rhs.ival); emit("]\n"); }
+        else { emit("    mov rcx, "); emit_slot(rhs.ival); emit("\n"); }
         return;
     }
     emit("    push rax\n");
@@ -2253,6 +2419,10 @@ int gen_operands_imm(int lhs, int rhs) {
         gen_expr(lhs);
         return 1;
     }
+    if (reg_local(rhs) != 0) {
+        gen_expr(lhs);
+        return 2;
+    }
     gen_operands(lhs, rhs);
     return 0;
 }
@@ -2260,6 +2430,7 @@ int gen_operands_imm(int lhs, int rhs) {
 // The right operand of an instruction, after gen_operands_imm.
 void emit_rhs(int imm, int rhs) {
     if (imm == 1) { print_int(rhs.ival); emit("\n"); }
+    else if (imm == 2) { emit(saved_reg_name(reg_local(rhs))); emit("\n"); }
     else { emit("rcx\n"); }
     return;
 }
@@ -2292,6 +2463,16 @@ void gen_jump(int cond, int sense, int label, int l) {
     int jcc = cmp_jump(k, sense);
     int imm = 0;
     int skip = 0;
+    int lr = 0;
+    if (jcc != 0) { lr = reg_local(cond.child1); }
+    if (lr != 0 && (is_imm32(cond.child2) == 1 || reg_local(cond.child2) != 0)) {
+        emit("    cmp "); emit(saved_reg_name(lr)); emit(", ");
+        if (is_imm32(cond.child2) == 1) { print_int(cond.child2.ival); }
+        else { emit(saved_reg_name(reg_local(cond.child2))); }
+        emit("\n");
+        emit("    "); emit(jcc); emit(" ."); emit(label); print_int(l); emit("\n");
+        return;
+    }
     if (jcc != 0) {
         imm = gen_operands_imm(cond.child1, cond.child2);
         emit("    cmp rax, ");
@@ -2360,7 +2541,7 @@ int nth_arg(int args, int i) {
 void gen_stable_arg(int nd, int reg) {
     if (nd.kind == 1) { emit("    mov "); emit(reg); emit(", "); print_int(nd.ival); emit("\n"); return; }
     if (nd.kind == 2) { emit("    lea "); emit(reg); emit(", [.Lstr"); print_int(nd.extra); emit("]\n"); return; }
-    emit("    mov "); emit(reg); emit(", [rbp - "); print_int(nd.ival); emit("]\n");
+    emit("    mov "); emit(reg); emit(", "); emit_slot(nd.ival); emit("\n");
     return;
 }
 
@@ -2382,7 +2563,7 @@ void gen_binop(int nd, int k) {
     if (k == 8) { emit("    sub rax, "); emit_rhs(imm, rhs); return; }
     if (k == 9) {
         if (imm == 1) { emit("    imul rax, rax, "); print_int(rhs.ival); emit("\n"); }
-        else { emit("    imul rax, rcx\n"); }
+        else { emit("    imul rax, "); emit_rhs(imm, rhs); }
         return;
     }
     if (k == 10) { emit("    cqo\n    idiv rcx\n"); return; }
@@ -2516,14 +2697,10 @@ void gen_call(int nd) {
             die3("'", name, "' exists only for the Moonshot target (--elf)");
         }
     } else {
-        // The Linux-only builtins have no meaning in ring 3 on Moonshot,
-        // where there are no file descriptors and no port I/O. argc and argv do
-        // exist there, as syscalls (see below).
-        if (streq(name, "write") == 1 || streq(name, "read") == 1
-            || streq(name, "open_read") == 1 || streq(name, "open_write") == 1
-            || streq(name, "close") == 1 || streq(name, "outb") == 1
-            || streq(name, "inb") == 1 || streq(name, "outw") == 1
-            || streq(name, "inw") == 1) {
+        // Port I/O has no meaning in ring 3 on Moonshot. The file builtins,
+        // argc and argv do exist there, as syscalls (see below).
+        if (streq(name, "outb") == 1 || streq(name, "inb") == 1
+            || streq(name, "outw") == 1 || streq(name, "inw") == 1) {
             die3("'", name, "' has no meaning in ring 3 on Moonshot");
         }
     }
@@ -2774,6 +2951,24 @@ void gen_call(int nd) {
         }
     }
 
+    // Under --elf the file builtins are Moonshot's SYS_OPEN (23, mode 0 to
+    // read and 1 to write), SYS_READ (24), SYS_WRITE (25) and SYS_CLOSE (26),
+    // with the arguments where Linux has them.
+    if (elf_mode == 1) {
+        if (streq(name, "write") == 1) { emit("    mov rax, 25\n    syscall\n"); return; }
+        if (streq(name, "read") == 1) { emit("    mov rax, 24\n    syscall\n"); return; }
+        if (streq(name, "close") == 1) { emit("    mov rax, 26\n    syscall\n"); return; }
+        if (streq(name, "open_read") == 1) {
+            emit("    mov rsi, 0\n");
+            emit("    mov rax, 23\n    syscall\n");
+            return;
+        }
+        if (streq(name, "open_write") == 1) {
+            emit("    mov rsi, 1\n");
+            emit("    mov rax, 23\n    syscall\n");
+            return;
+        }
+    }
     if (streq(name, "write") == 1) { emit("    mov rax, 1\n    syscall\n"); return; }
     if (streq(name, "read") == 1) { emit("    mov rax, 0\n    syscall\n"); return; }
     if (streq(name, "close") == 1) { emit("    mov rax, 3\n    syscall\n"); return; }
@@ -2792,7 +2987,7 @@ void gen_call(int nd) {
         emit("    mov r10, [.G"); emit(name); emit("]\n");
         emit("    call r10\n");
     } else if (nd.extra == 2) {
-        emit("    mov r10, [rbp - "); print_int(nd.ival); emit("]\n");
+        emit("    mov r10, "); emit_slot(nd.ival); emit("\n");
         emit("    call r10\n");
     } else {
         emit("    call "); emit(name); emit("\n");
@@ -2832,7 +3027,7 @@ void gen_expr_node(int nd) {
         if (nd.extra == 1) {
             emit("    mov rax, [.G"); emit(nd.sval); emit("]\n");
         } else {
-            emit("    mov rax, [rbp - "); print_int(nd.ival); emit("]\n");
+            emit("    mov rax, "); emit_slot(nd.ival); emit("\n");
         }
     
         return;
@@ -2857,9 +3052,11 @@ void gen_expr_node(int nd) {
     // --- array index (load8 offset) ---
     if (k == 27) {
         // base + index, so the operands may trade places like ADD's.
-        if (is_stable_leaf(nd.child1) == 1 && is_leaf(nd.child2) == 0) { gen_operands(nd.child2, nd.child1); }
-        else { gen_operands(nd.child1, nd.child2); }
-        emit("    add rax, rcx\n");
+        int ia = nd.child1;
+        int ib = nd.child2;
+        if (is_stable_leaf(ia) == 1 && is_leaf(ib) == 0) { ia = nd.child2; ib = nd.child1; }
+        int iimm = gen_operands_imm(ia, ib);
+        emit("    add rax, "); emit_rhs(iimm, ib);
         emit("    movzx rax, byte ptr [rax]\n");
     
         return;
@@ -2908,6 +3105,42 @@ void gen_expr_node(int nd) {
     return;
 }
 
+// The instruction for x = x op y done in place, or 0.
+int inplace_op(int k) {
+    if (k == 7) { return "add"; }
+    if (k == 8) { return "sub"; }
+    if (k == 34) { return "and"; }
+    if (k == 35) { return "or"; }
+    if (k == 36) { return "xor"; }
+    return 0;
+}
+
+// An assignment to a local in a register that needs no trip through rax. A
+// number (or no initialiser) loads straight in, and x = x op y, which is
+// also what x op= y is, works in place when y is a number or another
+// register. Returns 1 when it emitted the assignment.
+int gen_reg_assign(int off, int val) {
+    if (emit_dry == 1) { return 0; }
+    int r = load64(slot_reg + off);
+    if (r == 0) { return 0; }
+    if (val == 0 || val.kind == 1) {
+        emit("    mov "); emit(saved_reg_name(r)); emit(", ");
+        if (val == 0) { emit("0"); } else { print_int(val.ival); }
+        emit("\n");
+        return 1;
+    }
+    int op = inplace_op(val.kind);
+    if (op == 0) { return 0; }
+    int a = val.child1;
+    int b = val.child2;
+    if (a.kind != 3 || a.extra == 1 || a.ival != off) { return 0; }
+    if (is_imm32(b) == 0 && reg_local(b) == 0) { return 0; }
+    emit("    "); emit(op); emit(" "); emit(saved_reg_name(r)); emit(", ");
+    if (is_imm32(b) == 1) { print_int(b.ival); } else { emit(saved_reg_name(reg_local(b))); }
+    emit("\n");
+    return 1;
+}
+
 void gen_stmt(int nd) {
     int saved_file = err_file;
     int saved_line = err_line;
@@ -2921,23 +3154,25 @@ void gen_stmt(int nd) {
 void gen_stmt_node(int nd) {
     int k = nd.kind;
     int l = 0;
-    // --- var decl with init (k=5) ---
+    // --- var decl, with or without an initialiser (k=5) ---
     if (k == 5) {
+        if (gen_reg_assign(nd.ival, nd.child2) == 1) { return; }
         if (nd.child2 != 0) { gen_expr(nd.child2); }
         else {
             emit("    mov rax, 0\n");
         }
-        emit("    mov [rbp - "); print_int(nd.ival); emit("], rax\n");
+        emit("    mov "); emit_slot(nd.ival); emit(", rax\n");
     
         return;
     }
     // --- assignment (k=4) ---
     if (k == 4) {
+        if (nd.extra != 1 && gen_reg_assign(nd.ival, nd.child2) == 1) { return; }
         gen_expr(nd.child2);
         if (nd.extra == 1) {
             emit("    mov [.G"); emit(nd.sval); emit("], rax\n");
         } else {
-            emit("    mov [rbp - "); print_int(nd.ival); emit("], rax\n");
+            emit("    mov "); emit_slot(nd.ival); emit(", rax\n");
         }
     
         return;
@@ -2945,9 +3180,11 @@ void gen_stmt_node(int nd) {
     // --- array-index assignment (k=28) ---
     if (k == 28) {
         // base + index, then the value, as for store8.
-        if (is_stable_leaf(nd.child1) == 1 && is_leaf(nd.child2) == 0) { gen_operands(nd.child2, nd.child1); }
-        else { gen_operands(nd.child1, nd.child2); }
-        emit("    add rax, rcx\n");
+        int ia = nd.child1;
+        int ib = nd.child2;
+        if (is_stable_leaf(ia) == 1 && is_leaf(ib) == 0) { ia = nd.child2; ib = nd.child1; }
+        int iimm = gen_operands_imm(ia, ib);
+        emit("    add rax, "); emit_rhs(iimm, ib);
         if (is_leaf(nd.child3) == 1) {
             emit("    mov rdi, rax\n");
             gen_expr(nd.child3);
@@ -3041,9 +3278,9 @@ void gen_stmt_node(int nd) {
     if (k == 41) {
         gen_expr(nd.child1);
         if (nd.child2.extra == 1) { emit("    mov [.G"); emit(nd.child2.sval); emit("], rax\n"); }
-        else { emit("    mov [rbp - "); print_int(nd.child2.ival); emit("], rax\n"); }
+        else { emit("    mov "); emit_slot(nd.child2.ival); emit(", rax\n"); }
         if (nd.child3.extra == 1) { emit("    mov [.G"); emit(nd.child3.sval); emit("], rdx\n"); }
-        else { emit("    mov [rbp - "); print_int(nd.child3.ival); emit("], rdx\n"); }
+        else { emit("    mov "); emit_slot(nd.child3.ival); emit(", rdx\n"); }
         return;
     }
     // --- defer (k=42) is collected now and emitted, reversed, at .Lret ---
@@ -3074,34 +3311,83 @@ void gen_stmt_node(int nd) {
     return;
 }
 
-void gen_function(int f) {
-    int frame = f.stack_size;
+// The parameters' arrival and the body, the part of a function generated
+// twice.
+void gen_body(int f) {
     int nparams = f.nparams;
     int i = 0;
+    for (i = 0; i < nparams; i += 1) {
+        if (i < 6) {
+            emit("    mov "); emit_slot((i + 1) * 8); emit(", "); emit(arg_reg(i)); emit("\n");
+        } else {
+            emit("    mov rax, [rbp + "); print_int(16 + (nparams - 1 - i) * 8); emit("]\n");
+            emit("    mov "); emit_slot((i + 1) * 8); emit(", rax\n");
+        }
+    }
+    n_defers = 0;
+    gen_block(f.body);
+    return;
+}
+
+// Gives the up to five heaviest slots a register each, heaviest first, ties
+// to the lower slot. A slot weighing less than 3 stays on the stack, since
+// saving and restoring the register would cost what it saves. Returns how
+// many registers are in use.
+int pick_slot_regs(int nslots) {
+    int used = 0;
+    int i = 0;
+    while (used < 5) {
+        int best = 0 - 1;
+        int bestw = 2;
+        for (i = 1; i <= nslots; i += 1) {
+            if (load64(slot_reg + i * 8) == 0 && load64(slot_weight + i * 8) > bestw) {
+                best = i;
+                bestw = load64(slot_weight + i * 8);
+            }
+        }
+        if (best < 0) { return used; }
+        used += 1;
+        store64(slot_reg + best * 8, used);
+    }
+    return used;
+}
+
+void gen_function(int f) {
+    int nslots = f.stack_size / 8;
+    int i = 0;
+    slot_weight = alloc((nslots + 1) * 8);
+    slot_reg = alloc((nslots + 1) * 8);
+    for (i = 0; i <= nslots; i += 1) {
+        store64(slot_weight + i * 8, 0);
+        store64(slot_reg + i * 8, 0);
+    }
+
+    int first_label = label_count;
+    emit_dry = 1;
+    current_ret_label = label_count;
+    label_count += 1;
+    gen_body(f);
+    emit_dry = 0;
+    label_count = first_label;
+    int nregs = pick_slot_regs(nslots);
+
+    // The saved registers sit below the locals.
+    int frame = f.stack_size + nregs * 8;
     int rem = frame % 16;
     if (rem != 0) { frame += 16 - rem; }
 
     current_ret_label = label_count;
     label_count += 1;
 
-
     emit(f.name); emit(":\n");
     emit("    push rbp\n");
     emit("    mov rbp, rsp\n");
     if (frame > 0) { emit("    sub rsp, "); print_int(frame); emit("\n"); }
-
-    while (i < nparams) {
-        if (i < 6) {
-            emit("    mov [rbp - "); print_int((i + 1) * 8); emit("], "); emit(arg_reg(i)); emit("\n");
-        } else {
-            emit("    mov rax, [rbp + "); print_int(16 + (nparams - 1 - i) * 8); emit("]\n");
-            emit("    mov [rbp - "); print_int((i + 1) * 8); emit("], rax\n");
-        }
-        i += 1;
+    for (i = 1; i <= nregs; i += 1) {
+        emit("    mov [rbp - "); print_int(f.stack_size + i * 8); emit("], "); emit(saved_reg_name(i)); emit("\n");
     }
 
-    n_defers = 0;
-    gen_block(f.body);
+    gen_body(f);
 
     emit(".Lret"); print_int(current_ret_label); emit(":\n");
     // Deferred statements run here, before the frame is torn down, in reverse
@@ -3115,6 +3401,9 @@ void gen_function(int f) {
         }
         emit("    pop rdx\n");
         emit("    pop rax\n");
+    }
+    for (i = 1; i <= nregs; i += 1) {
+        emit("    mov "); emit(saved_reg_name(i)); emit(", [rbp - "); print_int(f.stack_size + i * 8); emit("]\n");
     }
     emit("    mov rsp, rbp\n");
     emit("    pop rbp\n");
@@ -3169,10 +3458,10 @@ int main() {
     layout_names = alloc(256 * 8);
     layout_sizes = alloc(256 * 8);
 
-    // The CLI is `coff input.c0 output.s`, or `coff --elf input.c0 output.s` for
+    // The CLI is `coff1 input.c0 output.s`, or `coff1 --elf input.c0 output.s` for
     // the Moonshot ring-3 target (still assembly; smed makes the ELF).
     // With no arguments, stdin/stdout works (differential-test harness),
-    // and `coff --elf` alone is the same with the Moonshot target.
+    // and `coff1 --elf` alone is the same with the Moonshot target.
     // Arguments come in any order, --elf, -I <dir> (any number, up to
     // MAX_INC_DIRS), and either no files (stdin to stdout) or two.
     int cli_input = 0;
@@ -3410,6 +3699,7 @@ int main() {
         if (streq(f.name, "main") == 1) {
             if (f.nparams != 0) { die("'main' must take no parameters"); }
             if (f.is_void == 1) { die("'main' must return int, not void"); }
+            if (f.two_ret == 1) { die("'main' must return one int, not two"); }
             found_main = 1;
         }
         f = f.fnext;
@@ -3596,6 +3886,7 @@ int main() {
         g = g.next;
     }
 
+    flush_out();
     if (outfd != 1) { close(outfd); }
     return 0;
 }

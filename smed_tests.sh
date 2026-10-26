@@ -170,11 +170,14 @@ fi
 
 echo ""
 echo "5. The kernel: as+ld and smed agree on layout and on boot.s's instructions"
-K=../moonshot
-if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] && [ -x "$K/build.sh" ]; then
+M=../moonshot
+K=$M/kernel/core
+if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] && [ -x "$M/build.sh" ]; then
   # kmain.s is coff's output for the kernel; regenerate it the way build.sh
   # does rather than trusting whatever is lying in the tree.
-  if "$COFF" "$K/kmain.c0" "$tmp/kmain.s" 2>/dev/null; then
+  # From the kernel's own folder, where the assembler is run below, since
+  # coff writes embed's .incbin paths relative to where it is run.
+  if (cd "$K" && "$OLDPWD/$COFF" kmain.c0 "$tmp/kmain.s") 2>/dev/null; then
     sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global kernel_post_init\n.global sched_start\n.global sys_dispatch' "$tmp/kmain.s"
     kfail=0
     (cd "$K" && as boot.s -o "$tmp/boot.o" && as "$tmp/kmain.s" -o "$tmp/kmain.o" \
@@ -197,8 +200,8 @@ if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] &
       gsym() { nm "$tmp/k_gnu" | awk -v s="$1" '$3==s{print "0x" $1; exit}'; }
       ssym() { awk -v s="$1" '$2==s{print "0x" $1; exit}' "$tmp/k.map"; }
       [ "$(gsym _boot_start)" = "$(ssym _boot_start)" ] || { echo "  _boot_start: as+ld $(gsym _boot_start), smed $(ssym _boot_start)"; lfail=1; }
-      for pair in serial_scratch:punkt_scratch punkt_scratch:kakel_scratch \
-                  kakel_scratch:skrift_scratch skrift_scratch:jakel_name_scratch \
+      for pair in punkt_scratch:kakel_scratch \
+                  kakel_scratch:jakel_name_scratch \
                   jakel_name_scratch:jakel_path_scratch jakel_path_scratch:repl_scratch \
                   repl_scratch:shell_scratch shell_scratch:shell_users shell_users:elf_scratch \
                   elf_scratch:idt_start idt_start:dispatch_start dispatch_start:_kernel_end \

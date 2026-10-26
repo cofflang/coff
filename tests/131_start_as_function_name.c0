@@ -1,0 +1,13 @@
+// expect: compile-error
+//
+// tests/131_start_as_function_name.c0 - _start cannot name a function
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// _start is the entry point every program gets, so a function by that name
+// is refused here instead of failing later in the assembler.
+int _start() {
+    return 1;
+}
+
+int main() {
+    return 0;
+}

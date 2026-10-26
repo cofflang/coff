@@ -1,8 +1,10 @@
-// tests/include_fixtures/diamond_common.c0 - fixture for 117_include_diamond, the shared bottom of the diamond
+// tests/include_fixtures/diamond_common.c0 - fixture for 117_include_diamond and 128, the shared bottom of the diamond
 // Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../../LICENSE).
 //
-// Included by both diamond_left.c0 and diamond_right.c0. Without
-// include-once it would be spliced twice and diamond_base redefined.
+// Included by both diamond_left.c0 and diamond_right.c0, and by
+// 128_include_same_file_spelled_differently.c0 under three spellings of its
+// path. Without include-once by file it would be spliced more than once and
+// diamond_base redefined.
 int diamond_base() {
     return 21;
 }

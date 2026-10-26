@@ -64,9 +64,9 @@ automated fails the build when it is wrong.
 | Component | Role | Status |
 |---|---|---|
 | `coff1` binary | compiles the kernel | **checked** — byte-verified against a fresh bootstrap; hash-gated on every kernel build |
-| `c0/coff.c0` | source of `coff1` | readable, about 3600 lines, in git, hashed in the manifest |
+| `c0/coff.c0` | source of `coff1` | readable, about 3900 lines, in git, hashed in the manifest |
 | `coff0` binary | bootstraps `coff1` once | **checked** — byte-verified against a fresh build of `coff0.c` |
-| `coff0.c` | the seed compiler | readable, about 3200 lines of plain C, hashed. Buildable by gcc, **tcc and cproc** |
+| `coff0.c` | the seed compiler | readable, about 3500 lines of plain C, hashed. Buildable by gcc, **tcc and cproc** |
 | gcc | *optional* | **not required.** See "gcc is out of the trusted base" |
 | **tcc 0.9.28** | builds `coff0` | **partially mitigated** — DDC-cross-checked against gcc **and cproc** over the whole corpus. Not yet from a bootstrapped seed |
 | **cproc + QBE** (pinned commits, see `fetch_ddc_cproc.sh`) | third DDC witness | built by tcc, not gcc; independent authors (Michael Forney, Quentin Carbonneaux). Diversifies the compilation proper only. It uses the system `cpp` (gcc's preprocessor), GNU as/ld and glibc, so those are not cross-checked by this leg |
@@ -106,7 +106,7 @@ hex0 (357 bytes, hand-auditable)
   -> hex1 -> hex2 -> M0 -> M1 -> M2-Planet
   -> GNU Mes / MesCC
   -> tcc
-  -> coff0        (about 3200 lines of C, hand-auditable)
+  -> coff0        (about 3500 lines of C, hand-auditable)
   -> coff1        (self-hosted c0)
   -> the kernel
 ```
@@ -269,7 +269,7 @@ claims above describe what runs when both trees are checked out together.
    descended from the 357-byte hex0 seed, then re-run DDC against it. That
    converts the tcc row from "partially mitigated" to something close to
    settled, and makes the full-source bootstrap real rather than credible.
-2. **Audit `coff0.c` by hand, once, and record the date.** About 3200
+2. **Audit `coff0.c` by hand, once, and record the date.** About 3500
    lines, one sitting. It is the only artifact where this is feasible, which
    is exactly why it is worth doing.
 

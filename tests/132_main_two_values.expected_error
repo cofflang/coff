@@ -1,0 +1,1 @@
+coff0: tests/132_main_two_values.c0:6: 'main' must return one int, not two

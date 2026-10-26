@@ -214,16 +214,23 @@ if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
   # sources include files relative to their own directory, hence the cd.
   # They include the ring-3 library (moonshot/programs/lib/moon.c0) by name,
   # so both compilers get its directory with -I, the way Moonshot's
-  # generators pass it.
+  # generators pass it. Gnista's 3D library is included the same way. Its
+  # folder is moonshot/programs in a Moonshot clone and ../gnista when Gnista
+  # is checked out on its own.
   elflib=$(cd .. && pwd)/moonshot/programs/lib
-  for src in ../moonshot/elf_tests/*.c0 ../moonshot/programs/*.c0 \
-             ../moonshot/programs/lira/lira.c0 ../utsikt/utsikt.c0 \
-             ../gnista/infecteria.c0 ../gnista/fps_probe.c0; do
+  if [ -f ../moonshot/programs/infecteria.c0 ]; then
+    gnistalib=$(cd .. && pwd)/moonshot/programs
+  else
+    gnistalib=$(cd .. && pwd)/gnista
+  fi
+  for src in ../moonshot/tests/elf/*.c0 ../moonshot/programs/*.c0 \
+             ../moonshot/programs/lira/lira.c0 ../moonshot/programs/utsikt/utsikt.c0 \
+             ../utsikt/utsikt.c0 ../gnista/infecteria.c0 ../gnista/fps_probe.c0; do
     [ -f "$src" ] || continue
     name=$(basename "$src" .c0)
     dir=$(dirname "$src")
-    if (cd "$dir" && "$OLDPWD/coff0" --elf -I "$elflib" "$(basename "$src")" "$tmpdir/eref_$name.s") 2>/dev/null; then
-      (cd "$dir" && "$tmpdir/coff1" --elf -I "$elflib" "$(basename "$src")" "$tmpdir/ec0_$name.s") 2>/dev/null
+    if (cd "$dir" && "$OLDPWD/coff0" --elf -I "$elflib" -I "$gnistalib" "$(basename "$src")" "$tmpdir/eref_$name.s") 2>/dev/null; then
+      (cd "$dir" && "$tmpdir/coff1" --elf -I "$elflib" -I "$gnistalib" "$(basename "$src")" "$tmpdir/ec0_$name.s") 2>/dev/null
       if diff -q "$tmpdir/eref_$name.s" "$tmpdir/ec0_$name.s" >/dev/null; then
         echo "PASS codegendiff --elf $name"
         pass=$((pass + 1))
@@ -287,20 +294,21 @@ if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
   fi
   echo ""
 
-  echo "Generated code never touches rbx"
-  # rbx is a register the System V ABI has a function preserve, and nothing
-  # coff emits saves it, so nothing coff emits may use it.
-  rbx_hits=0
-  for src in tests/*.c0; do
-    if ./coff0 "$src" "$tmpdir/rbx.s" 2>/dev/null && grep -q "rbx" "$tmpdir/rbx.s"; then
-      echo "  rbx in the output for $src"; rbx_hits=$((rbx_hits + 1))
+  echo "Callee-saved registers are saved and restored"
+  # rbx and r12-r15 hold a function's busiest locals. Each function that
+  # uses one must save it in its prologue and restore it before ret, from
+  # the same slot, since its caller expects them unchanged.
+  reg_bad=0
+  for src in tests/*.c0 c0/coff.c0; do
+    if ./coff0 "$src" "$tmpdir/regs.s" 2>/dev/null && ! awk -f check_saved_regs.awk "$tmpdir/regs.s" >"$tmpdir/regs.out"; then
+      echo "  $src"; sed 's/^/    /' "$tmpdir/regs.out" | head -5; reg_bad=$((reg_bad + 1))
     fi
   done
-  if [ "$rbx_hits" -eq 0 ]; then
-    echo "PASS no compiled test program uses rbx"
+  if [ "$reg_bad" -eq 0 ]; then
+    echo "PASS every function saves the callee-saved registers it uses"
     pass=$((pass + 1))
   else
-    echo "FAIL $rbx_hits compiled test program(s) use rbx"
+    echo "FAIL $reg_bad compiled program(s) use a callee-saved register unsaved"
     fail=$((fail + 1))
   fi
   echo ""

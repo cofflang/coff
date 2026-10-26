@@ -28,6 +28,8 @@ program.
 | `c0/parse.c0` | A standalone c0 parser in c0, same purpose. |
 | `c0/smed.c0` | The assembler and linker, in c0. Turns the assembly `coff1` emits into a finished executable, with no GNU tool in between. |
 | `c0/sha256.c0`, `c0/cmp.c0` | `sha256sum` and `cmp` written in c0. The audit builds them with the `coff1` it has just verified and runs them next to the system tools, so every hash and every byte comparison is checked by two inspectors. |
+| `lib/flyt.c0` | flyt, IEEE 754 doubles as a c0 library, for programs that need floating point. `lib/flyt_check.sh` checks it against the machine's own doubles. |
+| `check_saved_regs.awk` | Checks that every function in coff's output saves and restores the registers it keeps locals in. `run_tests.sh` runs it. |
 | `tests/` | The test programs, which double as the input set for the differential checks. |
 | `run_tests.sh` | Builds coff0 and runs the compiler test suite. |
 | `smed_tests.sh` | Checks smed against GNU as and ld over every program in the tree, then runs the suite with no GNU tool in the pipeline. The last check builds my kernel with both and compares them, when it is checked out alongside. |
@@ -150,7 +152,7 @@ hex literals,
 bare function name is its address, and calling through a variable holding
 one is an indirect call. `include "file.c0";` splits a program across
 files by plain textual substitution, and a file reached along two paths is
-spliced once. `extern int name;` declares a global
+spliced once, however its path is spelled. `extern int name;` declares a global
 that some other object file defines. A global's initializer may be any
 constant expression, folded at compile time. `embed name "file";` puts a
 file's bytes into the program as data, with `name` as their address and
@@ -178,6 +180,11 @@ int fd = open_read("notes.txt");
 defer close(fd);
 ```
 
+A defer may use the parameters, the function's outermost locals, globals
+and locals of its own. A local declared in an inner block is refused, since
+that block has ended, and its slot may hold another variable, by the time
+the defer runs.
+
 `layout` gives a block of memory named offsets:
 
 ```c
@@ -199,9 +206,20 @@ fields are looked up in that layout, so two layouts may put the same field
 name at different offsets. An untyped variable reaches a field through the
 one offset every layout agrees on, and is refused when they do not agree.
 
-There is no type checking, no optimizer pass beyond a few shortcuts in the
-code generator, and on Linux nothing is ever freed. Some of that will change, some of it is the design. The full
-grammar is in the header comment of `coff0.c`.
+There is no type checking, no optimizer pass of its own, and on Linux
+nothing is ever freed. The code generator does keep each function's
+busiest locals in rbx and r12 to r15 instead of on the stack, a use inside
+a loop counting for more than one outside it, and takes a few shortcuts
+where an operand is a number or a register. Some of that will change, some
+of it is the design. The full grammar is in the header comment of
+`coff0.c`.
+
+There is no floating-point type either. `lib/flyt.c0` is a library instead,
+named flyt, that keeps a double in an int as its 64 IEEE 754 bits. It adds,
+subtracts, multiplies, divides and takes square roots, rounded to nearest
+with ties to even like any FPU, with signed zeros, subnormals, infinities
+and NaN, converts to and from int, compares, and reads and writes decimal
+text exactly rounded. `include "flyt.c0";` with `-I lib` brings it in.
 
 I/O and memory are compiler builtins that map directly to syscalls:
 `print`, `write`, `read`, `open_read`, `open_write`, `close`, `alloc`,
@@ -234,12 +252,14 @@ read input, `glyph` hands over the kernel's font, `ticks` reads the timer,
 `readfile` and `writefile` load and save files, `sound` queues audio,
 `dealloc` gives back what `alloc` handed out, and `syscall(n, a, b, c, d,
 e)` reaches any system call by number, so a new one needs no compiler
-change. `argc` and `argv` work there too, as syscalls. Calling an `--elf`
-builtin outside `--elf` is a compile error, and calling a Linux-only
-builtin such as `open_read` or `outb` under `--elf` is too.
+change. `argc` and `argv` work there too, as syscalls, and so do
+`open_read`, `open_write`, `read`, `write` and `close`, as that kernel's
+file calls, which is what lets coff and smed themselves compile for it
+unchanged. Calling an `--elf` builtin outside `--elf` is a compile error,
+and calling port I/O such as `outb` under `--elf` is too.
 
 The distinction `win_info` versus `win_max` is worth knowing if you write
-against this: `win_info` is the window's size right now and changes
+against this. `win_info` is the window's size right now and changes
 whenever the window manager reflows, while `win_max` is the largest window
 the machine can ever hand out. A program sizes its frame buffer once from
 `win_max`, so it never has to reallocate it, and treats `win_info` as the
@@ -251,6 +271,7 @@ region it is currently allowed to draw into.
 ./run_tests.sh
 ./smed_tests.sh     # needs the coff1 from Building in the tree
                     # check 5 also needs my kernel at ../moonshot, and skips without it
+lib/flyt_check.sh   # flyt against the machine's doubles, needs python3
 ```
 
 Every test program goes through the real pipeline: compile, assemble,

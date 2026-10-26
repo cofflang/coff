@@ -1,0 +1,791 @@
+// flyt.c0 - IEEE 754 doubles in plain c0
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of coff, the compiler toolchain for c0. coff is free
+// software, distributed under the GNU General Public License version 3
+// or (at your option) any later version, WITHOUT ANY WARRANTY; see the
+// LICENSE file for the full text.
+//
+// flyt -- doubles in plain c0. A double is an int holding the 64 bits of an IEEE 754
+// binary64 number, so it is stored, passed and returned like any other int,
+// and only these functions know what the bits mean. f64_add, f64_sub, f64_mul
+// and f64_div round to nearest, ties to even, the way every common FPU does
+// by default, and handle signed zeros, subnormal numbers, infinities and NaN.
+// The rounding follows Berkeley SoftFloat's, function for function.
+//
+// c0's >> keeps the sign, and its < compares signed numbers, so every value
+// here is kept below 2^63 where it is compared or shifted, or masked after a
+// shift. The one place that needs all 128 bits of a product splits it into
+// 32-bit halves (f64_mul_hi).
+
+int F64_SIGN = 1 << 63;                   // bit 63
+int F64_FRAC = 4503599627370495;          // the 52 fraction bits
+int F64_NAN = 9221120237041090560;        // 0x7FF8000000000000, the quiet NaN
+int F64_INF = 9218868437227405312;        // 0x7FF0000000000000
+int F64_LOW32 = 4294967295;
+
+int f64_pack(int sign, int exp, int sig) {
+    return (sign << 63) + (exp << 52) + sig;
+}
+
+int f64_sign(int x) { return (x >> 63) & 1; }
+int f64_exp(int x) { return (x >> 52) & 2047; }
+int f64_frac(int x) { return x & F64_FRAC; }
+
+int f64_is_nan(int x) { return f64_exp(x) == 2047 && f64_frac(x) != 0; }
+
+// Leading zero bits of a value below 2^63, counted in 64 bits.
+int f64_clz(int a) {
+    if (a == 0) { return 64; }
+    int n = 1;
+    while (a < 4611686018427387904) { a = a << 1; n += 1; }
+    return n;
+}
+
+// a shifted right by d, with a 1 in the lowest bit when anything set was
+// shifted out, so rounding still knows the value was not exact. a is below
+// 2^63.
+int f64_jam(int a, int d) {
+    if (d <= 0) { return a; }
+    if (d < 63) {
+        int lost = a & ((1 << d) - 1);
+        a = a >> d;
+        if (lost != 0) { a = a | 1; }
+        return a;
+    }
+    if (a != 0) { return 1; }
+    return 0;
+}
+
+// Rounds and packs a significand with its leading 1 at bit 62, ten bits more
+// than the result keeps. The value is sig * 2^(exp - 1084).
+int f64_round_pack(int sign, int exp, int sig) {
+    int round_bits = sig & 1023;
+    if (exp < 0 || exp >= 2045) {
+        if (exp < 0) {
+            sig = f64_jam(sig, 0 - exp);
+            exp = 0;
+            round_bits = sig & 1023;
+        } else if (exp > 2045 || sig >= 9223372036854775296) {
+            return f64_pack(sign, 2047, 0);
+        }
+    }
+    // Plus half of the last place, then the ten extra bits off. The sum can
+    // reach 2^63, past what a signed int holds, so the shift is made logical
+    // by the mask.
+    sig = ((sig + 512) >> 10) & 18014398509481983;
+    if (round_bits == 512) { sig = sig & (0 - 2); }
+    if (sig == 0) { exp = 0; }
+    return f64_pack(sign, exp, sig);
+}
+
+// Normalises sig, below 2^63, so its leading 1 is at bit 62, and rounds.
+int f64_norm_round_pack(int sign, int exp, int sig) {
+    int shift = f64_clz(sig) - 1;
+    exp -= shift;
+    if (shift >= 10 && exp >= 0 && exp < 2045) {
+        if (sig == 0) { exp = 0; }
+        return f64_pack(sign, exp, sig << (shift - 10));
+    }
+    return f64_round_pack(sign, exp, sig << shift);
+}
+
+int f64_from_int(int i) {
+    if (i == 0) { return 0; }
+    if (i == F64_SIGN) { return -4332462841530417152; }   // -2^63 exactly
+    int sign = 0;
+    if (i < 0) { sign = 1; i = 0 - i; }
+    return f64_norm_round_pack(sign, 1084, i);
+}
+
+// Towards zero. NaN gives 0, and a value past what an int holds gives the
+// nearest end of the int range.
+int f64_to_int(int x) {
+    int exp = f64_exp(x);
+    int sign = f64_sign(x);
+    if (exp == 2047 && f64_frac(x) != 0) { return 0; }
+    if (exp < 1023) { return 0; }
+    if (exp >= 1086) {
+        if (sign) { return F64_SIGN; }
+        return 9223372036854775807;
+    }
+    int sig = f64_frac(x) | 4503599627370496;
+    int shift = exp - 1075;
+    int v = 0;
+    if (shift >= 0) { v = sig << shift; } else { v = sig >> (0 - shift); }
+    if (sign) { return 0 - v; }
+    return v;
+}
+
+int f64_neg(int x) { return x ^ F64_SIGN; }
+int f64_abs(int x) { return x & 9223372036854775807; }
+
+// Either NaN, quieted, the first when both are.
+int f64_nan_of(int a, int b) {
+    if (f64_is_nan(a)) { return a | 2251799813685248; }
+    return b | 2251799813685248;
+}
+
+int f64_add_mags(int a, int b, int sign) {
+    int ea = f64_exp(a);
+    int sa = f64_frac(a);
+    int eb = f64_exp(b);
+    int sb = f64_frac(b);
+    int diff = ea - eb;
+    int ez = 0;
+    int sz = 0;
+    if (diff == 0) {
+        if (ea == 0) { return a + sb; }
+        if (ea == 2047) {
+            if ((sa | sb) != 0) { return f64_nan_of(a, b); }
+            return a;
+        }
+        ez = ea;
+        sz = (9007199254740992 + sa + sb) << 9;
+    } else {
+        sa = sa << 9;
+        sb = sb << 9;
+        if (diff < 0) {
+            if (eb == 2047) {
+                if (sb != 0) { return f64_nan_of(a, b); }
+                return f64_pack(sign, 2047, 0);
+            }
+            ez = eb;
+            if (ea != 0) { sa += 2305843009213693952; } else { sa = sa << 1; }
+            sa = f64_jam(sa, 0 - diff);
+        } else {
+            if (ea == 2047) {
+                if (sa != 0) { return f64_nan_of(a, b); }
+                return a;
+            }
+            ez = ea;
+            if (eb != 0) { sb += 2305843009213693952; } else { sb = sb << 1; }
+            sb = f64_jam(sb, diff);
+        }
+        sz = 2305843009213693952 + sa + sb;
+        if (sz < 4611686018427387904) {
+            ez -= 1;
+            sz = sz << 1;
+        }
+    }
+    return f64_round_pack(sign, ez, sz);
+}
+
+int f64_sub_mags(int a, int b, int sign) {
+    int ea = f64_exp(a);
+    int sa = f64_frac(a);
+    int eb = f64_exp(b);
+    int sb = f64_frac(b);
+    int diff = ea - eb;
+    if (diff == 0) {
+        if (ea == 2047) {
+            if ((sa | sb) != 0) { return f64_nan_of(a, b); }
+            return F64_NAN;
+        }
+        int d = sa - sb;
+        if (d == 0) { return 0; }
+        if (ea != 0) { ea -= 1; }
+        if (d < 0) { sign = 1 - sign; d = 0 - d; }
+        int shift = f64_clz(d) - 11;
+        int ez = ea - shift;
+        if (ez < 0) {
+            shift = ea;
+            ez = 0;
+        }
+        return f64_pack(sign, ez, d << shift);
+    }
+    sa = sa << 10;
+    sb = sb << 10;
+    int ez2 = 0;
+    int sz = 0;
+    if (diff < 0) {
+        sign = 1 - sign;
+        if (eb == 2047) {
+            if (sb != 0) { return f64_nan_of(a, b); }
+            return f64_pack(sign, 2047, 0);
+        }
+        if (ea != 0) { sa += 4611686018427387904; } else { sa += sa; }
+        sa = f64_jam(sa, 0 - diff);
+        sb = sb | 4611686018427387904;
+        ez2 = eb;
+        sz = sb - sa;
+    } else {
+        if (ea == 2047) {
+            if (sa != 0) { return f64_nan_of(a, b); }
+            return a;
+        }
+        if (eb != 0) { sb += 4611686018427387904; } else { sb += sb; }
+        sb = f64_jam(sb, diff);
+        sa = sa | 4611686018427387904;
+        ez2 = ea;
+        sz = sa - sb;
+    }
+    return f64_norm_round_pack(sign, ez2 - 1, sz);
+}
+
+int f64_add(int a, int b) {
+    if (f64_sign(a) == f64_sign(b)) { return f64_add_mags(a, b, f64_sign(a)); }
+    return f64_sub_mags(a, b, f64_sign(a));
+}
+
+int f64_sub(int a, int b) {
+    if (f64_sign(a) != f64_sign(b)) { return f64_add_mags(a, b, f64_sign(a)); }
+    return f64_sub_mags(a, b, f64_sign(a));
+}
+
+// The high 64 bits of the 128-bit product of a and b, both read as unsigned,
+// with bit 0 set when any of the low 64 bits are. Done in 32-bit halves, so
+// no partial product is more than 64 bits.
+int f64_mul_hi(int a, int b) {
+    int a0 = a & F64_LOW32;
+    int a1 = (a >> 32) & F64_LOW32;
+    int b0 = b & F64_LOW32;
+    int b1 = (b >> 32) & F64_LOW32;
+    int p00 = a0 * b0;
+    int p01 = a0 * b1;
+    int p10 = a1 * b0;
+    int p11 = a1 * b1;
+    int mid = ((p00 >> 32) & F64_LOW32) + (p01 & F64_LOW32) + (p10 & F64_LOW32);
+    int lo = (p00 & F64_LOW32) | ((mid & F64_LOW32) << 32);
+    int hi = p11 + ((p01 >> 32) & F64_LOW32) + ((p10 >> 32) & F64_LOW32)
+             + ((mid >> 32) & F64_LOW32);
+    if (lo != 0) { hi = hi | 1; }
+    return hi;
+}
+
+// A subnormal's significand moved up so its leading 1 is at bit 52, and the
+// exponent that makes up for it.
+(int, int) f64_norm_sub(int sig) {
+    int shift = f64_clz(sig) - 11;
+    return 1 - shift, sig << shift;
+}
+
+int f64_mul(int a, int b) {
+    int sign = f64_sign(a) ^ f64_sign(b);
+    int ea = f64_exp(a);
+    int sa = f64_frac(a);
+    int eb = f64_exp(b);
+    int sb = f64_frac(b);
+    if (ea == 2047) {
+        if (sa != 0 || (eb == 2047 && sb != 0)) { return f64_nan_of(a, b); }
+        if ((eb | sb) == 0) { return F64_NAN; }
+        return f64_pack(sign, 2047, 0);
+    }
+    if (eb == 2047) {
+        if (sb != 0) { return f64_nan_of(a, b); }
+        if ((ea | sa) == 0) { return F64_NAN; }
+        return f64_pack(sign, 2047, 0);
+    }
+    if (ea == 0) {
+        if (sa == 0) { return f64_pack(sign, 0, 0); }
+        ea, sa = f64_norm_sub(sa);
+    }
+    if (eb == 0) {
+        if (sb == 0) { return f64_pack(sign, 0, 0); }
+        eb, sb = f64_norm_sub(sb);
+    }
+    int ez = ea + eb - 1023;
+    sa = (sa | 4503599627370496) << 10;
+    sb = (sb | 4503599627370496) << 11;
+    int sz = f64_mul_hi(sa, sb);
+    if (sz < 4611686018427387904) {
+        ez -= 1;
+        sz = sz << 1;
+    }
+    return f64_round_pack(sign, ez, sz);
+}
+
+int f64_div(int a, int b) {
+    int sign = f64_sign(a) ^ f64_sign(b);
+    int ea = f64_exp(a);
+    int sa = f64_frac(a);
+    int eb = f64_exp(b);
+    int sb = f64_frac(b);
+    if (ea == 2047) {
+        if (sa != 0) { return f64_nan_of(a, b); }
+        if (eb == 2047) {
+            if (sb != 0) { return f64_nan_of(a, b); }
+            return F64_NAN;
+        }
+        return f64_pack(sign, 2047, 0);
+    }
+    if (eb == 2047) {
+        if (sb != 0) { return f64_nan_of(a, b); }
+        return f64_pack(sign, 0, 0);
+    }
+    if (eb == 0) {
+        if (sb == 0) {
+            if ((ea | sa) == 0) { return F64_NAN; }
+            return f64_pack(sign, 2047, 0);
+        }
+        eb, sb = f64_norm_sub(sb);
+    }
+    if (ea == 0) {
+        if (sa == 0) { return f64_pack(sign, 0, 0); }
+        ea, sa = f64_norm_sub(sa);
+    }
+    int ez = ea - eb + 1022;
+    sa = sa | 4503599627370496;
+    sb = sb | 4503599627370496;
+    if (sa < sb) {
+        ez -= 1;
+        sa = sa << 1;
+    }
+    // Long division, one bit of the quotient at a time, 63 of them, so the
+    // quotient's leading 1 lands at bit 62. Whatever is left over makes the
+    // lowest bit sticky.
+    int q = 0;
+    int rem = sa;
+    int i = 0;
+    for (i = 0; i < 63; i += 1) {
+        q = q << 1;
+        if (rem >= sb) {
+            rem -= sb;
+            q = q | 1;
+        }
+        rem = rem << 1;
+    }
+    if (rem != 0) { q = q | 1; }
+    return f64_round_pack(sign, ez, q);
+}
+
+// -1, 0 or 1 as a is less than, equal to or greater than b, and 2 when either
+// is NaN, so neither order holds. The two zeros are equal.
+int f64_cmp(int a, int b) {
+    if (f64_is_nan(a) || f64_is_nan(b)) { return 2; }
+    if ((f64_abs(a) | f64_abs(b)) == 0) { return 0; }
+    if (a == b) { return 0; }
+    int sa = f64_sign(a);
+    int sb = f64_sign(b);
+    if (sa != sb) {
+        if (sa) { return 0 - 1; }
+        return 1;
+    }
+    // The same sign. Bit patterns order like the numbers for positive ones
+    // and the other way round for negative ones.
+    int less = f64_abs(a) < f64_abs(b);
+    if (sa) { less = !less; }
+    if (less) { return 0 - 1; }
+    return 1;
+}
+
+int f64_lt(int a, int b) { return f64_cmp(a, b) == 0 - 1; }
+int f64_le(int a, int b) { int c = f64_cmp(a, b); return c == 0 - 1 || c == 0; }
+int f64_eq(int a, int b) { return f64_cmp(a, b) == 0; }
+
+// The square root, exactly rounded. -0 stays -0, and anything else below
+// zero is NaN.
+int f64_sqrt(int x) {
+    int exp = f64_exp(x);
+    int sig = f64_frac(x);
+    if (exp == 2047) {
+        if (sig != 0) { return f64_nan_of(x, x); }
+        if (f64_sign(x)) { return F64_NAN; }
+        return x;
+    }
+    if ((exp | sig) == 0) { return x; }
+    if (f64_sign(x)) { return F64_NAN; }
+    if (exp == 0) {
+        exp, sig = f64_norm_sub(sig);
+    }
+    int m = sig | 4503599627370496;
+    int e = exp - 1023;
+    // An even exponent, so it halves exactly.
+    if ((e & 1) != 0) {
+        m = m << 1;
+        e -= 1;
+    }
+    // Digit by digit, two bits of m at a time from the top, then 28 pairs of
+    // zeros, so the root has 55 bits. What is left over makes the last bit
+    // sticky.
+    int root = 0;
+    int rem = 0;
+    int i = 0;
+    for (i = 0; i < 55; i += 1) {
+        int pair = 0;
+        if (i < 27) { pair = (m >> (52 - 2 * i)) & 3; }
+        rem = (rem << 2) | pair;
+        int trial = (root << 2) | 1;
+        if (rem >= trial) {
+            rem -= trial;
+            root = (root << 1) | 1;
+        } else {
+            root = root << 1;
+        }
+    }
+    int z = root << 8;
+    if (rem != 0) { z = z | 1; }
+    return f64_round_pack(0, e / 2 + 1022, z);
+}
+
+// --- big integers, for exact decimal conversion ---------------------------
+//
+// A number as 32-bit limbs, lowest first, in int slots after a count. Only
+// what reading and writing decimals needs, and in buffers made once, since
+// c0 on Linux gives no memory back.
+
+int BIG_LIMBS = 300;      // 9600 bits, past 10^343 times 768 digits
+int big_a = 0;
+int big_b = 0;
+int big_c = 0;
+
+int big_new() {
+    int b = alloc((BIG_LIMBS + 1) * 8);
+    store64(b, 0);
+    return b;
+}
+
+void big_init() {
+    if (!big_a) {
+        big_a = big_new();
+        big_b = big_new();
+        big_c = big_new();
+    }
+    return;
+}
+
+int big_n(int b) { return load64(b); }
+int big_at(int b, int i) { return load64(b + 8 + i * 8); }
+void big_put(int b, int i, int v) { store64(b + 8 + i * 8, v); return; }
+
+void big_trim(int b) {
+    int n = big_n(b);
+    while (n > 0 && big_at(b, n - 1) == 0) { n -= 1; }
+    store64(b, n);
+    return;
+}
+
+void big_set(int b, int v) {
+    store64(b, 0);
+    int n = 0;
+    while (v != 0) {
+        big_put(b, n, v & F64_LOW32);
+        v = (v >> 32) & F64_LOW32;
+        n += 1;
+    }
+    store64(b, n);
+    return;
+}
+
+void big_copy(int to, int from) {
+    int n = big_n(from);
+    int i = 0;
+    for (i = 0; i < n; i += 1) { big_put(to, i, big_at(from, i)); }
+    store64(to, n);
+    return;
+}
+
+// b = b * k + add, k and add below 2^31.
+void big_mul_add(int b, int k, int add) {
+    int carry = add;
+    int n = big_n(b);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int t = big_at(b, i) * k + carry;
+        big_put(b, i, t & F64_LOW32);
+        carry = (t >> 32) & F64_LOW32;
+    }
+    if (carry != 0 && n < BIG_LIMBS) { big_put(b, n, carry); store64(b, n + 1); }
+    return;
+}
+
+// b = b * 10^p.
+void big_mul_pow10(int b, int p) {
+    while (p >= 9) { big_mul_add(b, 1000000000, 0); p -= 9; }
+    int k = 1;
+    while (p > 0) { k *= 10; p -= 1; }
+    if (k > 1) { big_mul_add(b, k, 0); }
+    return;
+}
+
+int big_bits(int b) {
+    int n = big_n(b);
+    if (n == 0) { return 0; }
+    int top = big_at(b, n - 1);
+    int bits = 0;
+    while (top != 0) { bits += 1; top = top >> 1; }
+    return (n - 1) * 32 + bits;
+}
+
+// to = from << s.
+void big_shl(int to, int from, int s) {
+    int words = s / 32;
+    int bits = s % 32;
+    int n = big_n(from);
+    int i = 0;
+    for (i = 0; i < words + n + 1 && i < BIG_LIMBS; i += 1) { big_put(to, i, 0); }
+    for (i = 0; i < n; i += 1) {
+        int v = big_at(from, i) << bits;
+        int lo = v & F64_LOW32;
+        int hi = (v >> 32) & F64_LOW32;
+        big_put(to, i + words, big_at(to, i + words) | lo);
+        if (i + words + 1 < BIG_LIMBS) { big_put(to, i + words + 1, hi); }
+    }
+    store64(to, n + words + 1);
+    big_trim(to);
+    return;
+}
+
+int big_cmp(int a, int b) {
+    int na = big_n(a);
+    int nb = big_n(b);
+    if (na != nb) {
+        if (na < nb) { return 0 - 1; }
+        return 1;
+    }
+    int i = na - 1;
+    while (i >= 0) {
+        if (big_at(a, i) != big_at(b, i)) {
+            if (big_at(a, i) < big_at(b, i)) { return 0 - 1; }
+            return 1;
+        }
+        i -= 1;
+    }
+    return 0;
+}
+
+// a = a - b, a at least b.
+void big_sub(int a, int b) {
+    int borrow = 0;
+    int n = big_n(a);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int bv = 0;
+        if (i < big_n(b)) { bv = big_at(b, i); }
+        int t = big_at(a, i) - bv - borrow;
+        if (t < 0) { t += 4294967296; borrow = 1; } else { borrow = 0; }
+        big_put(a, i, t);
+    }
+    big_trim(a);
+    return;
+}
+
+// The bits of b from bit `from` up, 63 of them at most, as an int.
+int big_bits_at(int b, int from, int count) {
+    int v = 0;
+    int k = count - 1;
+    while (k >= 0) {
+        int bit = from + k;
+        int w = bit / 32;
+        int one = 0;
+        if (w < big_n(b)) { one = (big_at(b, w) >> (bit % 32)) & 1; }
+        v = (v << 1) | one;
+        k -= 1;
+    }
+    return v;
+}
+
+// 1 when any bit of b below bit `below` is set.
+int big_any_below(int b, int below) {
+    int w = below / 32;
+    int i = 0;
+    for (i = 0; i < w && i < big_n(b); i += 1) {
+        if (big_at(b, i) != 0) { return 1; }
+    }
+    if (w < big_n(b) && (below % 32) != 0) {
+        if ((big_at(b, w) & ((1 << (below % 32)) - 1)) != 0) { return 1; }
+    }
+    return 0;
+}
+
+// The nearest double to big_a, whole, times 2^-scale, with `sticky` 1 when
+// the true value is a little more than that.
+int big_to_f64(int sign, int scale, int sticky) {
+    int bits = big_bits(big_a);
+    if (bits == 0) { return f64_pack(sign, 0, 0); }
+    int sig = 0;
+    if (bits <= 63) {
+        sig = big_bits_at(big_a, 0, bits) << (63 - bits);
+    } else {
+        sig = big_bits_at(big_a, bits - 63, 63);
+        if (big_any_below(big_a, bits - 63)) { sticky = 1; }
+    }
+    if (sticky) { sig = sig | 1; }
+    return f64_round_pack(sign, bits + 1021 - scale, sig);
+}
+
+// The nearest double to the number written at s, such as -12.5 or 3e-4, and
+// how many characters it took, 0 when there is no number there. Exactly
+// rounded, ties to even, for up to 768 significant digits; digits past
+// those only decide which way an exact tie between them would go.
+(int, int) f64_parse(int s) {
+    big_init();
+    int i = 0;
+    int sign = 0;
+    if (s[i] == '-') { sign = 1; i += 1; } else if (s[i] == '+') { i += 1; }
+    big_set(big_a, 0);
+    int digits = 0;
+    int e10 = 0;
+    int any = 0;
+    int more = 0;
+    int point = 0;
+    while ((s[i] >= '0' && s[i] <= '9') || (s[i] == '.' && !point)) {
+        if (s[i] == '.') {
+            point = 1;
+        } else {
+            any = 1;
+            if (digits < 768) {
+                if (digits > 0 || s[i] != '0') {
+                    big_mul_add(big_a, 10, s[i] - '0');
+                    digits += 1;
+                }
+                if (point) { e10 -= 1; }
+            } else {
+                if (s[i] != '0') { more = 1; }
+                if (!point) { e10 += 1; }
+            }
+        }
+        i += 1;
+    }
+    if (!any) { return 0, 0; }
+    if (s[i] == 'e' || s[i] == 'E') {
+        int j = i + 1;
+        int esign = 1;
+        if (s[j] == '-') { esign = 0 - 1; j += 1; } else if (s[j] == '+') { j += 1; }
+        if (s[j] >= '0' && s[j] <= '9') {
+            int e = 0;
+            while (s[j] >= '0' && s[j] <= '9') {
+                if (e < 100000) { e = e * 10 + s[j] - '0'; }
+                j += 1;
+            }
+            e10 += esign * e;
+            i = j;
+        }
+    }
+    // Digits cut off are worth less than one of the last kept, so a 1
+    // after them stands for them without crossing any rounding boundary.
+    if (more) {
+        big_mul_add(big_a, 10, 1);
+        e10 -= 1;
+    }
+    if (big_n(big_a) == 0) { return f64_pack(sign, 0, 0), i; }
+    if (e10 + digits > 310) { return f64_pack(sign, 2047, 0), i; }
+    if (e10 + digits < 0 - 345) { return f64_pack(sign, 0, 0), i; }
+    if (e10 >= 0) {
+        big_mul_pow10(big_a, e10);
+        return big_to_f64(sign, 0, 0), i;
+    }
+    // A fraction, D / 10^-e10. Enough quotient bits come from shifting D up
+    // by s before dividing, one bit at a time.
+    big_set(big_b, 1);
+    big_mul_pow10(big_b, 0 - e10);
+    int scale = big_bits(big_b) - big_bits(big_a) + 66;
+    if (scale > 0) {
+        big_shl(big_c, big_a, scale);
+        big_copy(big_a, big_c);
+    } else {
+        big_shl(big_c, big_b, 0 - scale);
+        big_copy(big_b, big_c);
+    }
+    // big_a is now the dividend; the quotient's bits go into q.
+    int qbits = big_bits(big_a) - big_bits(big_b) + 1;
+    if (qbits < 1) { qbits = 1; }
+    int q = 0;
+    int k = qbits - 1;
+    // The quotient has 66 or 67 bits, more than an int holds, so its low
+    // bits fold into a sticky bit as they come.
+    int lowbits = 0;
+    int qv = 0;
+    while (k >= 0) {
+        big_shl(big_c, big_b, k);
+        int bit = 0;
+        if (big_cmp(big_a, big_c) >= 0) {
+            big_sub(big_a, big_c);
+            bit = 1;
+        }
+        if (k >= 4) { qv = (qv << 1) | bit; }
+        else if (bit) { lowbits = 1; }
+        k -= 1;
+    }
+    int sticky = lowbits;
+    if (big_n(big_a) != 0) { sticky = 1; }
+    big_set(big_a, qv);
+    return big_to_f64(sign, scale - 4, sticky), i;
+}
+
+// Writes x into buf with `places` digits after the point, exactly rounded
+// (the exact value of the double, ties to even), and a NUL, such as -12.50,
+// and returns how many characters that is. nan, inf and -inf are written as
+// words. buf needs room for 330 characters and `places`.
+int f64_format(int x, int buf, int places) {
+    big_init();
+    int n = 0;
+    if (f64_is_nan(x)) { buf[0] = 'n'; buf[1] = 'a'; buf[2] = 'n'; buf[3] = 0; return 3; }
+    if (f64_sign(x)) { buf[n] = '-'; n += 1; }
+    int exp = f64_exp(x);
+    if (exp == 2047) {
+        buf[n] = 'i'; buf[n + 1] = 'n'; buf[n + 2] = 'f'; buf[n + 3] = 0;
+        return n + 3;
+    }
+    int m = f64_frac(x);
+    if (exp != 0) { m = m | 4503599627370496; } else { exp = 1; }
+    int e = exp - 1075;
+    // The value is m * 2^e, so value * 10^places is m * 10^places * 2^e.
+    big_set(big_a, m);
+    big_mul_pow10(big_a, places);
+    if (e >= 0) {
+        big_shl(big_c, big_a, e);
+        big_copy(big_a, big_c);
+    } else {
+        // Shift right by -e, rounding half to even on what falls off.
+        int d = 0 - e;
+        int half = big_bits_at(big_a, d - 1, 1);
+        int below = big_any_below(big_a, d - 1);
+        // big_a >> d, through big_c.
+        int words = d / 32;
+        int bits = d % 32;
+        int na = big_n(big_a);
+        int i = 0;
+        store64(big_c, 0);
+        int nc = 0;
+        for (i = words; i < na; i += 1) {
+            int lo = (big_at(big_a, i) >> bits) & F64_LOW32;
+            int hi = 0;
+            if (i + 1 < na && bits > 0) { hi = (big_at(big_a, i + 1) << (32 - bits)) & F64_LOW32; }
+            big_put(big_c, i - words, (lo | hi) & F64_LOW32);
+            nc = i - words + 1;
+        }
+        store64(big_c, nc);
+        big_trim(big_c);
+        int odd = 0;
+        if (big_n(big_c) > 0) { odd = big_at(big_c, 0) & 1; }
+        if (half && (below || odd)) { big_mul_add(big_c, 1, 1); }
+        big_copy(big_a, big_c);
+    }
+    // The decimal digits, last first, by dividing by ten.
+    int start = n;
+    while (big_n(big_a) > 0 || n - start <= places) {
+        int r = 0;
+        int i2 = big_n(big_a) - 1;
+        while (i2 >= 0) {
+            int cur = (r << 32) | big_at(big_a, i2);
+            big_put(big_a, i2, cur / 10);
+            r = cur % 10;
+            i2 -= 1;
+        }
+        big_trim(big_a);
+        buf[n] = '0' + r;
+        n += 1;
+    }
+    int i3 = start;
+    int j3 = n - 1;
+    while (i3 < j3) {
+        int t = buf[i3];
+        buf[i3] = buf[j3];
+        buf[j3] = t;
+        i3 += 1;
+        j3 -= 1;
+    }
+    if (places > 0) {
+        int m2 = n;
+        while (m2 > n - places) {
+            buf[m2] = buf[m2 - 1];
+            m2 -= 1;
+        }
+        buf[n - places] = '.';
+        n += 1;
+    }
+    buf[n] = 0;
+    return n;
+}

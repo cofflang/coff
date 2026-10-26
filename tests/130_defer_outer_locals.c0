@@ -1,0 +1,43 @@
+// expect: 30
+//
+// tests/130_defer_outer_locals.c0 - the locals a defer may use
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// What a defer may use. The parameters, the function's outermost locals
+// (even from inside an inner block or a loop), globals, and locals the
+// deferred statement declares itself. In g, `late` is an outermost local
+// declared after an inner block ended, in the slot that block's `t` had.
+int total = 0;
+
+void add(int v) {
+    total += v;
+}
+
+int f(int p) {
+    int outer = 10;
+    for (int i = 0; i < 2; i += 1) {
+        if (i == 1) {
+            defer add(outer);
+        }
+    }
+    defer {
+        int own = 3;
+        add(own + p);
+    }
+    outer = 20;
+    return 0;
+}
+
+int g() {
+    {
+        int t = 1;
+    }
+    int late = 4;
+    defer add(late);
+    return 0;
+}
+
+int main() {
+    f(3);
+    g();
+    return total;
+}
