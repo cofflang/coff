@@ -24,12 +24,11 @@ program.
 |------|------------|
 | `coff0.c` | The bootstrap compiler, in plain C. It compiles `c0/coff.c0` the first time, and the test suite diffs everything against it. |
 | `c0/coff.c0` | The real compiler, written in c0. The binary built from it is called `coff1`. |
-| `c0/lex.c0` | A standalone c0 lexer in c0, kept as a differential test stage. |
-| `c0/parse.c0` | A standalone c0 parser in c0, same purpose. |
 | `c0/smed.c0` | The assembler and linker, in c0. Turns the assembly `coff1` emits into a finished executable, with no GNU tool in between. |
 | `c0/sha256.c0`, `c0/cmp.c0` | `sha256sum` and `cmp` written in c0. The audit builds them with the `coff1` it has just verified and runs them next to the system tools, so every hash and every byte comparison is checked by two inspectors. |
 | `lib/flyt.c0` | flyt, IEEE 754 doubles as a c0 library, for programs that need floating point. `lib/flyt_check.sh` checks it against the machine's own doubles. |
 | `check_saved_regs.awk` | Checks that every function in coff's output saves and restores the registers it keeps locals in. `run_tests.sh` runs it. |
+| `ddc_entries.sh` | The list of every compile the audit and the test suite compare, the coff tests and sources and, when my kernel is checked out alongside, everything its build compiles. Both `verify_bootstrap.sh` and `run_tests.sh` read it. |
 | `tests/` | The test programs, which double as the input set for the differential checks. |
 | `run_tests.sh` | Builds coff0 and runs the compiler test suite. |
 | `smed_tests.sh` | Checks smed against GNU as and ld over every program in the tree, then runs the suite with no GNU tool in the pipeline. The last check builds my kernel with both and compares them, when it is checked out alongside. |
@@ -133,7 +132,9 @@ coff1 [--elf] [-I dir]... input.c0 output.s
 `-I` adds a directory to look in for an include that is not next to the
 file including it, which is how programs in different directories share a
 library. With no file arguments, `coff1` reads c0 source on stdin and
-writes assembly to stdout instead; the test harness uses that form.
+writes assembly to stdout instead. Any other argument that starts with `-`
+is refused before anything is opened, so `coff1 -x prog.c0` cannot take a
+file named `-x` for its output and overwrite the source.
 
 A program with a mistake in it gets a real message, with the file and the
 line, such as `coff1: hello.c0:3: expected ';'`. coff1 and coff0 say exactly
@@ -146,8 +147,8 @@ c0 has `int` variables and globals, functions with up to 16 parameters
 `while` and `for` with `break`/`continue`, block scoping with shadowing,
 short-circuiting `&&`/`||`, logical not `!`, `%`, the bitwise operators
 `& | ^ ~ << >>` (with C's precedence, warts included, and `>>` arithmetic),
-the compound assignments `+= -= *= /= %=`, string literals, char literals,
-hex literals,
+the compound assignments `+= -= *= /= %= &= |= ^= <<= >>=`, string literals,
+char literals, hex literals,
 `buf[i]` indexing (sugar over byte load/store), and function references: a
 bare function name is its address, and calling through a variable holding
 one is an indirect call. `include "file.c0";` splits a program across
@@ -171,6 +172,13 @@ int q;
 int r;
 q, r = divmod(17, 5);
 ```
+
+A compound assignment to a variable means `x = x OP e`. On `buf[i]` or `p.f`
+it works out the base and the index, or the record, once, and reads the old
+value before the right side runs, so `b[f()] += 1` calls `f` once. The
+address is taken before the right side runs as well. A right side that
+moves the block a global base points to therefore stores into the old
+block, the same as plain `=` does.
 
 `defer stmt;` runs the statement at every exit of the function, the last
 defer first, which keeps a cleanup next to the thing it cleans up:
@@ -277,13 +285,15 @@ lib/flyt_check.sh   # flyt against the machine's doubles, needs python3
 Every test program goes through the real pipeline: compile, assemble,
 link, execute, check the exit code (and the exact stdout, where a test has
 an `.expected_stdout` file, and the exact error message, file and line,
-where a test has an `.expected_error` file). Then each c0-written stage is
-diffed byte for byte against coff0 over the whole corpus, error messages
-included, the `-I`, `embed` and large-source cases are run through both
-compilers, the c0 `sha256` and `cmp` are held to the system tools, and last
-the bootstrap fixpoint is checked: `coff.c0` compiling itself three
-generations deep, all byte-identical. That is over 400 checks, and they all
-have to stay green.
+where a test has an `.expected_error` file). Then coff1 is diffed byte for
+byte against coff0 over every compile `ddc_entries.sh` lists, error messages
+included, the command line, `-I`, `embed` and large-source cases are run
+through both compilers, the c0 `sha256` and `cmp` are held to the system
+tools, and last the bootstrap fixpoint is checked: `coff.c0` compiling
+itself three generations deep, all byte-identical. coff1's front end is
+checked only end to end, since there is no token-level or tree-level oracle
+to compare it with. That is over 370 checks, and they all have to stay
+green.
 `CC=tcc ./run_tests.sh` runs the same suite with gcc absent from the
 machine entirely.
 
@@ -327,8 +337,8 @@ file. `./verify_bootstrap.sh` is the audit that bears on that question. It
 rebuilds the whole chain from source, checks the fixpoint, checks that the
 compiler's output does not depend on locale, time zone, build directory or
 date, and then does diverse double-compiling: `coff0.c` built by
-unrelated C compilers must produce byte-identical assembly over every c0
-source it can find. That last stage is the one that caught the simulated
+unrelated C compilers must produce byte-identical assembly over every
+compile the build performs. That last stage is the one that caught the simulated
 attack, and it only did so once the corpus included the code worth
 attacking. It needs a second C compiler installed, tcc by preference, and
 uses cproc as a third when `./fetch_ddc_cproc.sh` has built it. Every hash
@@ -343,10 +353,9 @@ by what, what is still open, and what none of it proves.
 Contributions are welcome. Some things to know before opening a pull
 request:
 
-- The language is implemented four times over (`coff0.c`, `c0/lex.c0`,
-  `c0/parse.c0`, `c0/coff.c0`). A language change lands in `coff0.c`
-  first, then gets mirrored into the c0 implementations, each verified
-  byte-identical against coff0 before moving on. A new error message has to
+- The language is implemented twice (`coff0.c` and `c0/coff.c0`). A
+  language change lands in `coff0.c` first, then gets mirrored into
+  `c0/coff.c0`, verified byte-identical against coff0 before moving on. A new error message has to
   read the same in coff0 and coff1.
 - `./run_tests.sh` must pass, including both fixpoint checks, and so must
   `./smed_tests.sh` and `./verify_bootstrap.sh`.

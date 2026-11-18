@@ -1,0 +1,819 @@
+// expect: 42
+//
+// tests/146_compound_equivalence.c0 - T OP= E computes what T = T OP E computes
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// T OP= E computes exactly what T = T OP E computes, for every compound
+// operator, every target form (a local in a register, a local on the stack,
+// a global, buf[i] and a field) and every kind of right side (a 32-bit and a
+// 64-bit immediate, a local in a register, a global and a call). main runs
+// each over the values in vals, and over the counts in counts for the
+// shifts, skipping only the divisions idiv traps on. Then a few byte
+// targets are checked against constants. Each mismatch adds one to bad.
+layout F { int fa; int fb; int fc; }
+
+int bad = 0;
+int ge = 0;
+int gt = 0;
+int gu = 0;
+int gb = 0;
+int gp = 0;
+int gq = 0;
+
+int id(int x) { return x; }
+
+int tr_add(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x += 3; y = y + 3; if (x != y) { bad += 1; }
+    x = v; y = v; x += -7; y = y + -7; if (x != y) { bad += 1; }
+    x = v; y = v; x += 0x123456789ABCDEF; y = y + 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x += r; y = y + r; if (x != y) { bad += 1; }
+    x = v; y = v; x += ge; y = y + ge; if (x != y) { bad += 1; }
+    x = v; y = v; x += id(r); y = y + id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_add(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x += 3; y = y + 3; if (x != y) { bad += 1; }
+    x = v; y = v; x += -7; y = y + -7; if (x != y) { bad += 1; }
+    x = v; y = v; x += 0x123456789ABCDEF; y = y + 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x += r; y = y + r; if (x != y) { bad += 1; }
+    x = v; y = v; x += ge; y = y + ge; if (x != y) { bad += 1; }
+    x = v; y = v; x += id(r); y = y + id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_add(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt += 3; gu = gu + 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt += -7; gu = gu + -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt += 0x123456789ABCDEF; gu = gu + 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt += r; gu = gu + r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt += ge; gu = gu + ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt += id(r); gu = gu + id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_add(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] += 3; b[i + 2] = b[i + 2] + 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] += -7; b[i + 2] = b[i + 2] + -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] += 0x123456789ABCDEF; b[i + 2] = b[i + 2] + 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] += r; b[i + 2] = b[i + 2] + r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] += ge; b[i + 2] = b[i + 2] + ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] += id(r); b[i + 2] = b[i + 2] + id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_add(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb += 3; q.fb = q.fb + 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb += -7; q.fb = q.fb + -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb += 0x123456789ABCDEF; q.fb = q.fb + 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb += r; q.fb = q.fb + r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb += ge; q.fb = q.fb + ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb += id(r); q.fb = q.fb + id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_sub(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x -= 3; y = y - 3; if (x != y) { bad += 1; }
+    x = v; y = v; x -= -7; y = y - -7; if (x != y) { bad += 1; }
+    x = v; y = v; x -= 0x123456789ABCDEF; y = y - 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x -= r; y = y - r; if (x != y) { bad += 1; }
+    x = v; y = v; x -= ge; y = y - ge; if (x != y) { bad += 1; }
+    x = v; y = v; x -= id(r); y = y - id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_sub(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x -= 3; y = y - 3; if (x != y) { bad += 1; }
+    x = v; y = v; x -= -7; y = y - -7; if (x != y) { bad += 1; }
+    x = v; y = v; x -= 0x123456789ABCDEF; y = y - 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x -= r; y = y - r; if (x != y) { bad += 1; }
+    x = v; y = v; x -= ge; y = y - ge; if (x != y) { bad += 1; }
+    x = v; y = v; x -= id(r); y = y - id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_sub(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt -= 3; gu = gu - 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt -= -7; gu = gu - -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt -= 0x123456789ABCDEF; gu = gu - 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt -= r; gu = gu - r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt -= ge; gu = gu - ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt -= id(r); gu = gu - id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_sub(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] -= 3; b[i + 2] = b[i + 2] - 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] -= -7; b[i + 2] = b[i + 2] - -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] -= 0x123456789ABCDEF; b[i + 2] = b[i + 2] - 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] -= r; b[i + 2] = b[i + 2] - r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] -= ge; b[i + 2] = b[i + 2] - ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] -= id(r); b[i + 2] = b[i + 2] - id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_sub(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb -= 3; q.fb = q.fb - 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb -= -7; q.fb = q.fb - -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb -= 0x123456789ABCDEF; q.fb = q.fb - 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb -= r; q.fb = q.fb - r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb -= ge; q.fb = q.fb - ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb -= id(r); q.fb = q.fb - id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_mul(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x *= 3; y = y * 3; if (x != y) { bad += 1; }
+    x = v; y = v; x *= -7; y = y * -7; if (x != y) { bad += 1; }
+    x = v; y = v; x *= 0x123456789ABCDEF; y = y * 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x *= r; y = y * r; if (x != y) { bad += 1; }
+    x = v; y = v; x *= ge; y = y * ge; if (x != y) { bad += 1; }
+    x = v; y = v; x *= id(r); y = y * id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_mul(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x *= 3; y = y * 3; if (x != y) { bad += 1; }
+    x = v; y = v; x *= -7; y = y * -7; if (x != y) { bad += 1; }
+    x = v; y = v; x *= 0x123456789ABCDEF; y = y * 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x *= r; y = y * r; if (x != y) { bad += 1; }
+    x = v; y = v; x *= ge; y = y * ge; if (x != y) { bad += 1; }
+    x = v; y = v; x *= id(r); y = y * id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_mul(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt *= 3; gu = gu * 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt *= -7; gu = gu * -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt *= 0x123456789ABCDEF; gu = gu * 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt *= r; gu = gu * r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt *= ge; gu = gu * ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt *= id(r); gu = gu * id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_mul(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] *= 3; b[i + 2] = b[i + 2] * 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] *= -7; b[i + 2] = b[i + 2] * -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] *= 0x123456789ABCDEF; b[i + 2] = b[i + 2] * 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] *= r; b[i + 2] = b[i + 2] * r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] *= ge; b[i + 2] = b[i + 2] * ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] *= id(r); b[i + 2] = b[i + 2] * id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_mul(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb *= 3; q.fb = q.fb * 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb *= -7; q.fb = q.fb * -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb *= 0x123456789ABCDEF; q.fb = q.fb * 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb *= r; q.fb = q.fb * r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb *= ge; q.fb = q.fb * ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb *= id(r); q.fb = q.fb * id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_div(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x /= 3; y = y / 3; if (x != y) { bad += 1; }
+    x = v; y = v; x /= -7; y = y / -7; if (x != y) { bad += 1; }
+    x = v; y = v; x /= 0x123456789ABCDEF; y = y / 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x /= r; y = y / r; if (x != y) { bad += 1; }
+    x = v; y = v; x /= ge; y = y / ge; if (x != y) { bad += 1; }
+    x = v; y = v; x /= id(r); y = y / id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_div(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x /= 3; y = y / 3; if (x != y) { bad += 1; }
+    x = v; y = v; x /= -7; y = y / -7; if (x != y) { bad += 1; }
+    x = v; y = v; x /= 0x123456789ABCDEF; y = y / 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x /= r; y = y / r; if (x != y) { bad += 1; }
+    x = v; y = v; x /= ge; y = y / ge; if (x != y) { bad += 1; }
+    x = v; y = v; x /= id(r); y = y / id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_div(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt /= 3; gu = gu / 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt /= -7; gu = gu / -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt /= 0x123456789ABCDEF; gu = gu / 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt /= r; gu = gu / r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt /= ge; gu = gu / ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt /= id(r); gu = gu / id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_div(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] /= 3; b[i + 2] = b[i + 2] / 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] /= -7; b[i + 2] = b[i + 2] / -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] /= 0x123456789ABCDEF; b[i + 2] = b[i + 2] / 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] /= r; b[i + 2] = b[i + 2] / r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] /= ge; b[i + 2] = b[i + 2] / ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] /= id(r); b[i + 2] = b[i + 2] / id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_div(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb /= 3; q.fb = q.fb / 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb /= -7; q.fb = q.fb / -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb /= 0x123456789ABCDEF; q.fb = q.fb / 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb /= r; q.fb = q.fb / r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb /= ge; q.fb = q.fb / ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb /= id(r); q.fb = q.fb / id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_mod(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x %= 3; y = y % 3; if (x != y) { bad += 1; }
+    x = v; y = v; x %= -7; y = y % -7; if (x != y) { bad += 1; }
+    x = v; y = v; x %= 0x123456789ABCDEF; y = y % 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x %= r; y = y % r; if (x != y) { bad += 1; }
+    x = v; y = v; x %= ge; y = y % ge; if (x != y) { bad += 1; }
+    x = v; y = v; x %= id(r); y = y % id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_mod(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x %= 3; y = y % 3; if (x != y) { bad += 1; }
+    x = v; y = v; x %= -7; y = y % -7; if (x != y) { bad += 1; }
+    x = v; y = v; x %= 0x123456789ABCDEF; y = y % 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x %= r; y = y % r; if (x != y) { bad += 1; }
+    x = v; y = v; x %= ge; y = y % ge; if (x != y) { bad += 1; }
+    x = v; y = v; x %= id(r); y = y % id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_mod(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt %= 3; gu = gu % 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt %= -7; gu = gu % -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt %= 0x123456789ABCDEF; gu = gu % 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt %= r; gu = gu % r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt %= ge; gu = gu % ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt %= id(r); gu = gu % id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_mod(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] %= 3; b[i + 2] = b[i + 2] % 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] %= -7; b[i + 2] = b[i + 2] % -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] %= 0x123456789ABCDEF; b[i + 2] = b[i + 2] % 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] %= r; b[i + 2] = b[i + 2] % r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] %= ge; b[i + 2] = b[i + 2] % ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] %= id(r); b[i + 2] = b[i + 2] % id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_mod(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb %= 3; q.fb = q.fb % 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb %= -7; q.fb = q.fb % -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb %= 0x123456789ABCDEF; q.fb = q.fb % 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb %= r; q.fb = q.fb % r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb %= ge; q.fb = q.fb % ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb %= id(r); q.fb = q.fb % id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_and(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x &= 3; y = y & 3; if (x != y) { bad += 1; }
+    x = v; y = v; x &= -7; y = y & -7; if (x != y) { bad += 1; }
+    x = v; y = v; x &= 0x123456789ABCDEF; y = y & 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x &= r; y = y & r; if (x != y) { bad += 1; }
+    x = v; y = v; x &= ge; y = y & ge; if (x != y) { bad += 1; }
+    x = v; y = v; x &= id(r); y = y & id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_and(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x &= 3; y = y & 3; if (x != y) { bad += 1; }
+    x = v; y = v; x &= -7; y = y & -7; if (x != y) { bad += 1; }
+    x = v; y = v; x &= 0x123456789ABCDEF; y = y & 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x &= r; y = y & r; if (x != y) { bad += 1; }
+    x = v; y = v; x &= ge; y = y & ge; if (x != y) { bad += 1; }
+    x = v; y = v; x &= id(r); y = y & id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_and(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt &= 3; gu = gu & 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt &= -7; gu = gu & -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt &= 0x123456789ABCDEF; gu = gu & 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt &= r; gu = gu & r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt &= ge; gu = gu & ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt &= id(r); gu = gu & id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_and(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] &= 3; b[i + 2] = b[i + 2] & 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] &= -7; b[i + 2] = b[i + 2] & -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] &= 0x123456789ABCDEF; b[i + 2] = b[i + 2] & 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] &= r; b[i + 2] = b[i + 2] & r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] &= ge; b[i + 2] = b[i + 2] & ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] &= id(r); b[i + 2] = b[i + 2] & id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_and(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb &= 3; q.fb = q.fb & 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb &= -7; q.fb = q.fb & -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb &= 0x123456789ABCDEF; q.fb = q.fb & 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb &= r; q.fb = q.fb & r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb &= ge; q.fb = q.fb & ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb &= id(r); q.fb = q.fb & id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_or(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x |= 3; y = y | 3; if (x != y) { bad += 1; }
+    x = v; y = v; x |= -7; y = y | -7; if (x != y) { bad += 1; }
+    x = v; y = v; x |= 0x123456789ABCDEF; y = y | 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x |= r; y = y | r; if (x != y) { bad += 1; }
+    x = v; y = v; x |= ge; y = y | ge; if (x != y) { bad += 1; }
+    x = v; y = v; x |= id(r); y = y | id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_or(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x |= 3; y = y | 3; if (x != y) { bad += 1; }
+    x = v; y = v; x |= -7; y = y | -7; if (x != y) { bad += 1; }
+    x = v; y = v; x |= 0x123456789ABCDEF; y = y | 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x |= r; y = y | r; if (x != y) { bad += 1; }
+    x = v; y = v; x |= ge; y = y | ge; if (x != y) { bad += 1; }
+    x = v; y = v; x |= id(r); y = y | id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_or(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt |= 3; gu = gu | 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt |= -7; gu = gu | -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt |= 0x123456789ABCDEF; gu = gu | 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt |= r; gu = gu | r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt |= ge; gu = gu | ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt |= id(r); gu = gu | id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_or(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] |= 3; b[i + 2] = b[i + 2] | 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] |= -7; b[i + 2] = b[i + 2] | -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] |= 0x123456789ABCDEF; b[i + 2] = b[i + 2] | 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] |= r; b[i + 2] = b[i + 2] | r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] |= ge; b[i + 2] = b[i + 2] | ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] |= id(r); b[i + 2] = b[i + 2] | id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_or(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb |= 3; q.fb = q.fb | 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb |= -7; q.fb = q.fb | -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb |= 0x123456789ABCDEF; q.fb = q.fb | 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb |= r; q.fb = q.fb | r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb |= ge; q.fb = q.fb | ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb |= id(r); q.fb = q.fb | id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_xor(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x ^= 3; y = y ^ 3; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= -7; y = y ^ -7; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= 0x123456789ABCDEF; y = y ^ 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= r; y = y ^ r; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= ge; y = y ^ ge; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= id(r); y = y ^ id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_xor(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x ^= 3; y = y ^ 3; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= -7; y = y ^ -7; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= 0x123456789ABCDEF; y = y ^ 0x123456789ABCDEF; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= r; y = y ^ r; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= ge; y = y ^ ge; if (x != y) { bad += 1; }
+    x = v; y = v; x ^= id(r); y = y ^ id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_xor(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt ^= 3; gu = gu ^ 3; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt ^= -7; gu = gu ^ -7; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt ^= 0x123456789ABCDEF; gu = gu ^ 0x123456789ABCDEF; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt ^= r; gu = gu ^ r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt ^= ge; gu = gu ^ ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt ^= id(r); gu = gu ^ id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_xor(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] ^= 3; b[i + 2] = b[i + 2] ^ 3; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] ^= -7; b[i + 2] = b[i + 2] ^ -7; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] ^= 0x123456789ABCDEF; b[i + 2] = b[i + 2] ^ 0x123456789ABCDEF; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] ^= r; b[i + 2] = b[i + 2] ^ r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] ^= ge; b[i + 2] = b[i + 2] ^ ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] ^= id(r); b[i + 2] = b[i + 2] ^ id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_xor(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb ^= 3; q.fb = q.fb ^ 3; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb ^= -7; q.fb = q.fb ^ -7; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb ^= 0x123456789ABCDEF; q.fb = q.fb ^ 0x123456789ABCDEF; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb ^= r; q.fb = q.fb ^ r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb ^= ge; q.fb = q.fb ^ ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb ^= id(r); q.fb = q.fb ^ id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_shl(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x <<= 0; y = y << 0; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 1; y = y << 1; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 63; y = y << 63; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 64; y = y << 64; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 65; y = y << 65; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= -1; y = y << -1; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 0x100000001; y = y << 0x100000001; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= r; y = y << r; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= ge; y = y << ge; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= id(r); y = y << id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_shl(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x <<= 0; y = y << 0; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 1; y = y << 1; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 63; y = y << 63; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 64; y = y << 64; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 65; y = y << 65; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= -1; y = y << -1; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= 0x100000001; y = y << 0x100000001; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= r; y = y << r; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= ge; y = y << ge; if (x != y) { bad += 1; }
+    x = v; y = v; x <<= id(r); y = y << id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_shl(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt <<= 0; gu = gu << 0; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= 1; gu = gu << 1; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= 63; gu = gu << 63; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= 64; gu = gu << 64; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= 65; gu = gu << 65; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= -1; gu = gu << -1; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= 0x100000001; gu = gu << 0x100000001; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= r; gu = gu << r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= ge; gu = gu << ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt <<= id(r); gu = gu << id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_shl(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] <<= 0; b[i + 2] = b[i + 2] << 0; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= 1; b[i + 2] = b[i + 2] << 1; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= 63; b[i + 2] = b[i + 2] << 63; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= 64; b[i + 2] = b[i + 2] << 64; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= 65; b[i + 2] = b[i + 2] << 65; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= -1; b[i + 2] = b[i + 2] << -1; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= 0x100000001; b[i + 2] = b[i + 2] << 0x100000001; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= r; b[i + 2] = b[i + 2] << r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= ge; b[i + 2] = b[i + 2] << ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] <<= id(r); b[i + 2] = b[i + 2] << id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_shl(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb <<= 0; q.fb = q.fb << 0; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= 1; q.fb = q.fb << 1; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= 63; q.fb = q.fb << 63; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= 64; q.fb = q.fb << 64; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= 65; q.fb = q.fb << 65; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= -1; q.fb = q.fb << -1; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= 0x100000001; q.fb = q.fb << 0x100000001; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= r; q.fb = q.fb << r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= ge; q.fb = q.fb << ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb <<= id(r); q.fb = q.fb << id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int tr_shr(int v, int r) {
+    int x = 0;
+    int y = 0;
+    ge = r;
+    x = v; y = v; x >>= 0; y = y >> 0; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 1; y = y >> 1; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 63; y = y >> 63; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 64; y = y >> 64; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 65; y = y >> 65; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= -1; y = y >> -1; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 0x100000001; y = y >> 0x100000001; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= r; y = y >> r; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= ge; y = y >> ge; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= id(r); y = y >> id(r); if (x != y) { bad += 1; }
+    return 0;
+}
+
+int ts_shr(int v, int r) {
+    int x = 0;
+    int y = 0;
+    int k = 0;
+    int a1 = 0;
+    int a2 = 0;
+    int a3 = 0;
+    int a4 = 0;
+    int a5 = 0;
+    ge = r;
+    for (k = 0; k < 1; k += 1) { for (a1 = 0; a1 < 1; a1 += 1) { for (a2 = 0; a2 < 1; a2 += 1) { a3 += a1 + a2 + k; a4 += a3; a5 += a4; } } }
+    x = v; y = v; x >>= 0; y = y >> 0; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 1; y = y >> 1; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 63; y = y >> 63; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 64; y = y >> 64; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 65; y = y >> 65; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= -1; y = y >> -1; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= 0x100000001; y = y >> 0x100000001; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= r; y = y >> r; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= ge; y = y >> ge; if (x != y) { bad += 1; }
+    x = v; y = v; x >>= id(r); y = y >> id(r); if (x != y) { bad += 1; }
+    return a5;
+}
+
+int tg_shr(int v, int r) {
+    ge = r;
+    gt = v; gu = v; gt >>= 0; gu = gu >> 0; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= 1; gu = gu >> 1; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= 63; gu = gu >> 63; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= 64; gu = gu >> 64; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= 65; gu = gu >> 65; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= -1; gu = gu >> -1; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= 0x100000001; gu = gu >> 0x100000001; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= r; gu = gu >> r; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= ge; gu = gu >> ge; if (gt != gu) { bad += 1; }
+    gt = v; gu = v; gt >>= id(r); gu = gu >> id(r); if (gt != gu) { bad += 1; }
+    return 0;
+}
+
+int ti_shr(int v, int r) {
+    int b = gb;
+    int i = 1;
+    ge = r;
+    b[i] = v; b[i + 2] = v; b[i] >>= 0; b[i + 2] = b[i + 2] >> 0; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= 1; b[i + 2] = b[i + 2] >> 1; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= 63; b[i + 2] = b[i + 2] >> 63; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= 64; b[i + 2] = b[i + 2] >> 64; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= 65; b[i + 2] = b[i + 2] >> 65; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= -1; b[i + 2] = b[i + 2] >> -1; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= 0x100000001; b[i + 2] = b[i + 2] >> 0x100000001; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= r; b[i + 2] = b[i + 2] >> r; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= ge; b[i + 2] = b[i + 2] >> ge; if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    b[i] = v; b[i + 2] = v; b[i] >>= id(r); b[i + 2] = b[i + 2] >> id(r); if (b[1] != b[3] || b[0] != 0 || b[2] != 0) { bad += 1; }
+    return 0;
+}
+
+int tf_shr(int v, int r) {
+    int p = gp;
+    int q = gq;
+    ge = r;
+    p.fb = v; q.fb = v; p.fb >>= 0; q.fb = q.fb >> 0; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= 1; q.fb = q.fb >> 1; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= 63; q.fb = q.fb >> 63; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= 64; q.fb = q.fb >> 64; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= 65; q.fb = q.fb >> 65; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= -1; q.fb = q.fb >> -1; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= 0x100000001; q.fb = q.fb >> 0x100000001; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= r; q.fb = q.fb >> r; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= ge; q.fb = q.fb >> ge; if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    p.fb = v; q.fb = v; p.fb >>= id(r); q.fb = q.fb >> id(r); if (p.fb != q.fb || p.fa != 0 || p.fc != 0) { bad += 1; }
+    return 0;
+}
+
+int main() {
+    int vals = alloc(48);
+    int counts = alloc(48);
+    int i = 0;
+    int j = 0;
+    int v = 0;
+    int r = 0;
+    gb = alloc(8);
+    gp = alloc(sizeof(F));
+    gq = alloc(sizeof(F));
+    store64(vals, 0);
+    store64(vals + 8, 1);
+    store64(vals + 16, 0 - 1);
+    store64(vals + 24, 255);
+    store64(vals + 32, 256);
+    store64(vals + 40, -9223372036854775808);
+    store64(counts, 0);
+    store64(counts + 8, 1);
+    store64(counts + 16, 63);
+    store64(counts + 24, 64);
+    store64(counts + 32, 65);
+    store64(counts + 40, 0 - 1);
+    for (i = 0; i < 6; i += 1) {
+        v = load64(vals + i * 8);
+        for (j = 0; j < 6; j += 1) {
+            r = load64(vals + j * 8);
+            tr_add(v, r); ts_add(v, r); tg_add(v, r); ti_add(v, r); tf_add(v, r);
+            tr_sub(v, r); ts_sub(v, r); tg_sub(v, r); ti_sub(v, r); tf_sub(v, r);
+            tr_mul(v, r); ts_mul(v, r); tg_mul(v, r); ti_mul(v, r); tf_mul(v, r);
+            if (r != 0 && (v != -9223372036854775808 || r != 0 - 1)) {
+                tr_div(v, r); ts_div(v, r); tg_div(v, r); ti_div(v, r); tf_div(v, r);
+            }
+            if (r != 0 && (v != -9223372036854775808 || r != 0 - 1)) {
+                tr_mod(v, r); ts_mod(v, r); tg_mod(v, r); ti_mod(v, r); tf_mod(v, r);
+            }
+            tr_and(v, r); ts_and(v, r); tg_and(v, r); ti_and(v, r); tf_and(v, r);
+            tr_or(v, r); ts_or(v, r); tg_or(v, r); ti_or(v, r); tf_or(v, r);
+            tr_xor(v, r); ts_xor(v, r); tg_xor(v, r); ti_xor(v, r); tf_xor(v, r);
+            r = load64(counts + j * 8);
+            tr_shl(v, r); ts_shl(v, r); tg_shl(v, r); ti_shl(v, r); tf_shl(v, r);
+            tr_shr(v, r); ts_shr(v, r); tg_shr(v, r); ti_shr(v, r); tf_shr(v, r);
+        }
+    }
+    int b = gb;
+    store8(b + 1, 200);
+    b[1] += 300;
+    if (b[1] != 244) { bad += 1; }
+    store8(b + 1, 0x9c);
+    b[1] <<= 4;
+    if (b[1] != 0xc0) { bad += 1; }
+    store8(b + 1, 0xff);
+    b[1] >>= 1;
+    if (b[1] != 0x7f) { bad += 1; }
+    if (bad == 0) { return 42; }
+    return bad;
+}

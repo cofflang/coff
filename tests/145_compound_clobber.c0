@@ -1,0 +1,94 @@
+// expect: 42
+//
+// tests/145_compound_clobber.c0 - a compound store whose right side writes rdi
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// A compound store whose right side writes rdi must not keep the address
+// in rdi. Each target has a canary on both sides, and every right side that
+// allocates leaves a block of 77s behind, which a store through a stale rdi
+// would land in. Each check that holds adds one.
+layout W { int lo; int mid; int hi; }
+
+int last = 0;
+
+int mk(int a, int c) {
+    int q = alloc(sizeof(W));
+    q.lo = 77;
+    q.mid = 77;
+    q.hi = 77;
+    last = q;
+    return a + c;
+}
+
+int pick(int t, int i) {
+    return t + (i - 1) * sizeof(W);
+}
+
+int fresh(int b, int v) {
+    store8(b, 170);
+    store8(b + 1, v);
+    store8(b + 2, 85);
+    return 0;
+}
+
+int bytes_ok(int b, int v) {
+    return b[0] == 170 && b[1] == v && b[2] == 85;
+}
+
+int words_ok(int w, int v) {
+    return w.lo == 1111 && w.mid == v && w.hi == 2222;
+}
+
+int fresh_w(int w, int v) {
+    w.lo = 1111;
+    w.mid = v;
+    w.hi = 2222;
+    return 0;
+}
+
+int last_ok() {
+    return last.lo == 77 && last.mid == 77 && last.hi == 77;
+}
+
+int main() {
+    int ok = 0;
+    int s = "x";
+    int x = 3;
+    int y = 4;
+    int b = alloc(8);
+    int w = alloc(sizeof(W));
+
+    fresh(b, 10); b[1] += mk(2, 3);
+    if (bytes_ok(b, 15) && last_ok()) { ok += 1; }
+    fresh_w(w, 10); w.mid += mk(2, 3);
+    if (words_ok(w, 15) && last_ok()) { ok += 1; }
+
+    fresh(b, 10); b[1] += alloc(16) * 0 + 5;
+    if (bytes_ok(b, 15)) { ok += 1; }
+    fresh_w(w, 10); w.mid += alloc(16);
+    int a = w.mid - 10;
+    if (w.lo == 1111 && w.hi == 2222 && a != 0 && load64(a) == 0) { ok += 1; }
+
+    fresh(b, 10); b[1] += write(1, s, 0) + 6;
+    if (bytes_ok(b, 16)) { ok += 1; }
+    fresh_w(w, 10); w.mid -= write(1, s, 0) + 6;
+    if (words_ok(w, 4)) { ok += 1; }
+
+    fresh(b, 10); b[1] += x * 2 + y;
+    if (bytes_ok(b, 20)) { ok += 1; }
+    fresh_w(w, 10); w.mid *= x * 2 + y;
+    if (words_ok(w, 100)) { ok += 1; }
+
+    int t = alloc(3 * sizeof(W));
+    int i = 1;
+    fresh_w(t, 0);
+    fresh_w(t + sizeof(W), 30);
+    fresh_w(t + 2 * sizeof(W), 30);
+    fresh_w(w, 10); w.mid += pick(t, i + 1).mid;
+    if (words_ok(w, 40) && words_ok(t, 0)) { ok += 1; }
+    int e = t + 2 * sizeof(W);
+    fresh_w(w, 10); w.mid += e.mid;
+    if (words_ok(w, 40) && words_ok(e, 30)) { ok += 1; }
+
+    if (ok == 10) { return 42; }
+    return ok;
+}

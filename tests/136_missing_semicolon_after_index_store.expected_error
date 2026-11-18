@@ -1,0 +1,1 @@
+coff0: tests/136_missing_semicolon_after_index_store.c0:7: expected ';'

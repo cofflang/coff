@@ -1,0 +1,10 @@
+// expect: compile-error
+//
+// tests/135_missing_semicolon_after_field_store.c0 - a missing ; after a field store is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+layout Point { int x; int y; }
+int main() {
+    Point p = alloc(sizeof(Point));
+    p.x = 3
+    return p.x;
+}

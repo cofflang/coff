@@ -1,0 +1,20 @@
+// expect: 31
+//
+// tests/139_bitand_equality_precedence.c0 - & binds more loosely than == and !=
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// & binds more loosely than == and !=, as in C, so a & b == c is
+// a & (b == c). Each check that holds adds a bit, and each one comes out
+// differently if the two precedences are swapped.
+int main() {
+    int ok = 0;
+    int a = 6;
+    int b = 2;
+    if ((a & b == 2) == 0) { ok = ok + 1; }
+    if ((a & 2 != 0) == 0) { ok = ok + 2; }
+    if ((1 & 2 == 2) == 1) { ok = ok + 4; }
+    int r = 4 == 4 & 6;
+    if (r == 0) { ok = ok + 8; }
+    int t = 2 & 3 == 3 & 2;
+    if (t == 0) { ok = ok + 16; }
+    return ok;
+}

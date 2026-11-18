@@ -4,6 +4,70 @@ Every release of coff, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
 plain [semantic versions](https://semver.org/) with no names.
 
+## [0.8.0] - 2026-11-18
+
+### Added
+
+- `&=`, `|=`, `^=`, `<<=` and `>>=`, next to the `+=`, `-=`, `*=`, `/=` and
+  `%=` that were already there. They work on locals, globals, `buf[i]` and
+  `p.f`, and the lexer takes the longest match, so `x<<=2` is one operator.
+- `ddc_entries.sh`, the one list of what the build compiles. The diverse
+  double-compiling check and `run_tests.sh` both read it, and the audit
+  fails when one of the build scripts of my kernel compiles something the
+  list does not name. The check now compares every program, test and kernel
+  variant the kernel build compiles, with the flags the build gives it, where
+  it used to try files and skip the ones it could not build. A compile-error
+  test is compared on its message and its exit code.
+- The audit prints the line counts of `coff0.c`, `c0/coff.c0` and
+  `c0/smed.c0`, so the figures `TRUST.md` quotes can be checked against it.
+- Tests 133 to 150 cover a missing `;` after a call, an assignment, a field
+  store, an index store and a `for` condition, the string escapes, `'\0'`, `&` against `==`, and
+  every compound operator, including the order its parts run in, its use in
+  `for` and `defer`, its lexing and a shift at the very end of the input.
+  Each was seen failing, either by breaking the behaviour it pins or by
+  running it against 0.7.1.
+
+### Changed
+
+- `buf[i] += v` and `p.f += v` work out the buffer and the index, or the
+  record, once, and read the old value before the right side runs, so
+  `b[f()] += 1` calls `f` once, where it called it twice. The address is
+  taken before the right side runs as well. A right side that moves the
+  block a global base points to therefore stores into the old block, which
+  is what plain `=` has always done.
+- A store whose value is a number or a variable keeps its address in `rdi`
+  while the value is worked out. Every other store, and every call, still
+  goes through the stack. coff's own assembly comes out a few instructions
+  shorter.
+- coff0 and coff1 refuse an argument that starts with `-` and is not `--elf`
+  or `-I`, before they open anything. Before, `coff0 -x prog.c0` took `-x`
+  for the input and `prog.c0` for the output, and compiled over its own
+  source. `-I` without a directory and more than eight `-I` have their own
+  messages.
+- `run_tests.sh` reads both halves of its codegen comparison from
+  `ddc_entries.sh`, and has a new stage that checks the command line of both
+  compilers.
+- `BOOTSTRAP.sha256` hashes `ddc_entries.sh` and the new tests, and no
+  longer lists the lexer and the parser.
+- `TRUST.md` gives the figures the audit prints with the date it printed
+  them, and has two new standing rules. A call cannot write a local, and a
+  store keeps its address in `rdi` only across a number or a variable.
+
+### Fixed
+
+- The large-source check in `run_tests.sh` was meant to build a file over
+  1MB and built a smaller one. It now exceeds 1MB and asserts it.
+
+### Removed
+
+- `-t` and `-a`, the token and tree dumps of coff0.
+- `c0/lex.c0` and `c0/parse.c0`, the standalone lexer and parser, and the
+  two stages of `run_tests.sh` that compared them with coff0. coff1 is still
+  compared with coff0 on every compile and every message, and the compiler
+  still compiles itself to a fixpoint. What is gone is a comparison at the
+  token and tree level, so coff1's front end is checked only end to end.
+  `TRUST.md` says so.
+
 ## [0.7.1] - 2026-10-26
 
 ### Fixed

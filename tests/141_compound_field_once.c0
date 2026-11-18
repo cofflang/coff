@@ -1,0 +1,59 @@
+// expect: 42
+//
+// tests/141_compound_field_once.c0 - a compound assignment on a field evaluates its target once
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// T OP= E evaluates the base of a field target once. g counts its calls and
+// returns p the first time and q after that, so a second evaluation would
+// read q.py or write it. Each check that holds adds one.
+layout P { int px; int py; int next; }
+
+int calls = 0;
+int first = 0;
+int second = 0;
+
+int g(int p) {
+    calls += 1;
+    if (calls == 1) { return first; }
+    return second;
+}
+
+int reset(int v) {
+    first.py = v;
+    second.py = 7;
+    calls = 0;
+    return 0;
+}
+
+int main() {
+    int ok = 0;
+    first = alloc(sizeof(P));
+    second = alloc(sizeof(P));
+    int r = alloc(sizeof(P));
+    reset(20); g(first).py += 3;
+    if (calls == 1 && first.py == 23 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py -= 3;
+    if (calls == 1 && first.py == 17 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py *= 3;
+    if (calls == 1 && first.py == 60 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py /= 3;
+    if (calls == 1 && first.py == 6 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py %= 3;
+    if (calls == 1 && first.py == 2 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py &= 6;
+    if (calls == 1 && first.py == 4 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py |= 3;
+    if (calls == 1 && first.py == 23 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py ^= 5;
+    if (calls == 1 && first.py == 17 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py <<= 2;
+    if (calls == 1 && first.py == 80 && second.py == 7) { ok += 1; }
+    reset(20); g(first).py >>= 2;
+    if (calls == 1 && first.py == 5 && second.py == 7) { ok += 1; }
+    first.next = r;
+    second.next = second;
+    r.py = 5;
+    reset(20); g(first).next.py += 1;
+    if (calls == 1 && r.py == 6 && second.py == 7) { ok += 1; }
+    if (ok == 11) { return 42; }
+    return ok;
+}

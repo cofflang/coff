@@ -22,11 +22,12 @@
 # IOPL). Their codegen is still covered by the differential loops below,
 # which never execute the compiled binary.
 #
-# After the unit tests come the differential stages (each c0-written
-# stage diffed against coff0 over the whole corpus, error messages
-# included), checks for -I, embed, large sources and the audit's own
-# sha256 and cmp, and finally the bootstrap fixpoint checks, coff.c0
-# compiling itself three generations deep, all byte-identical.
+# After the unit tests comes the comparison of coff1 with coff0 over every
+# compile the corpus list names, assembly for the files that compile and
+# messages for the compile-error tests, then checks for the command line,
+# -I, embed, large sources and the audit's own sha256 and cmp, and finally
+# the bootstrap fixpoint checks, coff.c0 compiling itself three generations
+# deep, all byte-identical. coff.c0's front end is checked only end to end.
 #
 # What this suite does NOT establish is that the toolchain is free of a
 # Ken Thompson "trusting trust" payload. The bootstrap fixpoint below
@@ -57,6 +58,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 pass=0
 fail=0
+skip=0
 
 for src in tests/*.c0; do
   name=$(basename "$src" .c0)
@@ -128,125 +130,84 @@ for src in tests/*.c0; do
 done
 
 echo ""
-echo "Differential lexer test: c0/lex.c0 (compiled by coff0) vs coff0 -t"
-if ./coff0 c0/lex.c0 "$tmpdir/lex.s" \
-   && as "$tmpdir/lex.s" -o "$tmpdir/lex.o" \
-   && ld "$tmpdir/lex.o" -o "$tmpdir/lex"; then
-  for src in tests/*.c0 c0/lex.c0 c0/sha256.c0 c0/cmp.c0; do
-    name=$(basename "$src" .c0)
-    # Files coff0 itself refuses to lex are skipped. On error coff0 -t prints
-    # nothing while lex.c0 streams tokens until the bad byte, so the outputs
-    # are incomparable by design.
-    if ./coff0 -t "$src" > "$tmpdir/ref_tokens" 2>/dev/null; then
-      # Passing the real path (not piping via stdin) is what lets lex.c0
-      # resolve include directives -- a relative include path has nothing
-      # to resolve against from piped bytes alone. See c0/lex.c0's main().
-      "$tmpdir/lex" "$src" > "$tmpdir/c0_tokens"
-      if diff -q "$tmpdir/ref_tokens" "$tmpdir/c0_tokens" >/dev/null; then
-        echo "PASS lexdiff $name"
-        pass=$((pass + 1))
-      else
-        echo "FAIL lexdiff $name"
-        diff "$tmpdir/ref_tokens" "$tmpdir/c0_tokens" | head -10
-        fail=$((fail + 1))
-      fi
-    fi
-  done
-else
-  echo "FAIL building c0/lex.c0"
-  fail=$((fail + 1))
-fi
-
-echo ""
-echo "Differential parser test: c0/parse.c0 (compiled by coff0) vs coff0 -a"
-if ./coff0 c0/parse.c0 "$tmpdir/parse.s" \
-   && as "$tmpdir/parse.s" -o "$tmpdir/parse.o" \
-   && ld "$tmpdir/parse.o" -o "$tmpdir/parse"; then
-  for src in tests/*.c0 c0/lex.c0 c0/parse.c0 c0/sha256.c0 c0/cmp.c0; do
-    name=$(basename "$src" .c0)
-    if ./coff0 -a "$src" > "$tmpdir/ref_ast" 2>/dev/null; then
-      # Real path, not piped stdin -- see lexdiff's identical note above.
-      "$tmpdir/parse" "$src" > "$tmpdir/c0_ast" 2>/dev/null
-      if diff -q "$tmpdir/ref_ast" "$tmpdir/c0_ast" >/dev/null; then
-        echo "PASS astdiff $name"
-        pass=$((pass + 1))
-      else
-        echo "FAIL astdiff $name"
-        diff "$tmpdir/ref_ast" "$tmpdir/c0_ast" | head -10
-        fail=$((fail + 1))
-      fi
-    fi
-  done
-else
-  echo "FAIL building c0/parse.c0"
-  fail=$((fail + 1))
-fi
-
-echo ""
 echo "Differential codegen test: c0/coff.c0 (compiled by coff0) vs coff0's own codegen"
 if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
    && as "$tmpdir/coff1.s" -o "$tmpdir/coff1.o" \
    && ld "$tmpdir/coff1.o" -o "$tmpdir/coff1"; then
-  for src in tests/*.c0 c0/lex.c0 c0/parse.c0 c0/coff.c0 c0/sha256.c0 c0/cmp.c0; do
-    name=$(basename "$src" .c0)
-    # Only compares files that actually compile. coff0's own resolve-time
-    # errors (undeclared var, wrong arity, etc.) are excluded here since
-    # neither side produces assembly to diff in that case. Uses coff1's real
-    # file-based CLI (`coff1 src out.s`), the same interface coff0 itself has.
-    if ./coff0 "$src" "$tmpdir/ref_$name.s" 2>/dev/null; then
-      "$tmpdir/coff1" "$src" "$tmpdir/c0_$name.s" 2>/dev/null
-      if diff -q "$tmpdir/ref_$name.s" "$tmpdir/c0_$name.s" >/dev/null; then
-        echo "PASS codegendiff $name"
-        pass=$((pass + 1))
+  # Every compile in the coff list ddc_entries.sh prints, the same list
+  # verify_bootstrap.sh's DDC compares, with its flags. Uses coff1's real
+  # file-based CLI (`coff1 src out.s`), the same interface coff0 itself has.
+  # A file that should compile and that coff0 rejects is a failure. The
+  # compile-error tests produce no assembly, and the diagdiff section below
+  # compares them instead.
+  here=$(pwd)
+  if ./ddc_entries.sh coff > "$tmpdir/coff_list" 2>"$tmpdir/coff_list.err"; then
+    n=0
+    while IFS='|' read -r label dir flags file expect; do
+      n=$((n + 1))
+      [ "$expect" = error ] && continue
+      if (cd "$dir" && "$here/coff0" $flags "$file" "$tmpdir/cref_$n.s") 2>"$tmpdir/cref_$n.err"; then
+        (cd "$dir" && "$tmpdir/coff1" $flags "$file" "$tmpdir/cc0_$n.s") 2>/dev/null
+        if diff -q "$tmpdir/cref_$n.s" "$tmpdir/cc0_$n.s" >/dev/null; then
+          echo "PASS codegendiff $label"
+          pass=$((pass + 1))
+        else
+          echo "FAIL codegendiff $label"
+          diff "$tmpdir/cref_$n.s" "$tmpdir/cc0_$n.s" | head -10
+          fail=$((fail + 1))
+        fi
       else
-        echo "FAIL codegendiff $name"
-        diff "$tmpdir/ref_$name.s" "$tmpdir/c0_$name.s" | head -10
+        echo "FAIL codegendiff $label (coff0 rejected it)"
+        head -3 "$tmpdir/cref_$n.err"
         fail=$((fail + 1))
       fi
-    fi
-  done
-
-  # The same diff for the Moonshot ring-3 target. `--elf` is the same
-  # assembly backend with Moonshot's syscall numbers, present in coff0.c as
-  # well, so every ring-3 program the kernel ships is compared the same way,
-  # the test programs, the probes, and Gnista, whichever of them are checked
-  # out beside this repository. The
-  # sources include files relative to their own directory, hence the cd.
-  # They include the ring-3 library (moonshot/programs/lib/moon.c0) by name,
-  # so both compilers get its directory with -I, the way Moonshot's
-  # generators pass it. Gnista's 3D library is included the same way. Its
-  # folder is moonshot/programs in a Moonshot clone and ../gnista when Gnista
-  # is checked out on its own.
-  elflib=$(cd .. && pwd)/moonshot/programs/lib
-  if [ -f ../moonshot/programs/infecteria.c0 ]; then
-    gnistalib=$(cd .. && pwd)/moonshot/programs
+    done < "$tmpdir/coff_list"
   else
-    gnistalib=$(cd .. && pwd)/gnista
+    echo "FAIL codegendiff, the coff list could not be built"
+    cat "$tmpdir/coff_list.err"
+    fail=$((fail + 1))
   fi
-  for src in ../moonshot/tests/elf/*.c0 ../moonshot/programs/*.c0 \
-             ../moonshot/programs/lira/lira.c0 ../moonshot/programs/utsikt/utsikt.c0 \
-             ../utsikt/utsikt.c0 ../gnista/infecteria.c0 ../gnista/fps_probe.c0; do
-    [ -f "$src" ] || continue
-    # A library beside the programs, such as Gnista's engine in a Moonshot
-    # clone, has no main of its own and is compiled as part of a program.
-    grep -qE '^(int|void) main\(' "$src" || continue
-    name=$(basename "$src" .c0)
-    dir=$(dirname "$src")
-    if (cd "$dir" && "$OLDPWD/coff0" --elf -I "$elflib" -I "$gnistalib" "$(basename "$src")" "$tmpdir/eref_$name.s") 2>/dev/null; then
-      (cd "$dir" && "$tmpdir/coff1" --elf -I "$elflib" -I "$gnistalib" "$(basename "$src")" "$tmpdir/ec0_$name.s") 2>/dev/null
-      if diff -q "$tmpdir/eref_$name.s" "$tmpdir/ec0_$name.s" >/dev/null; then
-        echo "PASS codegendiff --elf $name"
-        pass=$((pass + 1))
-      else
-        echo "FAIL codegendiff --elf $name"
-        diff "$tmpdir/eref_$name.s" "$tmpdir/ec0_$name.s" | head -10
-        fail=$((fail + 1))
-      fi
+
+  # The same diff for everything the Moonshot build compiles, the kernel
+  # in each of its build/debug.c0 variants, every ring-3 program it embeds
+  # with the directory and -I flags tools/gen_programs.sh gives it, bake and
+  # the ELF tests. ddc_entries.sh builds that list from, and checks it
+  # against, Moonshot's build scripts, and verify_bootstrap.sh's DDC reads
+  # the same list, so the two cannot cover different files. `--elf` is the
+  # same assembly backend with Moonshot's syscall numbers, present in
+  # coff0.c as well. A file coff0 rejects is a failure, not a skip, since
+  # the build compiles it.
+  if [ -d ../moonshot ]; then
+    mkdir -p "$tmpdir/ms_entries"
+    if ./ddc_entries.sh moonshot ../moonshot "$tmpdir/ms_entries" > "$tmpdir/ms_list" 2>"$tmpdir/ms_list.err"; then
+      n=0
+      while IFS='|' read -r label dir flags file expect; do
+        n=$((n + 1))
+        if (cd "$dir" && "$here/coff0" $flags "$file" "$tmpdir/mref_$n.s") 2>"$tmpdir/mref_$n.err"; then
+          (cd "$dir" && "$tmpdir/coff1" $flags "$file" "$tmpdir/mc0_$n.s") 2>/dev/null
+          if diff -q "$tmpdir/mref_$n.s" "$tmpdir/mc0_$n.s" >/dev/null; then
+            echo "PASS codegendiff $label"
+            pass=$((pass + 1))
+          else
+            echo "FAIL codegendiff $label"
+            diff "$tmpdir/mref_$n.s" "$tmpdir/mc0_$n.s" | head -10
+            fail=$((fail + 1))
+          fi
+        else
+          echo "FAIL codegendiff $label (coff0 rejected it)"
+          head -3 "$tmpdir/mref_$n.err"
+          fail=$((fail + 1))
+        fi
+      done < "$tmpdir/ms_list"
     else
-      echo "FAIL codegendiff --elf $name (coff0 --elf rejected it)"
+      echo "FAIL codegendiff Moonshot, the build's compiles could not be listed"
+      cat "$tmpdir/ms_list.err"
       fail=$((fail + 1))
     fi
-  done
+  else
+    echo "SKIP codegendiff Moonshot, no ../moonshot beside this repository"
+    skip=$((skip + 1))
+  fi
 
   echo ""
   echo "Differential diagnostics: coff1's error message vs coff0's, every compile-error test"
@@ -275,11 +236,12 @@ if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
   # A source file over 1MB must compile whole. A reader with a fixed buffer
   # would silently lose the end of the file, and with it main. Built here
   # rather than committed, since the point is only its size.
-  for i in $(seq 1 14000); do
+  for i in $(seq 1 23000); do
     echo "// padding, to take this file past one megabyte"
   done > "$tmpdir/big.c0"
   echo "int main() { return 77; }" >> "$tmpdir/big.c0"
-  if ./coff0 "$tmpdir/big.c0" "$tmpdir/big0.s" 2>/dev/null \
+  if [ "$(wc -c < "$tmpdir/big.c0")" -gt 1048576 ] \
+     && ./coff0 "$tmpdir/big.c0" "$tmpdir/big0.s" 2>/dev/null \
      && "$tmpdir/coff1" "$tmpdir/big.c0" "$tmpdir/big1.s" 2>/dev/null \
      && cmp -s "$tmpdir/big0.s" "$tmpdir/big1.s" \
      && as "$tmpdir/big1.s" -o "$tmpdir/big.o" && ld "$tmpdir/big.o" -o "$tmpdir/big"; then
@@ -369,6 +331,50 @@ if ./coff0 c0/coff.c0 "$tmpdir/coff1.s" \
     echo "FAIL without -I: coff0 said '$e0', coff1 said '$e1'"
     fail=$((fail + 1))
   fi
+  echo ""
+
+  echo "Command line: an unknown option is refused, in both compilers"
+  # An argument that starts with '-' and is not --elf or -I is an error,
+  # never a file name, and so is -I without a directory or past the limit.
+  # Read as a path, `coff0 -t prog.c0` would compile a file named -t into
+  # prog.c0 and overwrite the source. Each case must fail in both compilers
+  # with the given message, the two messages must match once each
+  # compiler's own name is taken off the front, and nothing may be written.
+  cdir="$tmpdir/cli"
+  mkdir -p "$cdir"
+  printf 'int main() { return 7; }\n' > "$cdir/prog.c0"
+  printf 'int main() { return 0; }\n' > "$cdir/-t"
+  cp "$cdir/prog.c0" "$cdir/prog.keep"
+  cp "$cdir/-t" "$cdir/dash_t.keep"
+  many=""
+  for i in 1 2 3 4 5 6 7 8 9; do many="$many -I $cdir"; done
+  while IFS='|' read -r cargs want; do
+    rm -f "$cdir/out.s"
+    r0=$(cd "$cdir" && "$OLDPWD/coff0" $cargs 2>&1 >/dev/null); c0rc=$?
+    r1=$(cd "$cdir" && "$tmpdir/coff1" $cargs 2>&1 >/dev/null); c1rc=$?
+    if [ "$c0rc" -ne 0 ] && [ "$c1rc" -ne 0 ] && [ "$r0" = "coff0: $want" ] \
+       && [ "$(echo "$r0" | sed 's/^coff0: /coff1: /')" = "$r1" ] && [ ! -e "$cdir/out.s" ] \
+       && cmp -s "$cdir/prog.c0" "$cdir/prog.keep" && cmp -s "$cdir/-t" "$cdir/dash_t.keep"; then
+      echo "PASS coff $cargs"
+      pass=$((pass + 1))
+    else
+      echo "FAIL coff $cargs (want '$want')"
+      echo "  coff0 exit $c0rc: $r0"
+      echo "  coff1 exit $c1rc: $r1"
+      cmp -s "$cdir/prog.c0" "$cdir/prog.keep" || echo "  prog.c0 was overwritten"
+      cmp -s "$cdir/-t" "$cdir/dash_t.keep" || echo "  -t was overwritten"
+      cp "$cdir/prog.keep" "$cdir/prog.c0"; cp "$cdir/dash_t.keep" "$cdir/-t"
+      fail=$((fail + 1))
+    fi
+  done <<CASES
+-t prog.c0|unknown option '-t'
+-a prog.c0|unknown option '-a'
+--nosuch prog.c0 out.s|unknown option '--nosuch'
+prog.c0 out.s --elf=1|unknown option '--elf=1'
+- prog.c0 out.s|unknown option '-'
+prog.c0 out.s -I|-I needs a directory
+$many prog.c0 out.s|too many -I (at most 8)
+CASES
   echo ""
 
   echo "Audit tools: c0/sha256.c0 and c0/cmp.c0, built by coff1, vs sha256sum and cmp"
@@ -464,5 +470,9 @@ else
 fi
 
 echo ""
-echo "$pass passed, $fail failed"
+if [ "$skip" -gt 0 ]; then
+  echo "$pass passed, $fail failed, $skip skipped"
+else
+  echo "$pass passed, $fail failed"
+fi
 [ "$fail" -eq 0 ]

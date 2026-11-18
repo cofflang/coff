@@ -1,0 +1,46 @@
+// expect: 42
+//
+// tests/147_compound_bitwise.c0 - the bitwise and shift compound operators
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// &= |= ^= <<= >>= on every target form, against constants. 92 is 0x5c.
+// A byte target keeps the low byte, and >> is arithmetic on a word. Each
+// check that holds adds one.
+layout P { int pa; int pb; }
+
+int g = 0;
+
+int main() {
+    int ok = 0;
+    int x = 92;
+    x &= 15;   if (x == 12) { ok += 1; }
+    x = 92; x |= 33;   if (x == 125) { ok += 1; }
+    x = 92; x ^= 255;  if (x == 163) { ok += 1; }
+    x = 92; x <<= 3;   if (x == 736) { ok += 1; }
+    x = 92; x >>= 2;   if (x == 23) { ok += 1; }
+    x = 0 - 64; x >>= 3; if (x == 0 - 8) { ok += 1; }
+
+    g = 92; g &= 15;   if (g == 12) { ok += 1; }
+    g = 92; g |= 33;   if (g == 125) { ok += 1; }
+    g = 92; g ^= 255;  if (g == 163) { ok += 1; }
+    g = 92; g <<= 3;   if (g == 736) { ok += 1; }
+    g = 92; g >>= 2;   if (g == 23) { ok += 1; }
+
+    int b = alloc(8);
+    int i = 2;
+    b[i] = 92; b[i] &= 15;   if (b[2] == 12) { ok += 1; }
+    b[i] = 92; b[i] |= 33;   if (b[2] == 125) { ok += 1; }
+    b[i] = 92; b[i] ^= 255;  if (b[2] == 163) { ok += 1; }
+    b[i] = 92; b[i] <<= 3;   if (b[2] == 224) { ok += 1; }
+    b[i] = 92; b[i] >>= 2;   if (b[2] == 23) { ok += 1; }
+
+    int p = alloc(sizeof(P));
+    p.pb = 92; p.pb &= 15;   if (p.pb == 12) { ok += 1; }
+    p.pb = 92; p.pb |= 33;   if (p.pb == 125) { ok += 1; }
+    p.pb = 92; p.pb ^= 255;  if (p.pb == 163) { ok += 1; }
+    p.pb = 92; p.pb <<= 3;   if (p.pb == 736) { ok += 1; }
+    p.pb = 92; p.pb >>= 2;   if (p.pb == 23) { ok += 1; }
+    p.pb = 0 - 64; p.pb >>= 3; if (p.pb == 0 - 8) { ok += 1; }
+
+    if (ok == 22) { return 42; }
+    return ok;
+}

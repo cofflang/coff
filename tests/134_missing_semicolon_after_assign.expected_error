@@ -1,0 +1,1 @@
+coff0: tests/134_missing_semicolon_after_assign.c0:7: expected ';'

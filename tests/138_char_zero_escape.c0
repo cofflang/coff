@@ -1,0 +1,15 @@
+// expect: 7
+//
+// tests/138_char_zero_escape.c0 - '\0' is the number 0
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// '\0' is the number 0 wherever it appears, in a global initializer, in
+// arithmetic and in a comparison, never the digit character '0' (48). Each
+// check that holds adds a bit.
+int zero = '\0';
+int main() {
+    int ok = 0;
+    if (zero == 0) { ok = ok + 1; }
+    if ('\0' + 5 == 5) { ok = ok + 2; }
+    if ('0' - '\0' == 48) { ok = ok + 4; }
+    return ok;
+}

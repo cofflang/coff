@@ -1,0 +1,13 @@
+// expect: compile-error
+//
+// tests/143_compound_bad_target.c0 - a bad compound target is reported at the operator
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// The target of a compound assignment is checked before its right side is
+// read, and the error points at the operator, as for plain =.
+int f() { return 1; }
+int main() {
+    f() += 1 +
+        2 +
+        3;
+    return 0;
+}

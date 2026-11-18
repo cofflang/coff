@@ -1,0 +1,9 @@
+// expect: compile-error
+//
+// tests/150_for_missing_semicolon.c0 - a missing ; after a for condition is refused
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+int main() {
+    int n = 0;
+    for (int i = 0; i < 3 i = i + 1) { n = n + 1; }
+    return n;
+}

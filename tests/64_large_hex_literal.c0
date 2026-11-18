@@ -8,9 +8,9 @@
 // preserving the bits, which is why coff0.c's lexer uses strtoul. That
 // parses the same digits as an unsigned magnitude, and the cast back to
 // long just reinterprets the bits. A packed 8x8 font glyph bitmap such as
-// 0xF88484F88484F800 is the kind of value that needs it. The c0-written
-// lexers accumulate with `v = v*16 + digit`, which wraps naturally in the
-// register, and they get run over this file too, since it is part of the
+// 0xF88484F88484F800 is the kind of value that needs it. coff.c0's lexer
+// accumulates with `v = v*16 + digit`, which wraps naturally in the
+// register, and it gets run over this file too, since it is part of the
 // same differential corpus as every other test.
 //
 // Checked with real arithmetic, not just "did it compile". The hex

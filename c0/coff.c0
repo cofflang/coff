@@ -17,8 +17,7 @@
 // This file IS the compiler. Lexer, parser, resolver and code generator
 // in one file; the binary built from it is called coff1. Called as
 // `coff1 [--elf] [-I dir]... input.c0 output.s` it reads and writes real
-// files; with no file arguments it reads stdin and writes stdout (the form
-// the differential test harness uses).
+// files; with no file arguments it reads stdin and writes stdout.
 //
 // The output is byte-for-byte identical to what coff0 produces for the
 // same input, and so are the error messages. On any lex, parse or resolve
@@ -41,22 +40,28 @@
 //   31 LBRACKET, 32 RBRACKET, 33 VOID, 34 EXTERN, 35 DOT, 36 LAYOUT,
 //   37 SIZEOF, 38 PERCENT, 39 AMP, 40 PIPE, 41 CARET, 42 TILDE, 43 SHL,
 //   44 SHR, 45 NOT, 46 PLUSEQ, 47 MINUSEQ, 48 STAREQ, 49 SLASHEQ,
-//   50 PERCENTEQ, 51 FOR, 52 DEFER.
+//   50 PERCENTEQ, 51 FOR, 52 DEFER, 53 AMPEQ, 54 PIPEEQ, 55 CARETEQ,
+//   56 SHLEQ, 57 SHREQ.
 //
-// Node kinds use the same numbering as parse.c0 (1 NUM .. 22 BLOCK), plus
+// Node kinds are 1 NUM, 2 STR, 3 VAR, 4 ASSIGN, 5 DECL, 6 CALL, 7 ADD, 8 SUB,
+//   9 MUL, 10 DIV, 11 EQ, 12 NE, 13 LT, 14 LE, 15 GT, 16 GE, 17 NEG,
+//   18 IF, 19 WHILE, 20 RETURN, 21 EXPRSTMT, 22 BLOCK, plus
 //   23 AND, 24 OR (both short-circuiting, the two loosest operators, ||
 //   looser than &&, with | ^ & between && and equality), 25 BREAK, 26 CONTINUE
 //   (both only valid inside a loop, which resolve() enforces),
 //   27 INDEX (child1=base, child2=index; buf[i] sugar over load8(buf+i)),
-//   28 INDEXASSIGN (child1=base, child2=index, child3=value),
+//   28 INDEXASSIGN (child1=base, child2=index, child3=value, extra=the binary
+//   node kind of a compound assignment such as `buf[i] += v`, 0 for `=`),
 //   29 FUNCREF (a VAR node (kind 3) whose name turned out to be a declared
 //   function rather than a variable/global -- resolve() rewrites its kind
 //   in place; evaluates to the function's address via `lea`). A CALL node
 //   (kind 6) uses its `extra` field to say whether `name` is a variable
 //   holding a function-reference value rather than a declared function, so
 //   gen_call must call *through* its value instead of calling `name`
-//   directly (indirect call). 30 FIELD, 31 FIELDASSIGN and 32 SIZEOF are
-//   as in parse.c0, and 33 MOD is child1 % child2, same shape as DIV.
+//   directly (indirect call). 30 FIELD (sval=field, child1=base),
+//   31 FIELDASSIGN (sval=field, child1=base, child2=value, extra as for 28)
+//   and 32 SIZEOF (sval=layout name), and 33 MOD is child1 % child2, same
+//   shape as DIV.
 //   34 BITAND, 35 BITOR, 36 BITXOR, 37 SHL and 38 SHR are binary like DIV,
 //   39 BITNOT is unary like NEG.
 //   40 FORLOOP is child1=cond, child2=body, child3=step. `for` parses to a
@@ -280,7 +285,7 @@ int EXPAND_CAP = 4194304; // 4MB
 int expand_buf = 0;
 int expand_len = 0;
 
-// --- shared helpers (same as parse.c0) -------------------------------------
+// --- shared helpers --------------------------------------------------------
 
 void mem_copy_out(int dst, int src, int n) {
     int i = 0;
@@ -420,9 +425,9 @@ int streq(int a, int b) {
 //
 // `include "path.c0";` is pure textual substitution, resolved entirely
 // before real lexing starts -- mirrors coff0.c's resolve_includes exactly
-// (differentially verified against it, and against lex.c0/parse.c0's own
-// identical mirrors), see coff0.c for the full design rationale. This is
-// the copy that matters most, since coff.c0 is what coff1 is.
+// (differentially verified against it), see coff0.c for the full design
+// rationale. This is the copy that matters most, since coff.c0 is what
+// coff1 is.
 
 // -I directories, each with a trailing slash so join_path can use it like an
 // including file's own directory. An include is looked for next to the file
@@ -891,6 +896,7 @@ void lex_all(int buf, int n) {
     int t = 0;
     int c = 0;
     int nxt = 0;
+    int nxt2 = 0;
     int going = 0;
     int v = 0;
     int d = 0;
@@ -1092,7 +1098,10 @@ void lex_all(int buf, int n) {
         else if (c == '<') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            nxt2 = 0;
+            if (pos + 2 < n) { nxt2 = load8(buf + pos + 2); }
             if (nxt == '=') { tok_put(t, 12, 0, 0, 0); pos += 2; }
+            else if (nxt == '<' && nxt2 == '=') { tok_put(t, 56, 0, 0, 0); pos += 3; }
             else if (nxt == '<') { tok_put(t, 43, 0, 0, 0); pos += 2; }
             else { tok_put(t, 11, 0, 0, 0); pos += 1; }
             t += 1;
@@ -1100,7 +1109,10 @@ void lex_all(int buf, int n) {
         else if (c == '>') {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            nxt2 = 0;
+            if (pos + 2 < n) { nxt2 = load8(buf + pos + 2); }
             if (nxt == '=') { tok_put(t, 14, 0, 0, 0); pos += 2; }
+            else if (nxt == '>' && nxt2 == '=') { tok_put(t, 57, 0, 0, 0); pos += 3; }
             else if (nxt == '>') { tok_put(t, 44, 0, 0, 0); pos += 2; }
             else { tok_put(t, 13, 0, 0, 0); pos += 1; }
             t += 1;
@@ -1133,7 +1145,13 @@ void lex_all(int buf, int n) {
             else { tok_put(t, 38, 0, 0, 0); pos += 1; }
             t += 1;
         }
-        else if (c == '^') { tok_put(t, 41, 0, 0, 0); t += 1; pos += 1; }
+        else if (c == '^') {
+            nxt = 0;
+            if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
+            if (nxt == '=') { tok_put(t, 55, 0, 0, 0); pos += 2; }
+            else { tok_put(t, 41, 0, 0, 0); pos += 1; }
+            t += 1;
+        }
         else if (c == '~') { tok_put(t, 42, 0, 0, 0); t += 1; pos += 1; }
         else if (c == '(') { tok_put(t, 15, 0, 0, 0); t += 1; pos += 1; }
         else if (c == ')') { tok_put(t, 16, 0, 0, 0); t += 1; pos += 1; }
@@ -1145,6 +1163,7 @@ void lex_all(int buf, int n) {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '&') { tok_put(t, 27, 0, 0, 0); pos += 2; }
+            else if (nxt == '=') { tok_put(t, 53, 0, 0, 0); pos += 2; }
             else { tok_put(t, 39, 0, 0, 0); pos += 1; }
             t += 1;
         }
@@ -1152,6 +1171,7 @@ void lex_all(int buf, int n) {
             nxt = 0;
             if (pos + 1 < n) { nxt = load8(buf + pos + 1); }
             if (nxt == '|') { tok_put(t, 28, 0, 0, 0); pos += 2; }
+            else if (nxt == '=') { tok_put(t, 54, 0, 0, 0); pos += 2; }
             else { tok_put(t, 40, 0, 0, 0); pos += 1; }
             t += 1;
         }
@@ -1571,6 +1591,22 @@ int at_typed_decl() {
     return 0;
 }
 
+// The binary node kind a compound assignment token stands for, or 0 for any
+// other token. Every compound operator is listed here and nowhere else.
+int compound_kind(int tk) {
+    if (tk == 46) { return 7; }
+    if (tk == 47) { return 8; }
+    if (tk == 48) { return 9; }
+    if (tk == 49) { return 10; }
+    if (tk == 50) { return 33; }
+    if (tk == 53) { return 34; }
+    if (tk == 54) { return 35; }
+    if (tk == 55) { return 36; }
+    if (tk == 56) { return 37; }
+    if (tk == 57) { return 38; }
+    return 0;
+}
+
 // A plain assignment (VAR '=' expr), an indexed assignment (buf[i] '=' expr),
 // a field assignment (p.f '=' expr), a compound assignment (lhs OP= expr), or
 // -- if no assignment follows -- an expression statement. Needs arbitrary
@@ -1580,7 +1616,6 @@ int p_simple(int want_semi) {
     int e = 0;
     int out = 0;
     int name = 0;
-    int ck = 0;
     int bk = 0;
     int bin = 0;
     e = p_expr();
@@ -1616,6 +1651,7 @@ int p_simple(int want_semi) {
             out = new_node(28);
             out.child1 = e.child1;
             out.child2 = e.child2;
+            out.extra = 0;
             out.child3 = p_expr();
             if (want_semi == 1) { expect(19, "';'"); }
             return out;
@@ -1624,6 +1660,7 @@ int p_simple(int want_semi) {
             out = new_node(31);
             out.sval = e.sval;
             out.child1 = e.child1;
+            out.extra = 0;
             out.child2 = p_expr();
             if (want_semi == 1) { expect(19, "';'"); }
             return out;
@@ -1631,20 +1668,18 @@ int p_simple(int want_semi) {
         at_prev();
         die("invalid assignment target");
     }
-    // A compound assignment lhs OP= rhs is sugar for lhs = (lhs OP rhs), which
-    // builds the same AST a hand-written lhs = lhs OP rhs would.
-    if (tok_kind(tpos) >= 46 && tok_kind(tpos) <= 50) {
-        ck = tok_kind(tpos);
-        bk = 7;
-        if (ck == 47) { bk = 8; }
-        if (ck == 48) { bk = 9; }
-        if (ck == 49) { bk = 10; }
-        if (ck == 50) { bk = 33; }
+    // A compound assignment T OP= E. For a variable it is exactly x = x OP E,
+    // since reading a name has no side effect and no call can write a local.
+    // An index or field target keeps the operator in `extra` on the store, so
+    // its base and index are evaluated once. The target is checked before E
+    // is read, at the same token as for plain `=`.
+    bk = compound_kind(tok_kind(tpos));
+    if (bk != 0) {
         tpos += 1;
-        bin = new_node(bk);
-        bin.child1 = e;
-        bin.child2 = p_expr();
         if (e.kind == 3) {
+            bin = new_node(bk);
+            bin.child1 = e;
+            bin.child2 = p_expr();
             out = new_node(4);
             out.sval = e.sval;
             out.child2 = bin;
@@ -1652,12 +1687,14 @@ int p_simple(int want_semi) {
             out = new_node(28);
             out.child1 = e.child1;
             out.child2 = e.child2;
-            out.child3 = bin;
+            out.extra = bk;
+            out.child3 = p_expr();
         } else if (e.kind == 30) {
             out = new_node(31);
             out.sval = e.sval;
             out.child1 = e.child1;
-            out.child2 = bin;
+            out.extra = bk;
+            out.child2 = p_expr();
         } else {
             at_prev();
             die("invalid assignment target");
@@ -2381,6 +2418,15 @@ int is_leaf(int nd) {
     return nd.kind == 1 || nd.kind == 3;
 }
 
+// Whether a store may keep its address in rdi while the value nd is
+// evaluated. Evaluating a number or a variable writes only rax or rcx. Every
+// call and every inline builtin writes rdi, so nothing else may be added
+// here without a security review. This alone decides it, so that widening
+// is_leaf can never move a store onto the rdi path.
+int keeps_rdi(int nd) {
+    return nd.kind == 1 || nd.kind == 3;
+}
+
 // The register a local lives in, or 0 when it is on the stack, a global or
 // something else, and always 0 in the dry pass.
 int reg_local(int nd) {
@@ -2390,12 +2436,18 @@ int reg_local(int nd) {
 
 // Leaves lhs in rax and rhs in rcx, the operand layout of every binary
 // operator.
+// A leaf operand, loaded into rcx.
+void gen_leaf_rcx(int nd) {
+    if (nd.kind == 1) { emit("    mov rcx, "); print_int(nd.ival); emit("\n"); }
+    else if (nd.extra == 1) { emit("    mov rcx, [.G"); emit(nd.sval); emit("]\n"); }
+    else { emit("    mov rcx, "); emit_slot(nd.ival); emit("\n"); }
+    return;
+}
+
 void gen_operands(int lhs, int rhs) {
     gen_expr(lhs);
     if (is_leaf(rhs) == 1) {
-        if (rhs.kind == 1) { emit("    mov rcx, "); print_int(rhs.ival); emit("\n"); }
-        else if (rhs.extra == 1) { emit("    mov rcx, [.G"); emit(rhs.sval); emit("]\n"); }
-        else { emit("    mov rcx, "); emit_slot(rhs.ival); emit("\n"); }
+        gen_leaf_rcx(rhs);
         return;
     }
     emit("    push rax\n");
@@ -2512,7 +2564,7 @@ void gen_jump_if_false(int cond, int label, int l) {
 // wait on the stack.
 void gen_addr_value(int addr, int value) {
     gen_expr(addr);
-    if (is_leaf(value) == 1) {
+    if (keeps_rdi(value) == 1) {
         emit("    mov rdi, rax\n");
         gen_expr(value);
         return;
@@ -2545,6 +2597,17 @@ void gen_stable_arg(int nd, int reg) {
     return;
 }
 
+// base + index into rax, the address of buf[i]. The operands may trade
+// places like ADD's.
+void gen_index_addr(int base, int index) {
+    int ia = base;
+    int ib = index;
+    if (is_stable_leaf(ia) == 1 && is_leaf(ib) == 0) { ia = index; ib = base; }
+    int iimm = gen_operands_imm(ia, ib);
+    emit("    add rax, "); emit_rhs(iimm, ib);
+    return;
+}
+
 void gen_binop(int nd, int k) {
     int imm = 0;
     int lhs = nd.child1;
@@ -2555,6 +2618,14 @@ void gen_binop(int nd, int k) {
     if (commutes && is_stable_leaf(lhs) == 1 && is_leaf(rhs) == 0) { lhs = nd.child2; rhs = nd.child1; }
     if (commutes || k == 8 || (k >= 11 && k <= 16)) { imm = gen_operands_imm(lhs, rhs); }
     else { gen_operands(lhs, rhs); }
+    emit_binop(k, imm, rhs);
+    return;
+}
+
+// A binary operator with its left operand in rax and its right one where
+// gen_operands_imm or gen_operands left it, an immediate (imm 1), a saved
+// register (imm 2) or rcx (imm 0). The result is in rax.
+void emit_binop(int k, int imm, int rhs) {
     if (k >= 11 && k <= 16) {
         emit("    cmp rax, ");
         emit_rhs(imm, rhs);
@@ -3051,12 +3122,7 @@ void gen_expr_node(int nd) {
     }
     // --- array index (load8 offset) ---
     if (k == 27) {
-        // base + index, so the operands may trade places like ADD's.
-        int ia = nd.child1;
-        int ib = nd.child2;
-        if (is_stable_leaf(ia) == 1 && is_leaf(ib) == 0) { ia = nd.child2; ib = nd.child1; }
-        int iimm = gen_operands_imm(ia, ib);
-        emit("    add rax, "); emit_rhs(iimm, ib);
+        gen_index_addr(nd.child1, nd.child2);
         emit("    movzx rax, byte ptr [rax]\n");
     
         return;
@@ -3141,6 +3207,45 @@ int gen_reg_assign(int off, int val) {
     return 1;
 }
 
+// The old value of a compound target, from the address in rax, a byte
+// zero-extended for buf[i] (field 0) or 8 bytes at offset off for e.f.
+void gen_compound_load(int field, int off) {
+    if (field == 1) { emit("    mov rax, [rax + "); print_int(off); emit("]\n"); }
+    else { emit("    movzx rax, byte ptr [rax]\n"); }
+    return;
+}
+
+// T OP= E for an index or field target whose address is in rax. The old
+// value is read before E runs, old OP E is computed exactly as the binary
+// operator computes it, and the result is stored where it was read, its
+// low byte for buf[i].
+void gen_compound(int op, int value, int field, int off) {
+    int imm = 0;
+    int imm_ok = 0;
+    if (keeps_rdi(value) == 1) {
+        emit("    mov rdi, rax\n");
+        gen_compound_load(field, off);
+        imm_ok = op == 7 || op == 8 || op == 9 || op == 34 || op == 35 || op == 36;
+        if (imm_ok && is_imm32(value) == 1) { imm = 1; }
+        else if (imm_ok && reg_local(value) != 0) { imm = 2; }
+        else { gen_leaf_rcx(value); }
+        emit_binop(op, imm, value);
+    } else {
+        // The address and the old value wait on the stack while E runs.
+        emit("    push rax\n");
+        gen_compound_load(field, off);
+        emit("    push rax\n");
+        gen_expr(value);
+        emit("    mov rcx, rax\n");
+        emit("    pop rax\n");
+        emit_binop(op, 0, value);
+        emit("    pop rdi\n");
+    }
+    if (field == 1) { emit("    mov [rdi + "); print_int(off); emit("], rax\n"); }
+    else { emit("    mov byte ptr [rdi], al\n"); }
+    return;
+}
+
 void gen_stmt(int nd) {
     int saved_file = err_file;
     int saved_line = err_line;
@@ -3180,12 +3285,9 @@ void gen_stmt_node(int nd) {
     // --- array-index assignment (k=28) ---
     if (k == 28) {
         // base + index, then the value, as for store8.
-        int ia = nd.child1;
-        int ib = nd.child2;
-        if (is_stable_leaf(ia) == 1 && is_leaf(ib) == 0) { ia = nd.child2; ib = nd.child1; }
-        int iimm = gen_operands_imm(ia, ib);
-        emit("    add rax, "); emit_rhs(iimm, ib);
-        if (is_leaf(nd.child3) == 1) {
+        gen_index_addr(nd.child1, nd.child2);
+        if (nd.extra != 0) { gen_compound(nd.extra, nd.child3, 0, 0); return; }
+        if (keeps_rdi(nd.child3) == 1) {
             emit("    mov rdi, rax\n");
             gen_expr(nd.child3);
         } else {
@@ -3199,6 +3301,11 @@ void gen_stmt_node(int nd) {
     }
     // --- field assignment (k=31, e.field = value) ---
     if (k == 31) {
+        if (nd.extra != 0) {
+            gen_expr(nd.child1);
+            gen_compound(nd.extra, nd.child2, 1, nd.ival);
+            return;
+        }
         gen_addr_value(nd.child1, nd.child2);
         emit("    mov [rdi + "); print_int(nd.ival); emit("], rax\n");
     
@@ -3460,10 +3567,12 @@ int main() {
 
     // The CLI is `coff1 input.c0 output.s`, or `coff1 --elf input.c0 output.s` for
     // the Moonshot ring-3 target (still assembly; smed makes the ELF).
-    // With no arguments, stdin/stdout works (differential-test harness),
+    // With no arguments, stdin/stdout works,
     // and `coff1 --elf` alone is the same with the Moonshot target.
     // Arguments come in any order, --elf, -I <dir> (any number, up to
-    // MAX_INC_DIRS), and either no files (stdin to stdout) or two.
+    // MAX_INC_DIRS), and either no files (stdin to stdout) or two. Any other
+    // argument that starts with '-' is refused rather than taken as a file
+    // name, the same as in coff0.c, before anything is opened.
     int cli_input = 0;
     int cli_output = 0;
     int npos = 0;
@@ -3475,7 +3584,14 @@ int main() {
         int a = argv(argi);
         if (streq(a, "--elf") == 1) {
             elf_mode = 1;
-        } else if (streq(a, "-I") == 1 && argi + 1 < argc() && n_inc_dirs < MAX_INC_DIRS) {
+        } else if (streq(a, "-I") == 1) {
+            if (argi + 1 >= argc()) { eput("coff1: -I needs a directory"); efail(); }
+            if (n_inc_dirs >= MAX_INC_DIRS) {
+                eput("coff1: too many -I (at most ");
+                eput_int(MAX_INC_DIRS);
+                eput(")");
+                efail();
+            }
             argi += 1;
             int d = argv(argi);
             int dl = strlen_(d);
@@ -3486,6 +3602,11 @@ int main() {
             if (dl == 0 || load8(d + dl - 1) != '/') { store8(ws + dl, '/'); store8(ws + dl + 1, 0); }
             store64(inc_dirs + n_inc_dirs * 8, ws);
             n_inc_dirs += 1;
+        } else if (load8(a) == '-') {
+            eput("coff1: unknown option '");
+            eput(a);
+            eput("'");
+            efail();
         } else if (!npos) {
             cli_input = argi; npos = 1;
         } else if (npos == 1) {

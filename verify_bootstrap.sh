@@ -335,6 +335,15 @@ fi
 
 fi  # end ddc_only guard
 
+# Must be $CC, not a hardcoded gcc. With --ddc-only nothing has built the
+# seed side yet, and both 2b and 3 below run it. Building it with the same
+# compiler that is about to play the "diverse" role would compare a compiler
+# against itself, which lets a compromised gcc pass the DDC while
+# backdooring the kernel.
+if [ ! -f "$tmpdir/coff0" ]; then
+  $CC -Wall -Wextra -o "$tmpdir/coff0" coff0.c 2>/dev/null
+fi
+
 echo ""
 echo "=== 2b. Determinism and environment independence ==="
 echo ""
@@ -443,35 +452,90 @@ if [ -z "$diverse_list" ]; then
   echo "     every other check in this script."
   echo "     fix: install tcc (see TRUST.md for why tcc specifically)"
 else
-  # Must be $CC, not a hardcoded gcc. With --ddc-only nothing has built
-  # the seed side yet, and building it with the same compiler that is about
-  # to play the "diverse" role compares a compiler against itself, which
-  # lets a compromised gcc pass this check while backdooring the kernel.
-  if [ ! -f "$tmpdir/coff0" ]; then
-    $CC -Wall -Wextra -o "$tmpdir/coff0" coff0.c 2>/dev/null
-  fi
-
   # The corpus. Everything that matters is in here, because a payload is
-  # only caught on inputs where it fires. Moonshot's kernel sources are
-  # included deliberately, being the code actually worth backdooring,
-  # and leaving them out is what lets the simulated attack through.
-  corpus=""
-  for f in tests/*.c0 c0/lex.c0 c0/parse.c0 c0/coff.c0 c0/smed.c0 c0/sha256.c0 c0/cmp.c0; do
-    [ -f "$f" ] && corpus="$corpus $f"
-  done
+  # only caught on inputs where it fires. ddc_entries.sh lists every compile
+  # the coff suite and the Moonshot build perform, each with the directory
+  # and flags it is compiled with, Moonshot's kernel and every program it
+  # embeds included. Nothing in the list is tried and dropped. A file the
+  # reference coff0 rejects is a failure unless it is a compile-error test,
+  # and a compile-error test must be rejected by both compilers with the
+  # same message and exit code. run_tests.sh's codegendiff reads the same
+  # list, so the two cannot drift apart.
   ms=../moonshot
+  ms_listed=0
+  mkdir -p "$tmpdir/entries"
+  : > "$tmpdir/ddc_list"
+  if ./ddc_entries.sh coff > "$tmpdir/ddc_coff" 2>"$tmpdir/ddc_entries.err"; then
+    sed 's/^/coff|/' "$tmpdir/ddc_coff" >> "$tmpdir/ddc_list"
+  else
+    bad "DDC: the coff corpus could not be listed"
+    sed 's/^/     /' "$tmpdir/ddc_entries.err"
+  fi
   if [ -d "$ms" ]; then
-    # The ring-3 programs the kernel carries are kernel content too, and so
-    # is the tool that packs the tests (bake.c0 sits in the kernel
-    # directory and is picked up by the first glob). Gnista's sources live
-    # in ../gnista in the dev tree and in programs/ in a release.
-    for f in "$ms"/kernel/*/*.c0 "$ms"/tools/*.c0 "$ms"/programs/*.c0 ../gnista/*.c0; do
-      case "$f" in *_data.c0|*.bak*) continue ;; esac
-      [ -f "$f" ] && corpus="$corpus $f"
-    done
+    if ./ddc_entries.sh moonshot "$ms" "$tmpdir/entries" > "$tmpdir/ddc_ms" 2>"$tmpdir/ddc_entries.err"; then
+      sed 's/^/moonshot|/' "$tmpdir/ddc_ms" >> "$tmpdir/ddc_list"
+      ms_listed=1
+    else
+      bad "DDC: the Moonshot corpus could not be listed, so none of it is compared"
+      sed 's/^/     /' "$tmpdir/ddc_entries.err"
+    fi
   else
     warn "moonshot sources not found at $ms -- kernel code is NOT in the DDC corpus"
   fi
+  ddc_total=$(wc -l < "$tmpdir/ddc_list")
+  kmain_total=$(grep -c '/kernel/core/kmain\.c0 with ' "$tmpdir/ddc_list")
+
+  # ddc_compile <coff0> <outdir>, every entry into <outdir>/<n>.s with
+  # <outdir>/<n>.err and <outdir>/<n>.rc. Numbered, so two sources with one
+  # basename cannot overwrite each other.
+  ddc_compile() {
+    local c="$1" o="$2" n=0 grp label dir flags file expect
+    mkdir -p "$o"
+    while IFS='|' read -r grp label dir flags file expect; do
+      n=$((n + 1))
+      (cd "$dir" && "$c" $flags "$file" "$o/$n.s") 2>"$o/$n.err" >/dev/null
+      echo $? > "$o/$n.rc"
+    done < "$tmpdir/ddc_list"
+  }
+
+  # Every coff0 is built first, then the reference and each diverse coff0
+  # compile the whole list at the same time, each into its own directory.
+  # The reference side is compiled once and shared by every comparison.
+  for diverse in $diverse_list; do
+    build_coff0_with "$diverse" "$tmpdir/coff0_$diverse" 2>"$tmpdir/div_$diverse.err" \
+      || rm -f "$tmpdir/coff0_$diverse"
+  done
+  ddc_compile "$tmpdir/coff0" "$tmpdir/ref" &
+  for diverse in $diverse_list; do
+    [ -x "$tmpdir/coff0_$diverse" ] && ddc_compile "$tmpdir/coff0_$diverse" "$tmpdir/div_$diverse" &
+  done
+  wait
+
+  # Every entry the reference rejects is reported here, and every
+  # compile-error test it accepts. Neither is compared further.
+  n=0
+  ref_bad=" "
+  while IFS='|' read -r grp label dir flags file expect; do
+    n=$((n + 1))
+    # A compile that left no exit code behind did not finish, and is a
+    # failure like any other.
+    rc=""
+    { read -r rc < "$tmpdir/ref/$n.rc"; } 2>/dev/null
+    case "$rc" in
+      ''|*[!0-9]*)
+        bad "DDC: $CC-built coff0 left no result for $label"
+        ref_bad="$ref_bad$n "
+        continue ;;
+    esac
+    if [ "$expect" = error ] && [ "$rc" -eq 0 ]; then
+      bad "DDC: $CC-built coff0 accepted $label, a compile-error test"
+      ref_bad="$ref_bad$n "
+    elif [ "$expect" = ok ] && [ "$rc" -ne 0 ]; then
+      bad "DDC: $CC-built coff0 rejected $label (exit $rc), which the build compiles"
+      head -3 "$tmpdir/ref/$n.err" | sed 's/^/     /'
+      ref_bad="$ref_bad$n "
+    fi
+  done < "$tmpdir/ddc_list"
 
   for diverse in $diverse_list; do
     if [ "$diverse" = cproc ] && [ -f "$HOME/.local/opt/c0-ddc/VERSIONS" ]; then
@@ -479,44 +543,89 @@ else
     else
       echo "diverse compiler: $diverse ($($diverse --version 2>&1 | head -1))"
     fi
-    rm -rf "$tmpdir/div"; mkdir -p "$tmpdir/div"
-    if build_coff0_with "$diverse" "$tmpdir/coff0_div" 2>"$tmpdir/div.err"; then
+    div="$tmpdir/div_$diverse"
+    if [ -x "$tmpdir/coff0_$diverse" ]; then
       ok "coff0.c builds under $diverse"
-      ddc_checked=0
       ddc_bad=0
-      for f in $corpus; do
-        name=$(basename "$f" .c0)
-        # Only inputs both binaries accept are comparable, since a file coff0
-        # rejects produces no output to diff on either side.
-        if ! "$tmpdir/coff0" "$f" "$tmpdir/a_$name.s" 2>/dev/null; then continue; fi
-        if ! "$tmpdir/coff0_div" "$f" "$tmpdir/div/b_$name.s" 2>/dev/null; then
-          bad "DDC: $diverse-built coff0 rejected $f which $CC-built coff0 accepted"
-          ddc_bad=$((ddc_bad + 1))
-          continue
+      ddc_coff=0
+      ddc_coff_err=0
+      ddc_ms=0
+      ddc_kmain=0
+      n=0
+      while IFS='|' read -r grp label dir flags file expect; do
+        n=$((n + 1))
+        case "$ref_bad" in *" $n "*) continue ;; esac
+        rref=""; rdiv=""
+        read -r rref < "$tmpdir/ref/$n.rc"
+        { read -r rdiv < "$div/$n.rc"; } 2>/dev/null
+        case "$rdiv" in
+          ''|*[!0-9]*)
+            bad "DDC: $diverse-built coff0 left no result for $label"
+            ddc_bad=$((ddc_bad + 1)); continue ;;
+        esac
+        if [ "$expect" = error ]; then
+          if [ "$rdiv" -eq 0 ]; then
+            bad "DDC: $diverse-built coff0 accepted $label, a compile-error test $CC-built coff0 rejects"
+            ddc_bad=$((ddc_bad + 1)); continue
+          fi
+          if [ "$rref" != "$rdiv" ] || ! cmpq "$tmpdir/ref/$n.err" "$div/$n.err"; then
+            bad "DDC MISMATCH on $label, the two coff0 reject it differently ($CC exit $rref, $diverse exit $rdiv)"
+            diff "$tmpdir/ref/$n.err" "$div/$n.err" | head -6 | sed 's/^/     /'
+            ddc_bad=$((ddc_bad + 1)); continue
+          fi
+          ddc_coff_err=$((ddc_coff_err + 1))
+        else
+          if [ "$rdiv" -ne 0 ]; then
+            bad "DDC: $diverse-built coff0 rejected $label which $CC-built coff0 accepted"
+            head -3 "$div/$n.err" | sed 's/^/     /'
+            ddc_bad=$((ddc_bad + 1)); continue
+          fi
+          # Two empty message files are equal without asking a tool.
+          if ! cmpq "$tmpdir/ref/$n.s" "$div/$n.s" \
+             || { { [ -s "$tmpdir/ref/$n.err" ] || [ -s "$div/$n.err" ]; } \
+                  && ! cmpq "$tmpdir/ref/$n.err" "$div/$n.err"; }; then
+            bad "DDC MISMATCH on $label ($CC vs $diverse)"
+            diff "$tmpdir/ref/$n.s" "$div/$n.s" | head -12
+            diff "$tmpdir/ref/$n.err" "$div/$n.err" | head -6 | sed 's/^/     /'
+            ddc_bad=$((ddc_bad + 1)); continue
+          fi
         fi
-        ddc_checked=$((ddc_checked + 1))
-        if ! cmpq "$tmpdir/a_$name.s" "$tmpdir/div/b_$name.s"; then
-          bad "DDC MISMATCH on $f ($CC vs $diverse)"
-          diff "$tmpdir/a_$name.s" "$tmpdir/div/b_$name.s" | head -12
-          ddc_bad=$((ddc_bad + 1))
+        if [ "$grp" = coff ]; then
+          ddc_coff=$((ddc_coff + 1))
+        else
+          ddc_ms=$((ddc_ms + 1))
+          case "$label" in */kernel/core/kmain*\ with\ *) ddc_kmain=$((ddc_kmain + 1)) ;; esac
         fi
-      done
+      done < "$tmpdir/ddc_list"
+      ddc_checked=$((ddc_coff + ddc_ms))
 
-      if [ "$ddc_bad" -eq 0 ] && [ "$ddc_checked" -gt 0 ]; then
-        ok "DDC: $CC-built and $diverse-built coff0 agree byte-for-byte on all $ddc_checked corpus files"
-        echo "     corpus includes Moonshot's kernel sources, so a payload"
-        echo "     targeting kernel code is caught where it fires."
+      if [ -d "$ms" ] && [ "$ms_listed" -eq 0 ]; then
+        # Already a failure above. No PASS line, since one would describe a
+        # corpus without Moonshot in it.
+        echo "     $ddc_checked of $ddc_total listed files agree ($ddc_bad bad), all of them coff."
+        echo "     Moonshot is not compared, see the listing failure above."
+      elif [ "$ddc_bad" -eq 0 ] && [ "$ddc_checked" -gt 0 ] && [ "$ddc_checked" -eq "$ddc_total" ]; then
+        ok "DDC: $CC-built and $diverse-built coff0 agree on all $ddc_checked corpus files, $ddc_coff coff files ($ddc_coff_err of them compile-error tests, compared on message and exit code) and $ddc_ms Moonshot files"
+        if [ "$kmain_total" -gt 0 ] && [ "$ddc_kmain" -eq "$kmain_total" ]; then
+          echo "     corpus includes Moonshot's kernel ($ddc_kmain build variants of its"
+          echo "     main source), so a payload targeting kernel code is caught where it fires."
+        fi
       elif [ "$ddc_checked" -eq 0 ]; then
         bad "DDC ran but compared nothing -- corpus empty, treat as no coverage"
       else
-        echo "     $ddc_bad mismatch(es) over $ddc_checked files compared."
-        echo "     Either a compiler bug, undefined behaviour in coff0.c, or"
-        echo "     the thing this script exists to find. Do not build a kernel"
-        echo "     until it is explained."
+        [ "$ddc_bad" -eq 0 ] && bad "DDC: $diverse compared $ddc_checked of $ddc_total corpus files"
+        echo "     $ddc_checked of $ddc_total corpus files agree, $ddc_coff coff and $ddc_ms Moonshot."
+        if [ "$ddc_bad" -eq 0 ]; then
+          echo "     The rest failed on the $CC-built coff0 side, see above."
+        else
+          echo "     A mismatch is a compiler bug, undefined behaviour in coff0.c, or"
+          echo "     the thing this script exists to find. Do not build a kernel"
+          echo "     until it is explained."
+        fi
       fi
     else
       warn "coff0.c does not build under $diverse"
-      head -5 "$tmpdir/div.err"
+      head -5 "$tmpdir/div_$diverse.err"
       echo "     worth fixing: coff0.c staying buildable by any C compiler is"
       echo "     what keeps DDC available at all."
     fi
@@ -544,7 +653,7 @@ echo ""
   echo "ld: $(ld --version 2>/dev/null | head -1)"
   [ -n "$diverse" ] && echo "diverse: $($diverse --version 2>&1 | head -1)"
   echo ""
-  hashq coff0.c c0/coff.c0 c0/lex.c0 c0/parse.c0 c0/smed.c0 c0/sha256.c0 c0/cmp.c0 \
+  hashq coff0.c c0/coff.c0 c0/smed.c0 c0/sha256.c0 c0/cmp.c0 \
         lib/flyt.c0 lib/flyt_check.c0
   # No binary is hashed. None is committed, and a manifest that changed
   # whenever the tree was built would fail on every fresh clone, and a
@@ -555,14 +664,15 @@ echo ""
   # files that looked like test data. Both of those categories exist here
   # -- run_tests.sh decides what gets compiled here, and a "test" file in
   # this project is input to the compiler under test, so it is hashed like
-  # code. The kernel's build script and its generators are the same
+  # code. ddc_entries.sh decides what the DDC compares, so it is build code
+  # too. The kernel's build script and its generators are the same
   # category, but they live in the kernel's repository and are recorded
   # there. For the same reason that no binary is hashed, nothing outside
   # this repository is either, or the committed manifest would match only
   # one of the two layouts the README describes. The kernel sources still
   # go into the DDC corpus (stage 3) when they sit next to this tree.
-  hashq run_tests.sh check_saved_regs.awk verify_bootstrap.sh smed_tests.sh \
-        fetch_ddc_cproc.sh lib/flyt_check.sh
+  hashq run_tests.sh check_saved_regs.awk verify_bootstrap.sh ddc_entries.sh \
+        smed_tests.sh fetch_ddc_cproc.sh lib/flyt_check.sh
   # File names here never contain spaces, so word splitting is safe.
   hashq $(find tests -type f 2>/dev/null | LC_ALL=C sort)
 } > "$tmpdir/manifest"
@@ -607,6 +717,11 @@ elif [ "$cmp_checked" -gt 0 ]; then
 fi
 
 fi  # end ddc_only guard
+
+# The figures TRUST.md quotes, measured on every run so the document can be
+# checked against them.
+echo ""
+echo "sizes: coff0.c $(wc -l < coff0.c) lines, c0/coff.c0 $(wc -l < c0/coff.c0) lines, c0/smed.c0 $(wc -l < c0/smed.c0) lines"
 
 echo ""
 echo "$pass passed, $fail failed, $skip skipped"

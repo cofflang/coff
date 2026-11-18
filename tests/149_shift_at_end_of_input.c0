@@ -1,0 +1,8 @@
+// expect: compile-error
+//
+// tests/149_shift_at_end_of_input.c0 - a compound operator as the last bytes of the input
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// >>= as the last three bytes of the input still lexes as one token, so
+// the error is the missing semicolon after it, not a missing expression.
+int main() {
+    return 1 >>=

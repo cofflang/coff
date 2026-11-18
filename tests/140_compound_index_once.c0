@@ -1,0 +1,59 @@
+// expect: 42
+//
+// tests/140_compound_index_once.c0 - a compound assignment on an index evaluates its target once
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// T OP= E evaluates the base and the index of an indexed target once. f
+// counts its calls and returns 0 the first time and 1 after that, so a
+// second evaluation would read b[1] or write it. Each check that holds adds
+// one.
+int calls = 0;
+int bases = 0;
+int bb = 0;
+
+int f() {
+    calls += 1;
+    if (calls == 1) { return 0; }
+    return 1;
+}
+
+int base() {
+    bases += 1;
+    return bb;
+}
+
+int reset(int b, int v) {
+    store8(b, v);
+    store8(b + 1, 7);
+    calls = 0;
+    return 0;
+}
+
+int main() {
+    int ok = 0;
+    int b = alloc(8);
+    reset(b, 20); b[f()] += 3;
+    if (calls == 1 && b[0] == 23 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] -= 3;
+    if (calls == 1 && b[0] == 17 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] *= 3;
+    if (calls == 1 && b[0] == 60 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] /= 3;
+    if (calls == 1 && b[0] == 6 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] %= 3;
+    if (calls == 1 && b[0] == 2 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] &= 6;
+    if (calls == 1 && b[0] == 4 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] |= 3;
+    if (calls == 1 && b[0] == 23 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] ^= 5;
+    if (calls == 1 && b[0] == 17 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] <<= 2;
+    if (calls == 1 && b[0] == 80 && b[1] == 7) { ok += 1; }
+    reset(b, 20); b[f()] >>= 2;
+    if (calls == 1 && b[0] == 5 && b[1] == 7) { ok += 1; }
+    bb = b;
+    reset(b, 20); base()[f()] += 1;
+    if (bases == 1 && calls == 1 && b[0] == 21 && b[1] == 7) { ok += 1; }
+    if (ok == 11) { return 42; }
+    return ok;
+}

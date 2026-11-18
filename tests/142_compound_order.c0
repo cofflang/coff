@@ -1,0 +1,74 @@
+// expect: 42
+//
+// tests/142_compound_order.c0 - the order a compound assignment runs its parts in
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// The order of T OP= E is the target's address, then the old value, then E,
+// then the store. A call in E that writes the target is therefore lost, for
+// an index, a field and a global alike. The address is taken before E runs,
+// so when E moves the block a global base points to, the value goes to the
+// old block, for OP= and for plain = alike. Each check that holds adds one.
+layout P { int pa; int pb; }
+
+int buf = 0;
+int gp = 0;
+int g = 0;
+int gb = 0;
+int trace = 0;
+
+int hb() { store8(buf + 1, 100); return 1; }
+int hf() { gp.pb = 100; return 1; }
+int hg() { g = 100; return 1; }
+
+int traced_base() { trace = trace * 10 + 1; return buf; }
+int traced_index() { trace = trace * 10 + 2; return 1; }
+int traced_rhs(int a, int b, int c, int d, int e, int f, int h, int i) {
+    trace = trace * 10 + 3;
+    store8(buf + 1, 100);
+    return a + b + c + d + e + f + h + i;
+}
+
+int grow() {
+    gb = alloc(16);
+    return 100;
+}
+
+int growp() {
+    gp = alloc(sizeof(P));
+    return 100;
+}
+
+int main() {
+    int ok = 0;
+    int i = 1;
+    buf = alloc(8);
+    store8(buf + 1, 10);
+    buf[i] += hb();
+    if (buf[1] == 11) { ok += 1; }
+    gp = alloc(sizeof(P));
+    gp.pb = 10;
+    gp.pb += hf();
+    if (gp.pb == 11) { ok += 1; }
+    g = 10;
+    g += hg();
+    if (g == 11) { ok += 1; }
+
+    int old = alloc(16);
+    gb = old;
+    store8(old, 5);
+    gb[0] += grow();
+    if (old[0] == 105 && gb[0] == 0) { ok += 1; }
+    old = gb;
+    gb[0] = grow();
+    if (old[0] == 100 && gb[0] == 0) { ok += 1; }
+
+    int oldp = gp;
+    oldp.pb = 5;
+    gp.pb += growp();
+    if (oldp.pb == 105 && gp.pb == 0) { ok += 1; }
+
+    store8(buf + 1, 10);
+    traced_base()[traced_index()] += traced_rhs(1, 2, 3, 4, 5, 6, 7, 8);
+    if (trace == 123 && buf[1] == 46) { ok += 1; }
+    if (ok == 7) { return 42; }
+    return ok;
+}

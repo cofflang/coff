@@ -1,0 +1,29 @@
+// expect: 42
+//
+// tests/148_compound_lexing.c0 - the compound operators lex by longest match
+// Copyright (C) 2026 tavro. Part of coff, GPL-3.0-or-later (see ../LICENSE).
+// The compound operators lex by longest match without spaces around them,
+// and the operators they extend lex as before. Each check that holds adds
+// one.
+layout P { int pa; }
+
+int main() {
+    int ok = 0;
+    int a = 12;
+    int b = 2;
+    a>>=b;  if (a == 3) { ok += 1; }
+    a<<=b;  if (a == 12) { ok += 1; }
+    a&=b+8; if (a == 8) { ok += 1; }
+    a|=b;   if (a == 10) { ok += 1; }
+    a^=b;   if (a == 8) { ok += 1; }
+    if (a>=b && a>>b == 2 && b<=a && a<<b == 32) { ok += 1; }
+    if ((a&&0) == 0 && (a||0) == 1 && (a&b) == 0 && (a|b) == 10 && (a^b) == 10) { ok += 1; }
+    int buf = alloc(8);
+    buf[1] = 8;
+    buf[1]>>=b; if (buf[1] == 2) { ok += 1; }
+    int p = alloc(sizeof(P));
+    p.pa = 5;
+    p.pa^=3; if (p.pa == 6) { ok += 1; }
+    if (ok == 9) { return 42; }
+    return ok;
+}

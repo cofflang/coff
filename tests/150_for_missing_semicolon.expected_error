@@ -1,0 +1,1 @@
+coff0: tests/150_for_missing_semicolon.c0:7: expected ';'

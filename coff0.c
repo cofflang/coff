@@ -25,8 +25,7 @@
  * seed and gcc cannot (see TRUST.md) -- and it exists so the self-hosted
  * compiler (c0/coff.c0) has something to be compiled by the first time.
  * After that it stays around as the oracle. run_tests.sh diffs the output
- * of every c0-written stage against this one, byte for byte, error messages
- * included. It is not the compiler you are meant to use day to day - that
+ * of coff1 against this one, byte for byte, error messages included. It is not the compiler you are meant to use day to day - that
  * is coff1, the binary built from c0/coff.c0.
  *
  * The c0 grammar, as accepted here
@@ -84,9 +83,18 @@
  *                                                        in an index or a field,
  *                                                        e.g. buf[i] = v or
  *                                                        e.hp = 10)
- *   assign_op  := "=" | "+=" | "-=" | "*=" | "/=" | "%="
- *                                                     (x OP= e is sugar for
- *                                                        x = x OP (e))
+ *   assign_op  := "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^="
+ *                                                     | "<<=" | ">>="
+ *                                                     (for a variable, x OP= e
+ *                                                        is x = x OP (e). For
+ *                                                        buf[i] and e.f the
+ *                                                        base and the index are
+ *                                                        worked out once, the
+ *                                                        old value is read
+ *                                                        before e runs, and the
+ *                                                        store goes to the
+ *                                                        address taken before
+ *                                                        e runs)
  *   multi_assign := IDENT "," IDENT "=" call ";"      (the call must be to a
  *                                                        "(int, int)" function)
  *   if_stmt    := "if" "(" expr ")" stmt ("else" stmt)?
@@ -264,6 +272,7 @@ typedef enum {
   TK_PLUSEQ, TK_MINUSEQ, TK_STAREQ, TK_SLASHEQ, TK_PERCENTEQ,
   TK_KW_FOR,
   TK_KW_DEFER,
+  TK_AMPEQ, TK_PIPEEQ, TK_CARETEQ, TK_SHLEQ, TK_SHREQ,
 } TokenKind;
 
 typedef struct {
@@ -348,8 +357,8 @@ static Token *tokenize(char *src) {
         p += 2;
         /* The digits are added up in an unsigned long, which wraps modulo
          * 2^64, so a literal is what its low 64 bits are, reinterpreted as
-         * signed. The c0-written lexers (lex.c0, parse.c0, coff.c0) do
-         * `v = v * 16 + digit` on a plain int and wrap the same way.
+         * signed. coff.c0's lexer does `v = v * 16 + digit` on a plain
+         * int and wraps the same way.
          * strtoul would agree up to 2^64 and then clamp. Hex literals with
          * the top bit set are common, an 8x8 font glyph's packed bitmap such
          * as 0xF88484F88484F800. */
@@ -365,8 +374,8 @@ static Token *tokenize(char *src) {
         n++;
         continue;
       }
-      /* Decimal the same way, wrapping modulo 2^64 like the c0-written
-       * lexers' `v = v * 10 + digit`. c0 has no unsigned type, so a literal
+      /* Decimal the same way, wrapping modulo 2^64 like coff.c0's lexer,
+       * `v = v * 10 + digit`. c0 has no unsigned type, so a literal
        * at or past 2^63 is just what its bits are, reinterpreted as
        * negative, like every other c0 int. */
       unsigned long v = 0;
@@ -485,21 +494,27 @@ static Token *tokenize(char *src) {
         break;
       case '<':
         if (p[1] == '=') { t->kind = TK_LE; p += 2; }
+        else if (p[1] == '<' && p[2] == '=') { t->kind = TK_SHLEQ; p += 3; }
         else if (p[1] == '<') { t->kind = TK_SHL; p += 2; }
         else { t->kind = TK_LT; p++; }
         break;
       case '>':
         if (p[1] == '=') { t->kind = TK_GE; p += 2; }
+        else if (p[1] == '>' && p[2] == '=') { t->kind = TK_SHREQ; p += 3; }
         else if (p[1] == '>') { t->kind = TK_SHR; p += 2; }
         else { t->kind = TK_GT; p++; }
         break;
       case '&':
-        if (p[1] == '&') { t->kind = TK_AND; p += 2; } else { t->kind = TK_AMP; p++; }
+        if (p[1] == '&') { t->kind = TK_AND; p += 2; }
+        else if (p[1] == '=') { t->kind = TK_AMPEQ; p += 2; }
+        else { t->kind = TK_AMP; p++; }
         break;
       case '|':
-        if (p[1] == '|') { t->kind = TK_OR; p += 2; } else { t->kind = TK_PIPE; p++; }
+        if (p[1] == '|') { t->kind = TK_OR; p += 2; }
+        else if (p[1] == '=') { t->kind = TK_PIPEEQ; p += 2; }
+        else { t->kind = TK_PIPE; p++; }
         break;
-      case '^': t->kind = TK_CARET; p++; break;
+      case '^': if (p[1] == '=') { t->kind = TK_CARETEQ; p += 2; } else { t->kind = TK_CARET; p++; } break;
       case '~': t->kind = TK_TILDE; p++; break;
       default:
         error("unexpected character '%c'", *p);
@@ -547,6 +562,8 @@ struct Node {
   int str_id;         /* STR, index into the string-literal table */
   char *name;         /* VAR / ASSIGN / DECL / CALL / FUNCREF */
   Node *cond, *then, *els; /* IF; INDEX_ASSIGN cond = value expr (`buf[i] = value`) */
+  int op;             /* INDEX_ASSIGN / FIELD_ASSIGN, the binary operator of a compound
+                         assignment (`buf[i] += value`), or 0 (ND_NUM) for plain `=` */
   Node *body;         /* WHILE body; BLOCK head of statement list */
   Node *args;         /* CALL, head of argument-expression list (chained via next) */
   int nargs;          /* CALL, argument count */
@@ -1037,6 +1054,25 @@ static Node *parse_stmt(void) {
   return parse_simple(1);
 }
 
+/* The binary operator a compound assignment token stands for, or 0 (ND_NUM)
+ * for any other token. Every compound operator is listed here and nowhere
+ * else. */
+static NodeKind compound_kind(TokenKind k) {
+  switch (k) {
+    case TK_PLUSEQ: return ND_ADD;
+    case TK_MINUSEQ: return ND_SUB;
+    case TK_STAREQ: return ND_MUL;
+    case TK_SLASHEQ: return ND_DIV;
+    case TK_PERCENTEQ: return ND_MOD;
+    case TK_AMPEQ: return ND_BITAND;
+    case TK_PIPEEQ: return ND_BITOR;
+    case TK_CARETEQ: return ND_BITXOR;
+    case TK_SHLEQ: return ND_SHL;
+    case TK_SHREQ: return ND_SHR;
+    default: return ND_NUM;
+  }
+}
+
 /* A plain/indexed/field assignment, a compound assignment, or -- if no
  * assignment follows -- an expression statement. Needs arbitrary lookahead
  * (buf[i] can be any length). want_semi is 0 for a for-loop step, which has
@@ -1088,22 +1124,18 @@ static Node *parse_simple(int want_semi) {
     error("invalid assignment target");
   }
 
-  /* A compound assignment lhs OP= rhs is sugar for lhs = (lhs OP rhs), which
-   * builds the same AST a hand-written lhs = lhs OP rhs would, so codegen
-   * needs nothing of its own for it, and an index or field target is
-   * evaluated twice exactly as in the hand-written form. */
-  if (check(TK_PLUSEQ) || check(TK_MINUSEQ) || check(TK_STAREQ)
-      || check(TK_SLASHEQ) || check(TK_PERCENTEQ)) {
-    NodeKind bk = ND_ADD;
-    if (check(TK_MINUSEQ)) bk = ND_SUB;
-    if (check(TK_STAREQ)) bk = ND_MUL;
-    if (check(TK_SLASHEQ)) bk = ND_DIV;
-    if (check(TK_PERCENTEQ)) bk = ND_MOD;
+  /* A compound assignment T OP= E. For a variable it is exactly x = x OP E,
+   * since reading a name has no side effect and no call can write a local.
+   * An index or field target keeps the operator on the store, so its base
+   * and index are evaluated once. The target is checked before E is read,
+   * at the same token as for plain `=`. */
+  NodeKind bk = compound_kind(peek()->kind);
+  if (bk) {
     advance();
-    Node *bin = new_node(bk);
-    bin->lhs = e;
-    bin->rhs = parse_expr();
     if (e->kind == ND_VAR) {
+      Node *bin = new_node(bk);
+      bin->lhs = e;
+      bin->rhs = parse_expr();
       Node *n = new_node(ND_ASSIGN);
       n->name = e->name;
       n->rhs = bin;
@@ -1114,7 +1146,8 @@ static Node *parse_simple(int want_semi) {
       Node *n = new_node(ND_INDEX_ASSIGN);
       n->lhs = e->lhs;
       n->rhs = e->rhs;
-      n->cond = bin;
+      n->op = bk;
+      n->cond = parse_expr();
       if (want_semi) expect(TK_SEMI, "';'");
       return n;
     }
@@ -1122,7 +1155,8 @@ static Node *parse_simple(int want_semi) {
       Node *n = new_node(ND_FIELD_ASSIGN);
       n->lhs = e->lhs;
       n->name = e->name;
-      n->rhs = bin;
+      n->op = bk;
+      n->rhs = parse_expr();
       if (want_semi) expect(TK_SEMI, "';'");
       return n;
     }
@@ -1189,7 +1223,7 @@ static Function *parse_function(char *name) {
  * arithmetic is the generated code's. / and % truncate toward zero like
  * idiv, << and >> use the count's low six bits, >> is arithmetic, and
  * overflow wraps (done unsigned here, where C would call it undefined).
- * parse.c0 and coff.c0 fold the same way, and the AST dump shows the value. */
+ * coff.c0 folds the same way, and the emitted .quad shows the value. */
 static long const_fold(Node *n) {
   long a, b;
   switch (n->kind) {
@@ -1971,6 +2005,15 @@ static int is_leaf(Node *n) {
   return n->kind == ND_NUM || n->kind == ND_VAR;
 }
 
+/* Whether a store may keep its address in rdi while the value n is
+ * evaluated. Evaluating a number or a variable writes only rax or rcx. Every
+ * call and every inline builtin writes rdi, so nothing else may be added
+ * here without a security review. This alone decides it, so that widening
+ * is_leaf can never move a store onto the rdi path. */
+static int keeps_rdi(Node *n) {
+  return n->kind == ND_NUM || n->kind == ND_VAR;
+}
+
 /* The register a local lives in, or 0 when it is on the stack, a global or
  * something else, and always 0 in the dry pass. */
 static int reg_local(Node *n) {
@@ -1980,12 +2023,17 @@ static int reg_local(Node *n) {
 
 /* Leaves lhs in rax and rhs in rcx, the operand layout of every binary
  * operator. */
+/* A leaf operand, loaded into rcx. */
+static void gen_leaf_rcx(Node *n) {
+  if (n->kind == ND_NUM) fprintf(out, "    mov rcx, %ld\n", n->ival);
+  else if (n->is_global) fprintf(out, "    mov rcx, [.G%s]\n", n->name);
+  else fprintf(out, "    mov rcx, %s\n", slot(n->ival));
+}
+
 static void gen_operands(Node *lhs, Node *rhs) {
   gen_expr(lhs);
   if (is_leaf(rhs)) {
-    if (rhs->kind == ND_NUM) fprintf(out, "    mov rcx, %ld\n", rhs->ival);
-    else if (rhs->is_global) fprintf(out, "    mov rcx, [.G%s]\n", rhs->name);
-    else fprintf(out, "    mov rcx, %s\n", slot(rhs->ival));
+    gen_leaf_rcx(rhs);
     return;
   }
   fprintf(out, "    push rax\n");
@@ -2092,7 +2140,7 @@ static void gen_jump_if_false(Node *cond, const char *label, int l) {
  * wait on the stack. */
 static void gen_addr_value(Node *addr, Node *value) {
   gen_expr(addr);
-  if (is_leaf(value)) {
+  if (keeps_rdi(value)) {
     fprintf(out, "    mov rdi, rax\n");
     gen_expr(value);
     return;
@@ -2113,6 +2161,54 @@ static void gen_stable_arg(Node *n, const char *reg) {
   if (n->kind == ND_NUM) fprintf(out, "    mov %s, %ld\n", reg, n->ival);
   else if (n->kind == ND_STR) fprintf(out, "    lea %s, [.Lstr%d]\n", reg, n->str_id);
   else fprintf(out, "    mov %s, %s\n", reg, slot(n->ival));
+}
+
+/* base + index into rax, the address of buf[i]. The operands may trade
+ * places like ADD's. */
+static void gen_index_addr(Node *base, Node *index) {
+  Node *ia = base, *ib = index;
+  if (is_stable_leaf(ia) && !is_leaf(ib)) { ia = index; ib = base; }
+  int iimm = gen_operands_imm(ia, ib);
+  fprintf(out, "    add rax, ");
+  emit_rhs(iimm, ib);
+}
+
+/* A binary operator with its left operand in rax and its right one where
+ * gen_operands_imm or gen_operands left it, an immediate (imm 1), a saved
+ * register (imm 2) or rcx (imm 0). The result is in rax. */
+static void emit_binop(int kind, int imm, Node *rhs) {
+  if (kind >= ND_EQ && kind <= ND_GE) {
+    fprintf(out, "    cmp rax, ");
+    emit_rhs(imm, rhs);
+  }
+  switch (kind) {
+    case ND_ADD: fprintf(out, "    add rax, "); emit_rhs(imm, rhs); break;
+    case ND_SUB: fprintf(out, "    sub rax, "); emit_rhs(imm, rhs); break;
+    case ND_MUL:
+      if (imm == 1) fprintf(out, "    imul rax, rax, %ld\n", rhs->ival);
+      else { fprintf(out, "    imul rax, "); emit_rhs(imm, rhs); }
+      break;
+    case ND_DIV: fprintf(out, "    cqo\n    idiv rcx\n"); break;
+    /* idiv leaves the remainder in rdx, with the sign of the dividend,
+     * the same as C, so -7 % 2 is -1. */
+    case ND_MOD: fprintf(out, "    cqo\n    idiv rcx\n    mov rax, rdx\n"); break;
+    case ND_EQ:  fprintf(out, "    sete al\n    movzx rax, al\n"); break;
+    case ND_NE:  fprintf(out, "    setne al\n    movzx rax, al\n"); break;
+    case ND_LT:  fprintf(out, "    setl al\n    movzx rax, al\n"); break;
+    case ND_LE:  fprintf(out, "    setle al\n    movzx rax, al\n"); break;
+    case ND_GT:  fprintf(out, "    setg al\n    movzx rax, al\n"); break;
+    case ND_GE:  fprintf(out, "    setge al\n    movzx rax, al\n"); break;
+    case ND_BITAND: fprintf(out, "    and rax, "); emit_rhs(imm, rhs); break;
+    case ND_BITOR:  fprintf(out, "    or rax, "); emit_rhs(imm, rhs); break;
+    case ND_BITXOR: fprintf(out, "    xor rax, "); emit_rhs(imm, rhs); break;
+    /* the count is in cl, and x86 uses only its low six bits, so a
+     * count outside 0..63 shifts by count & 63. >> is arithmetic (sar),
+     * the sign bit fills in from the left, which is what gcc does for a
+     * signed int in C. */
+    case ND_SHL:    fprintf(out, "    shl rax, cl\n"); break;
+    case ND_SHR:    fprintf(out, "    sar rax, cl\n"); break;
+    default: break;
+  }
 }
 
 static void gen_expr_node(Node *n) {
@@ -2139,15 +2235,8 @@ static void gen_expr_node(Node *n) {
       fprintf(out, "    not rax\n");
       return;
     case ND_INDEX:
-      /* base + index, so the operands may trade places like ADD's. */
-    {
-      Node *ia = n->lhs, *ib = n->rhs;
-      if (is_stable_leaf(ia) && !is_leaf(ib)) { ia = n->rhs; ib = n->lhs; }
-      int iimm = gen_operands_imm(ia, ib);
-      fprintf(out, "    add rax, ");
-      emit_rhs(iimm, ib);
+      gen_index_addr(n->lhs, n->rhs);
       fprintf(out, "    movzx rax, byte ptr [rax]\n");
-    }
       return;
     case ND_FIELD:
       gen_expr(n->lhs);
@@ -2497,38 +2586,7 @@ static void gen_expr_node(Node *n) {
         imm = gen_operands_imm(lhs, rhs);
       else
         gen_operands(lhs, rhs);
-      if (n->kind >= ND_EQ && n->kind <= ND_GE) {
-        fprintf(out, "    cmp rax, ");
-        emit_rhs(imm, rhs);
-      }
-      switch (n->kind) {
-        case ND_ADD: fprintf(out, "    add rax, "); emit_rhs(imm, rhs); break;
-        case ND_SUB: fprintf(out, "    sub rax, "); emit_rhs(imm, rhs); break;
-        case ND_MUL:
-          if (imm == 1) fprintf(out, "    imul rax, rax, %ld\n", rhs->ival);
-          else { fprintf(out, "    imul rax, "); emit_rhs(imm, rhs); }
-          break;
-        case ND_DIV: fprintf(out, "    cqo\n    idiv rcx\n"); break;
-        /* idiv leaves the remainder in rdx, with the sign of the dividend,
-         * the same as C, so -7 % 2 is -1. */
-        case ND_MOD: fprintf(out, "    cqo\n    idiv rcx\n    mov rax, rdx\n"); break;
-        case ND_EQ:  fprintf(out, "    sete al\n    movzx rax, al\n"); break;
-        case ND_NE:  fprintf(out, "    setne al\n    movzx rax, al\n"); break;
-        case ND_LT:  fprintf(out, "    setl al\n    movzx rax, al\n"); break;
-        case ND_LE:  fprintf(out, "    setle al\n    movzx rax, al\n"); break;
-        case ND_GT:  fprintf(out, "    setg al\n    movzx rax, al\n"); break;
-        case ND_GE:  fprintf(out, "    setge al\n    movzx rax, al\n"); break;
-        case ND_BITAND: fprintf(out, "    and rax, "); emit_rhs(imm, rhs); break;
-        case ND_BITOR:  fprintf(out, "    or rax, "); emit_rhs(imm, rhs); break;
-        case ND_BITXOR: fprintf(out, "    xor rax, "); emit_rhs(imm, rhs); break;
-        /* the count is in cl, and x86 uses only its low six bits, so a
-         * count outside 0..63 shifts by count & 63. >> is arithmetic (sar),
-         * the sign bit fills in from the left, which is what gcc does for a
-         * signed int in C. */
-        case ND_SHL:    fprintf(out, "    shl rax, cl\n"); break;
-        case ND_SHR:    fprintf(out, "    sar rax, cl\n"); break;
-        default: break;
-      }
+      emit_binop(n->kind, imm, rhs);
       return;
     }
     default:
@@ -2587,6 +2645,43 @@ static int gen_reg_assign(long off, Node *val) {
   return 1;
 }
 
+/* The old value of a compound target, from the address in rax, a byte
+ * zero-extended for buf[i] (field 0) or 8 bytes at offset off for e.f. */
+static void gen_compound_load(int field, long off) {
+  if (field) fprintf(out, "    mov rax, [rax + %ld]\n", off);
+  else fprintf(out, "    movzx rax, byte ptr [rax]\n");
+}
+
+/* T OP= E for an index or field target whose address is in rax. The old
+ * value is read before E runs, old OP E is computed exactly as the binary
+ * operator computes it, and the result is stored where it was read, its
+ * low byte for buf[i]. */
+static void gen_compound(int op, Node *value, int field, long off) {
+  int imm = 0;
+  if (keeps_rdi(value)) {
+    fprintf(out, "    mov rdi, rax\n");
+    gen_compound_load(field, off);
+    int imm_ok = op == ND_ADD || op == ND_SUB || op == ND_MUL
+      || op == ND_BITAND || op == ND_BITOR || op == ND_BITXOR;
+    if (imm_ok && is_imm32(value)) imm = 1;
+    else if (imm_ok && reg_local(value)) imm = 2;
+    else gen_leaf_rcx(value);
+    emit_binop(op, imm, value);
+  } else {
+    /* The address and the old value wait on the stack while E runs. */
+    fprintf(out, "    push rax\n");
+    gen_compound_load(field, off);
+    fprintf(out, "    push rax\n");
+    gen_expr(value);
+    fprintf(out, "    mov rcx, rax\n");
+    fprintf(out, "    pop rax\n");
+    emit_binop(op, 0, value);
+    fprintf(out, "    pop rdi\n");
+  }
+  if (field) fprintf(out, "    mov [rdi + %ld], rax\n", off);
+  else fprintf(out, "    mov byte ptr [rdi], al\n");
+}
+
 static void gen_stmt_node(Node *n) {
   switch (n->kind) {
     case ND_DECL:
@@ -2603,14 +2698,9 @@ static void gen_stmt_node(Node *n) {
       return;
     case ND_INDEX_ASSIGN:
       /* base + index, then the value, as for store8. */
-    {
-      Node *ia = n->lhs, *ib = n->rhs;
-      if (is_stable_leaf(ia) && !is_leaf(ib)) { ia = n->rhs; ib = n->lhs; }
-      int iimm = gen_operands_imm(ia, ib);
-      fprintf(out, "    add rax, ");
-      emit_rhs(iimm, ib);
-    }
-      if (is_leaf(n->cond)) {
+      gen_index_addr(n->lhs, n->rhs);
+      if (n->op) { gen_compound(n->op, n->cond, 0, 0); return; }
+      if (keeps_rdi(n->cond)) {
         fprintf(out, "    mov rdi, rax\n");
         gen_expr(n->cond);
       } else {
@@ -2621,6 +2711,11 @@ static void gen_stmt_node(Node *n) {
       fprintf(out, "    mov byte ptr [rdi], al\n");
       return;
     case ND_FIELD_ASSIGN:
+      if (n->op) {
+        gen_expr(n->lhs);
+        gen_compound(n->op, n->rhs, 1, n->ival);
+        return;
+      }
       gen_addr_value(n->lhs, n->rhs);
       fprintf(out, "    mov [rdi + %ld], rax\n", n->ival);
       return;
@@ -2802,229 +2897,6 @@ static void gen_function(Function *f) {
   fprintf(out, "    ret\n");
   free(slot_weight);
   free(slot_reg);
-}
-
-/* ------------------------------------------------------------ token dump */
-/* `coff0 -t file.c0` prints the token stream, one token per line. This is
- * the reference output the c0-written lexer (c0/lex.c0) is diffed against,
- * so the format is a contract and the two must be kept in sync. */
-
-static void dump_tokens(void) {
-  for (int i = 0; i < ntokens; i++) {
-    Token *t = &tokens[i];
-    switch (t->kind) {
-      case TK_NUM:    printf("NUM %ld\n", t->ival); break;
-      case TK_IDENT:  printf("IDENT %s\n", t->name); break;
-      case TK_STRING:
-        printf("STR");
-        for (long j = 0; j < t->ival; j++) printf(" %d", (unsigned char)t->name[j]);
-        printf("\n");
-        break;
-      case TK_PLUS:   printf("PLUS\n"); break;
-      case TK_MINUS:  printf("MINUS\n"); break;
-      case TK_STAR:   printf("STAR\n"); break;
-      case TK_SLASH:  printf("SLASH\n"); break;
-      case TK_PERCENT: printf("PERCENT\n"); break;
-      case TK_ASSIGN: printf("ASSIGN\n"); break;
-      case TK_EQ:     printf("EQ\n"); break;
-      case TK_NE:     printf("NE\n"); break;
-      case TK_NOT:    printf("NOT\n"); break;
-      case TK_PLUSEQ:    printf("PLUSEQ\n"); break;
-      case TK_MINUSEQ:   printf("MINUSEQ\n"); break;
-      case TK_STAREQ:    printf("STAREQ\n"); break;
-      case TK_SLASHEQ:   printf("SLASHEQ\n"); break;
-      case TK_PERCENTEQ: printf("PERCENTEQ\n"); break;
-      case TK_LT:     printf("LT\n"); break;
-      case TK_LE:     printf("LE\n"); break;
-      case TK_GT:     printf("GT\n"); break;
-      case TK_GE:     printf("GE\n"); break;
-      case TK_LPAREN: printf("LPAREN\n"); break;
-      case TK_RPAREN: printf("RPAREN\n"); break;
-      case TK_LBRACE: printf("LBRACE\n"); break;
-      case TK_RBRACE: printf("RBRACE\n"); break;
-      case TK_SEMI:   printf("SEMI\n"); break;
-      case TK_COMMA:  printf("COMMA\n"); break;
-      case TK_KW_INT:    printf("INT\n"); break;
-      case TK_KW_IF:     printf("IF\n"); break;
-      case TK_KW_ELSE:   printf("ELSE\n"); break;
-      case TK_KW_WHILE:  printf("WHILE\n"); break;
-      case TK_KW_FOR:    printf("FOR\n"); break;
-      case TK_KW_DEFER:  printf("DEFER\n"); break;
-      case TK_KW_RETURN: printf("RETURN\n"); break;
-      case TK_EOF:    printf("EOF\n"); break;
-      case TK_AND:    printf("AND\n"); break;
-      case TK_OR:     printf("OR\n"); break;
-      case TK_KW_BREAK:    printf("BREAK\n"); break;
-      case TK_KW_CONTINUE: printf("CONTINUE\n"); break;
-      case TK_LBRACKET: printf("LBRACKET\n"); break;
-      case TK_RBRACKET: printf("RBRACKET\n"); break;
-      case TK_KW_VOID: printf("VOID\n"); break;
-      case TK_KW_EXTERN: printf("EXTERN\n"); break;
-      case TK_DOT: printf("DOT\n"); break;
-      case TK_KW_LAYOUT: printf("LAYOUT\n"); break;
-      case TK_KW_SIZEOF: printf("SIZEOF\n"); break;
-      case TK_AMP:   printf("AMP\n"); break;
-      case TK_PIPE:  printf("PIPE\n"); break;
-      case TK_CARET: printf("CARET\n"); break;
-      case TK_TILDE: printf("TILDE\n"); break;
-      case TK_SHL:   printf("SHL\n"); break;
-      case TK_SHR:   printf("SHR\n"); break;
-    }
-  }
-}
-
-/* -------------------------------------------------------------- ast dump */
-/* `coff0 -a file.c0` prints the parse tree, one node per line, two-space
- * indent per depth, pre-resolve (names, not offsets). Like -t, this format
- * is the contract the c0-written parser (c0/parse.c0) is diffed against. */
-
-static void dump_node(Node *n, int depth) {
-  if (!n) return;
-  for (int i = 0; i < depth; i++) printf("  ");
-  switch (n->kind) {
-    case ND_NUM: printf("NUM %ld\n", n->ival); return;
-    case ND_STR:
-      printf("STR");
-      for (int j = 0; j < string_len[n->str_id]; j++)
-        printf(" %d", (unsigned char)string_data[n->str_id][j]);
-      printf("\n");
-      return;
-    case ND_VAR: printf("VAR %s\n", n->name); return;
-    case ND_FUNCREF: printf("FUNCREF %s\n", n->name); return; /* never actually
-      hit, since -a dumps pre-resolve, and FUNCREF only exists post-resolve (see
-      resolve()'s ND_VAR case) -- here purely for switch exhaustiveness. */
-    case ND_ASSIGN:
-      printf("ASSIGN %s\n", n->name);
-      dump_node(n->rhs, depth + 1);
-      return;
-    case ND_DECL:
-      printf("DECL %s\n", n->name);
-      dump_node(n->rhs, depth + 1);
-      return;
-    case ND_CALL:
-      printf("CALL %s\n", n->name);
-      for (Node *a = n->args; a; a = a->next) dump_node(a, depth + 1);
-      return;
-    case ND_ADD: printf("ADD\n"); goto binary;
-    case ND_SUB: printf("SUB\n"); goto binary;
-    case ND_MUL: printf("MUL\n"); goto binary;
-    case ND_DIV: printf("DIV\n"); goto binary;
-    case ND_MOD: printf("MOD\n"); goto binary;
-    case ND_EQ:  printf("EQ\n");  goto binary;
-    case ND_NE:  printf("NE\n");  goto binary;
-    case ND_LT:  printf("LT\n");  goto binary;
-    case ND_LE:  printf("LE\n");  goto binary;
-    case ND_GT:  printf("GT\n");  goto binary;
-    case ND_GE:  printf("GE\n");  goto binary;
-    case ND_AND: printf("AND\n"); goto binary;
-    case ND_OR:  printf("OR\n");  goto binary;
-    case ND_BITAND: printf("BITAND\n"); goto binary;
-    case ND_BITOR:  printf("BITOR\n");  goto binary;
-    case ND_BITXOR: printf("BITXOR\n"); goto binary;
-    case ND_SHL:    printf("SHL\n");    goto binary;
-    case ND_SHR:    printf("SHR\n");    goto binary;
-    case ND_BITNOT:
-      printf("BITNOT\n");
-      dump_node(n->lhs, depth + 1);
-      return;
-    case ND_NEG:
-      printf("NEG\n");
-      dump_node(n->lhs, depth + 1);
-      return;
-    case ND_IF:
-      printf("IF\n");
-      dump_node(n->cond, depth + 1);
-      dump_node(n->then, depth + 1);
-      if (n->els) {
-        for (int i = 0; i < depth + 1; i++) printf("  ");
-        printf("ELSE\n");
-        dump_node(n->els, depth + 1);
-      }
-      return;
-    case ND_WHILE:
-      printf("WHILE\n");
-      dump_node(n->cond, depth + 1);
-      dump_node(n->body, depth + 1);
-      return;
-    case ND_FORLOOP:
-      printf("FORLOOP\n");
-      dump_node(n->cond, depth + 1);
-      dump_node(n->body, depth + 1);
-      dump_node(n->then, depth + 1);
-      return;
-    case ND_RETURN:
-      printf("RETURN\n");
-      dump_node(n->lhs, depth + 1);
-      if (n->rhs) dump_node(n->rhs, depth + 1);
-      return;
-    case ND_MULTIASSIGN:
-      printf("MULTIASSIGN\n");
-      dump_node(n->cond, depth + 1);
-      dump_node(n->rhs, depth + 1);
-      dump_node(n->lhs, depth + 1);
-      return;
-    case ND_DEFER:
-      printf("DEFER\n");
-      dump_node(n->lhs, depth + 1);
-      return;
-    case ND_EXPR_STMT:
-      printf("EXPRSTMT\n");
-      dump_node(n->lhs, depth + 1);
-      return;
-    case ND_BLOCK:
-      printf("BLOCK\n");
-      for (Node *s = n->body; s; s = s->next) dump_node(s, depth + 1);
-      return;
-    case ND_BREAK: printf("BREAK\n"); return;
-    case ND_CONTINUE: printf("CONTINUE\n"); return;
-    case ND_INDEX:
-      printf("INDEX\n");
-      dump_node(n->lhs, depth + 1);
-      dump_node(n->rhs, depth + 1);
-      return;
-    case ND_INDEX_ASSIGN:
-      printf("INDEXASSIGN\n");
-      dump_node(n->lhs, depth + 1);
-      dump_node(n->rhs, depth + 1);
-      dump_node(n->cond, depth + 1);
-      return;
-    case ND_FIELD:
-      printf("FIELD %s\n", n->name);
-      dump_node(n->lhs, depth + 1);
-      return;
-    case ND_FIELD_ASSIGN:
-      printf("FIELDASSIGN %s\n", n->name);
-      dump_node(n->lhs, depth + 1);
-      dump_node(n->rhs, depth + 1);
-      return;
-    case ND_SIZEOF:
-      printf("SIZEOF %s\n", n->name);
-      return;
-  }
-  return;
-binary:
-  dump_node(n->lhs, depth + 1);
-  dump_node(n->rhs, depth + 1);
-}
-
-static void dump_ast(void) {
-  for (Embed *e = prog_embeds; e; e = e->next)
-    printf("EMBED %s %s\n", e->name, e->path);
-  for (Global *g = prog_globals; g; g = g->next)
-    printf("GLOBAL %s %ld\n", g->name, g->init);
-  for (Layout *l = prog_layouts; l; l = l->next) {
-    printf("LAYOUT %s\n", l->name);
-    for (LayoutField *f = l->fields; f; f = f->next)
-      printf("  FIELDDECL %s\n", f->name);
-  }
-  for (Function *f = prog_functions; f; f = f->next) {
-    if (f->is_void) printf("FUNC void %s", f->name);
-    else if (f->two_ret) printf("FUNC (int, int) %s", f->name);
-    else printf("FUNC %s", f->name);
-    for (int i = 0; i < f->nparams; i++) printf(" %s", param_name(f, i));
-    printf("\n");
-    dump_node(f->body, 1);
-  }
 }
 
 /* ------------------------------------------------------------------ io */
@@ -3310,28 +3182,22 @@ static char *resolve_includes(const char *path) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 3 && strcmp(argv[1], "-t") == 0) {
-    src_name = argv[2];
-    tokens = tokenize(resolve_includes(argv[2]));
-    dump_tokens();
-    return 0;
-  }
-  if (argc == 3 && strcmp(argv[1], "-a") == 0) {
-    src_name = argv[2];
-    tokens = tokenize(resolve_includes(argv[2]));
-    pos = 0;
-    parse_program();
-    dump_ast();
-    return 0;
-  }
-  /* [--elf] [-I dir]... input output, in any order. */
+  /* [--elf] [-I dir]... input output, in any order. Any other argument
+   * that starts with '-' is refused, never taken as a file name, since
+   * `coff0 -x prog.c0` would otherwise compile a file named -x over the
+   * source. Nothing has been opened or written when these fail. */
   char *pos_args[2];
   int npos = 0;
   int bad = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--elf") == 0) {
       elf_mode = 1;
-    } else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc && n_inc_dirs < MAX_INC_DIRS) {
+    } else if (strcmp(argv[i], "-I") == 0) {
+      if (i + 1 >= argc) { fprintf(stderr, "coff0: -I needs a directory\n"); return 1; }
+      if (n_inc_dirs >= MAX_INC_DIRS) {
+        fprintf(stderr, "coff0: too many -I (at most %d)\n", MAX_INC_DIRS);
+        return 1;
+      }
       const char *d = argv[++i];
       long dl = strlen(d);
       char *withslash = malloc(dl + 2);
@@ -3339,6 +3205,9 @@ int main(int argc, char **argv) {
       withslash[dl] = 0;
       if (dl == 0 || d[dl - 1] != '/') { withslash[dl] = '/'; withslash[dl + 1] = 0; }
       inc_dirs[n_inc_dirs++] = withslash;
+    } else if (argv[i][0] == '-') {
+      fprintf(stderr, "coff0: unknown option '%s'\n", argv[i]);
+      return 1;
     } else if (npos < 2) {
       pos_args[npos++] = argv[i];
     } else {
@@ -3346,7 +3215,7 @@ int main(int argc, char **argv) {
     }
   }
   if (bad || npos != 2) {
-    fprintf(stderr, "usage: coff0 [--elf] [-I dir]... <input.c0> <output.s>  |  coff0 -t <input.c0>\n");
+    fprintf(stderr, "usage: coff0 [--elf] [-I dir]... <input.c0> <output.s>\n");
     return 1;
   }
   const char *out_path = pos_args[1];

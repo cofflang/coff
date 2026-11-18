@@ -90,7 +90,7 @@ SMED="$tmp/smed"
 echo ""
 echo "1. Differential corpus: smed vs as+ld over every c0 source"
 agree=0
-for src in tests/*.c0 c0/lex.c0 c0/parse.c0 c0/coff.c0 c0/smed.c0; do
+for src in tests/*.c0 c0/coff.c0 c0/smed.c0; do
   n=$(basename "$src" .c0)
   # Sources coff rejects on purpose (the compile-error tests) produce no
   # assembly on either side and are not comparable.
@@ -178,7 +178,9 @@ if [ -f "$K/boot.s" ] && [ -f "$K/linker.ld" ] && [ -f "$K/ring3_handlers.s" ] &
   # From the kernel's own folder, where the assembler is run below, since
   # coff writes embed's .incbin paths relative to where it is run.
   if (cd "$K" && "$OLDPWD/$COFF" kmain.c0 "$tmp/kmain.s") 2>/dev/null; then
-    sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global kernel_post_init\n.global sched_start\n.global sys_dispatch' "$tmp/kmain.s"
+    # coff makes only _start global, so every kernel function that the
+    # boot code or the ring-3 handlers call by name is made global here for ld.
+    sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global kernel_post_init\n.global sched_start\n.global sys_dispatch\n.global user_abort_stack\n.global user_abort_finish\n.global sched_stop_bad_sysret' "$tmp/kmain.s"
     kfail=0
     (cd "$K" && as boot.s -o "$tmp/boot.o" && as "$tmp/kmain.s" -o "$tmp/kmain.o" \
       && as ring3_handlers.s -o "$tmp/r3.o" \
